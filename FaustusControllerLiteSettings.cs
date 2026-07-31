@@ -1,0 +1,98 @@
+using ExileCore.Shared.Interfaces;
+using ExileCore.Shared.Nodes;
+using ExileCore.Shared.Attributes;
+using Newtonsoft.Json;
+using System.ComponentModel;
+using System.Windows.Forms;
+
+namespace FaustusControllerLite;
+
+public sealed class FaustusControllerLiteSettings : ISettings
+{
+    public ToggleNode Enable { get; set; } = new(false);
+
+    [Category("Market")]
+    public ListNode TargetCurrency { get; set; } = new() { Value = "Orb of Alteration" };
+
+    [IgnoreMenu]
+    public string TargetCurrencyMetadata { get; set; } = "Metadata/Items/Currency/CurrencyRerollMagic";
+
+    [IgnoreMenu]
+    public string TargetCurrencyDisplayName { get; set; } = "Orb of Alteration";
+
+    [Category("Bankroll Seeds")]
+    public RangeNode<int> StartingChaos { get; set; } = new(0, 0, 1_000_000);
+
+    [Category("Bankroll Seeds")]
+    public RangeNode<int> StartingDivine { get; set; } = new(0, 0, 1_000_000);
+
+    [Category("Strategy")]
+    public RangeNode<int> MinimumProfitChaos { get; set; } = new(5, 0, 1_000_000);
+
+    [Category("Strategy")]
+    public RangeNode<int> CompetingOrderWaitMinutes { get; set; } = new(5, 1, 120);
+
+    [Category("Probing")]
+    public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
+
+    [Category("Probing")]
+    public RangeNode<int> StableRateSampleCount { get; set; } = new(3, 1, 10);
+
+    [Category("Probing")]
+    public RangeNode<int> MaximumQuoteAgeSeconds { get; set; } = new(60, 1, 3600);
+
+    [Category("Permissions")]
+    public ToggleNode AllowAutomatedProbing { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowVerifiedMouseMovement { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowVerifiedClicks { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowQueryInput { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowAmountInput { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowOrderPlacement { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowOrderCancellation { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowOrderCollection { get; set; } = new(false);
+
+    [Category("Permissions")]
+    public ToggleNode AllowFullWorkflow { get; set; } = new(false);
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 ProbeMarketsHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CaptureCurrentPairHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 DumpSdkReadsHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 ExecuteSingleLegHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 FullWorkflowHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Bankroll Safety")]
+    [JsonIgnore]
+    public ButtonNode ArmBankrollReset { get; set; } = new();
+
+    [Category("Bankroll Safety")]
+    [JsonIgnore]
+    public ButtonNode ApplyArmedBankrollReset { get; set; } = new();
+
+    private static HotkeyNodeV2 CreateUnboundHotkey() => new(Keys.None)
+    {
+        IgnoreFocusedInput = true
+    };
+}
