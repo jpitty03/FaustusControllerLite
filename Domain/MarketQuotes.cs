@@ -1,9 +1,16 @@
 namespace FaustusControllerLite;
 
-public enum QuoteProvenance
+public enum QuoteExecutionIntent
 {
     Immediate,
     Competing,
+}
+
+public enum QuoteBookSource
+{
+    Synthetic,
+    WantedItemStock,
+    OfferedItemStock,
 }
 
 public sealed record QuoteLevel
@@ -38,11 +45,13 @@ public sealed record QuoteSnapshot
         CurrencyIdentity from,
         CurrencyIdentity to,
         Rational selectedRate,
-        QuoteProvenance provenance,
+        QuoteExecutionIntent executionIntent,
         DateTimeOffset capturedAt,
         string sessionId,
         string areaId,
-        IEnumerable<QuoteLevel> levels)
+        IEnumerable<QuoteLevel> levels,
+        QuoteBookSource sourceBook = QuoteBookSource.Synthetic,
+        Guid captureId = default)
     {
         ArgumentNullException.ThrowIfNull(from);
         ArgumentNullException.ThrowIfNull(to);
@@ -66,11 +75,13 @@ public sealed record QuoteSnapshot
         To = to;
         Pair = new CurrencyPairKey(from, to);
         SelectedRate = selectedRate;
-        Provenance = provenance;
+        ExecutionIntent = executionIntent;
         CapturedAt = capturedAt;
         SessionId = sessionId;
         AreaId = areaId;
         Levels = levels.ToArray();
+        SourceBook = sourceBook;
+        CaptureId = captureId;
     }
 
     public CurrencyIdentity From { get; }
@@ -81,7 +92,7 @@ public sealed record QuoteSnapshot
 
     public Rational SelectedRate { get; }
 
-    public QuoteProvenance Provenance { get; }
+    public QuoteExecutionIntent ExecutionIntent { get; }
 
     public DateTimeOffset CapturedAt { get; }
 
@@ -90,6 +101,10 @@ public sealed record QuoteSnapshot
     public string AreaId { get; }
 
     public IReadOnlyList<QuoteLevel> Levels { get; }
+
+    public QuoteBookSource SourceBook { get; }
+
+    public Guid CaptureId { get; }
 }
 
 public sealed record DirectedExchangeEdge(
@@ -97,14 +112,16 @@ public sealed record DirectedExchangeEdge(
     CurrencyIdentity To,
     CurrencyPairKey Pair,
     Rational Rate,
-    QuoteProvenance Provenance,
+    QuoteExecutionIntent ExecutionIntent,
     long ImmediateInputDepth,
     long CompetingQueueAhead,
     DateTimeOffset CapturedAt,
     string SessionId,
-    string AreaId)
+    string AreaId,
+    QuoteBookSource SourceBook = QuoteBookSource.Synthetic,
+    Guid CaptureId = default)
 {
-    public long InputLimit => Provenance == QuoteProvenance.Immediate ? ImmediateInputDepth : long.MaxValue;
+    public long InputLimit => ExecutionIntent == QuoteExecutionIntent.Immediate ? ImmediateInputDepth : long.MaxValue;
 }
 
 public static class QuoteNormalizer
@@ -117,17 +134,22 @@ public static class QuoteNormalizer
         long queue = 0;
         foreach (var level in snapshot.Levels)
         {
-            if (level.Rate < snapshot.SelectedRate)
+            if (snapshot.ExecutionIntent == QuoteExecutionIntent.Immediate)
             {
-                continue;
-            }
+                if (level.Rate < snapshot.SelectedRate)
+                {
+                    continue;
+                }
 
-            if (snapshot.Provenance == QuoteProvenance.Immediate)
-            {
                 depth = checked(depth + level.InputDepth);
             }
             else
             {
+                if (level.Rate != snapshot.SelectedRate)
+                {
+                    continue;
+                }
+
                 queue = checked(queue + level.ListedCount);
             }
         }
@@ -137,11 +159,13 @@ public static class QuoteNormalizer
             snapshot.To,
             snapshot.Pair,
             snapshot.SelectedRate,
-            snapshot.Provenance,
+            snapshot.ExecutionIntent,
             depth,
             queue,
             snapshot.CapturedAt,
             snapshot.SessionId,
-            snapshot.AreaId);
+            snapshot.AreaId,
+            snapshot.SourceBook,
+            snapshot.CaptureId);
     }
 }

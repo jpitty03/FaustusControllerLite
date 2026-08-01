@@ -65,11 +65,29 @@ public sealed class FaustusControllerLiteSettings : ISettings
     [Category("Permissions")]
     public ToggleNode AllowOrderCollection { get; set; } = new(false);
 
+    [Category("Input Permissions")]
+    public ToggleNode AllowStashTransfer { get; set; } = new(false);
+
     [Category("Permissions")]
     public ToggleNode AllowFullWorkflow { get; set; } = new(false);
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 ProbeMarketsHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CalibratePickerButtonHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CalibratePlaceOrderHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CalibrateCollectionHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CalibrateCancelHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CalibrateReturnSlotHotkey { get; set; } = CreateUnboundHotkey();
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 CaptureCurrentPairHotkey { get; set; } = CreateUnboundHotkey();
@@ -79,6 +97,21 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 ExecuteSingleLegHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 PlaceStagedLegHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CollectTrackedOrderHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 StashCollectedCurrencyHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 CancelTimedOutOrderHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 AdoptPendingOrderHotkey { get; set; } = CreateUnboundHotkey();
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 FullWorkflowHotkey { get; set; } = CreateUnboundHotkey();

@@ -48,7 +48,14 @@ public sealed class LatestRateStore
 
     public IReadOnlyCollection<MarketCapture> Captures => _captures.Values;
 
-    public void Store(MarketCapture capture) => _captures[Key(capture.League, capture.Pair)] = capture;
+    public bool Store(MarketCapture capture)
+    {
+        Validate(capture);
+        var key = Key(capture.League, capture.Pair);
+        var replaced = _captures.ContainsKey(key);
+        _captures[key] = capture;
+        return replaced;
+    }
 
     public void Load(string path)
     {
@@ -64,28 +71,99 @@ public sealed class LatestRateStore
             throw new InvalidDataException($"Unsupported latest-rate schema {file.SchemaVersion}.");
         }
 
-        _captures.Clear();
+        var loaded = new Dictionary<string, MarketCapture>(StringComparer.Ordinal);
         foreach (var dto in file.Captures)
         {
-            Store(FromDto(dto));
+            var capture = FromDto(dto);
+            Validate(capture);
+            loaded[Key(capture.League, capture.Pair)] = capture;
+        }
+
+        _captures.Clear();
+        foreach (var pair in loaded)
+        {
+            _captures.Add(pair.Key, pair.Value);
         }
     }
 
     public void Save(string path)
     {
+        AtomicWrite(path, Serialize(_captures.Values));
+    }
+
+    public void StoreBatchAtomically(string path, IReadOnlyCollection<MarketCapture> captures)
+    {
+        ArgumentNullException.ThrowIfNull(captures);
+        if (captures.Count != 3)
+        {
+            throw new ArgumentException("An automated latest-rate batch must contain exactly three captures.", nameof(captures));
+        }
+
+        foreach (var capture in captures)
+        {
+            Validate(capture);
+        }
+
+        if (captures.Select(capture => capture.CaptureId).Distinct().Count() != captures.Count ||
+            captures.Select(capture => capture.Pair).Distinct().Count() != captures.Count ||
+            captures.Select(capture => capture.SessionId).Distinct().Count() != 1 ||
+            captures.Select(capture => capture.League).Distinct(StringComparer.Ordinal).Count() != 1 ||
+            captures.Select(capture => capture.AreaInstanceId).Distinct().Count() != 1)
+        {
+            throw new InvalidDataException("Atomic latest-rate batches require unique pairs in one session, league, and area.");
+        }
+
+        var replacement = new Dictionary<string, MarketCapture>(_captures, StringComparer.Ordinal);
+        foreach (var capture in captures)
+        {
+            replacement[Key(capture.League, capture.Pair)] = capture;
+        }
+
+        AtomicWrite(path, Serialize(replacement.Values));
+        _captures.Clear();
+        foreach (var pair in replacement)
+        {
+            _captures.Add(pair.Key, pair.Value);
+        }
+    }
+
+    private static string Serialize(IEnumerable<MarketCapture> captures)
+    {
         var file = new LatestRateFile
         {
             WrittenAtUtc = DateTimeOffset.UtcNow,
-            Captures = _captures.Values
+            Captures = captures
                 .OrderBy(capture => capture.League, StringComparer.Ordinal)
                 .ThenBy(capture => capture.Pair.ToString(), StringComparer.Ordinal)
                 .Select(ToDto)
                 .ToList()
         };
-        AtomicWrite(path, JsonSerializer.Serialize(file, JsonOptions));
+        return JsonSerializer.Serialize(file, JsonOptions);
     }
 
     private static string Key(string league, CurrencyPairKey pair) => $"{league}\n{pair}";
+
+    private static void Validate(MarketCapture capture)
+    {
+        ArgumentNullException.ThrowIfNull(capture);
+        if (capture.CaptureId == Guid.Empty || capture.SessionId == Guid.Empty)
+        {
+            throw new InvalidDataException("Latest-rate capture IDs must be non-empty.");
+        }
+
+        if (string.IsNullOrWhiteSpace(capture.League) || capture.CapturedAtUtc == default)
+        {
+            throw new InvalidDataException("Latest-rate capture league and timestamp are required.");
+        }
+
+        if (capture.WantedItemStock.Any(level => level.Side != RawBookSide.WantedItem) ||
+            capture.OfferedItemStock.Any(level => level.Side != RawBookSide.OfferedItem))
+        {
+            throw new InvalidDataException("Latest-rate stock rows do not match their stored book sides.");
+        }
+
+        _ = capture.Pair;
+    }
 
     private static MarketCaptureDto ToDto(MarketCapture capture) => new()
     {
