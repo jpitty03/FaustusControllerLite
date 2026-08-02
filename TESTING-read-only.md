@@ -186,7 +186,41 @@ Milestone 8 passes only when the uniquely matched reconciled order disappears, o
 - Final tracked schema 4 status is `Stashed`; all four per-asset collection/stash flags are true, all reserved and completed-uncollected buckets are zero, and unresolved=false.
 - Audit retains `TerminalAssetCollectionArmed`, the initial `CanceledReturnCollectionAmbiguous`, `TerminalAssetCollectionInterruptedPostStateReconciled`, second `TerminalAssetCollectionArmed`, `TerminalAssetsCollectedAndCreditedAtomically`, `TerminalAssetStashProgressVerified`, and `TerminalAssetsStashedAndVerified`.
 - Collection requires zero pre-existing inventory units of the current asset so later stash custody can remain exact. Aggregate ownership may be zero before collection.
-- Interrupted collection intent is hard-blocked without retry. Interrupted stash intent accepts only exact pre-click or exact post-click evidence. Completed controllers ignore later area-change cancellation so stale armed snapshots cannot overwrite newer progress.
+- Interrupted terminal-asset collection and stash intents accept only exact pre-click or exact post-click evidence without retrying the old click. A simple completed-order collection intent without a durable per-asset baseline remains hard-blocked for manual reconciliation. Completed controllers ignore later area-change cancellation so stale armed snapshots cannot overwrite newer progress.
+
+## Milestone 9 Full Workflow
+
+This checkpoint can place, cancel, collect, and stash real orders. Use only a deliberately small disposable bankroll. The implementation is complete, but this checkpoint has not yet been live-validated.
+
+1. Restart ExileAPI and confirm the overlay reports Milestone 9, bankroll schema 5 loads, no active workflow exists, and all permissions/hotkeys are disabled before setup.
+2. Bind only `FullWorkflowHotkey` to a unique key. Confirm every picker, Place Order, collection, return, and cancellation calibration is ready before enabling input.
+3. Enable automated probing, verified movement, verified clicks, query input, amount input, placement, cancellation, collection, stash transfer, and full workflow. Confirm the full `FaustusController` is disabled.
+4. Open foreground exchange, visible Currency Stash, and inventory with picker closed, no popup, no held modifier, no unresolved unrelated order, and zero matching currency already in inventory.
+5. Press the workflow hotkey once. Confirm one coherent three-market probe completes before an exact schema-2 workflow route is persisted. The current leg must then receive a selected-market refresh, remaining-path profitability check, exact restage, and one placement click.
+6. Inspect canonical state after placement. The workflow must be `LegActive`, its attempt ID must match the tracked order, and exactly one offered bucket must equal the tracked reservation. No later leg may start while that order is unresolved.
+7. For an immediate fill, confirm exact collection and stash custody complete before a new three-market probe begins for the next leg. Confirm the next leg spends only the prior leg's verified output, not unrelated target holdings.
+8. For a competing fill, confirm passive polling waits until the persisted deadline. On timeout, verify exactly one row-X click and one typed confirmation click, followed by deterministic collection/stash settlement.
+9. Force a partial fill or no fill. Confirm both proceeds and offered return are reconciled and stashed, then workflow phase becomes `Stopped`; no downstream placement occurs.
+10. During probing, staging, movement to Place Order, cancellation, collection, and stash transfer, separately disable one permission, open a popup, move the mouse, Alt-Tab, close a panel, or change area. Confirm revocation is observed before the next controller effect and no blind retry occurs.
+11. Press the workflow hotkey a second time while a local operation is active. Confirm local automation stops. A pending server order remains tracked and is not represented as canceled.
+12. Restart separately in `Pending`, `TimedOut`, `CancelArmed`, `CancelClicked`, terminal-uncollected, `CollectionArmed`, `Collected`, and `StashTransferArmed`. Confirm no input resumes on load. A new workflow-hotkey press may authorize safe continuation, while interrupted intents first classify exact pre-click or post-click evidence without retrying the old click.
+13. Force profitability below `MinimumProfitChaos`, stale quotes, insufficient immediate depth, and ledger/live ownership disagreement before a later leg. Confirm the workflow stops before placement and retains its durable cursor/evidence.
+14. On exact final completion, confirm workflow phase `Completed`, cursor equals leg count, unresolved is false, every reservation/completed-uncollected bucket is zero, and the audit records planned versus actual terminal Chaos and profit.
+15. For proceeds or returns larger than free inventory capacity, confirm Lite repeatedly collects one authenticated-capacity batch, credits it once, stashes it, and resumes the same left/right slot until the exact row disappears. No opposite-slot collection or downstream placement may begin while a batch awaits stash custody.
+16. Disable every permission, reset every hotkey to `None`, and disable the plugin immediately after the controlled checkpoint.
+
+Milestone 9 live validation passes only after both an immediate continuation and one competing/timeout recovery path preserve exact accounting, custody, authorization, and no-retry guarantees.
+
+## Observed Milestone 9 Evidence
+
+- A two-leg workflow completed `300 Chaos -> 1,830 Alterations -> 305 Chaos` for exact planned/actual profit of 5 Chaos.
+- The first leg exceeded one-click inventory capacity and was collected/stashed automatically in authenticated batches of `1,160` and `670`. Each batch had a durable collection intent, one ledger credit, one verified stash transfer, and zero pending amount before the next click.
+- The second leg collected/stashed 305 Chaos and advanced workflow phase to `Completed`, cursor `2/2`, with every reserved/completed-uncollected bucket zero.
+- A separate `305 Chaos -> 1,830 Alterations` competing order reached its one-minute test deadline with no fill. Lite persisted both cancellation boundaries, recovered 305 Chaos from the right offered-return slot, credited/stashed it once, and stopped the workflow with balances unchanged.
+- Live row matching accepted decimal ratio text, preserved exact competing limit economics through readable head drift, and rejected unreadable/depth/profit states before placement. An organic partial `483 Regrets -> 315 Chaos` row exposed pending cancellation text `1 : 1.53`; the cancellation gate now uses the same integer-only decimal-rounding proof as completed-row matching. The order finished before recovery input and then collected/stashed 315 Chaos exactly once.
+- Restart did not restore transient authorization. Canonical reconciliation and tracked schema-5 migration loaded with no state error.
+- A simultaneous nonzero wanted-proceeds plus offered-return partial fill was not forced; both independent slot paths and batch progress invariants are covered, and the combined branch remains for organic observation.
+- Final isolated bankroll after validation: 305 Chaos, 5 Divine, and 2,319 Alterations; unresolved false. Plugin, permissions, and hotkeys were disabled, with minimum profit restored to 5 and competing wait restored to 6 minutes.
 
 ## Observed Milestone 2 Evidence
 

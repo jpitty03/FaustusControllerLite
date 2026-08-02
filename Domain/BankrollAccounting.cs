@@ -16,16 +16,18 @@ public static class BankrollAccounting
             remainingOfferedAmount > originalOfferedAmount || receivedWantedAmount < 0 ||
             offeredMetadata == wantedMetadata ||
             !TryReadReserved(state, offeredMetadata, chaosMetadata, divineMetadata, out var reserved) ||
-            reserved < originalOfferedAmount ||
+            reserved != originalOfferedAmount ||
             !CanUseCompletedBucket(state, offeredMetadata, remainingOfferedAmount, chaosMetadata, divineMetadata) ||
             !CanUseCompletedBucket(state, wantedMetadata, receivedWantedAmount, chaosMetadata, divineMetadata))
         {
             return false;
         }
 
-        AddReserved(state, offeredMetadata, -originalOfferedAmount, chaosMetadata, divineMetadata);
-        AddCompleted(state, offeredMetadata, remainingOfferedAmount, chaosMetadata, divineMetadata);
-        AddCompleted(state, wantedMetadata, receivedWantedAmount, chaosMetadata, divineMetadata);
+        var shadow = Copy(state);
+        AddReserved(shadow, offeredMetadata, -originalOfferedAmount, chaosMetadata, divineMetadata);
+        AddCompleted(shadow, offeredMetadata, remainingOfferedAmount, chaosMetadata, divineMetadata);
+        AddCompleted(shadow, wantedMetadata, receivedWantedAmount, chaosMetadata, divineMetadata);
+        CopyAccounting(shadow, state);
         return true;
     }
 
@@ -40,21 +42,24 @@ public static class BankrollAccounting
         if (metadata == chaosMetadata)
         {
             if (state.CompletedUncollectedChaos < amount) return false;
+            var available = checked(state.AvailableChaos + amount);
             state.CompletedUncollectedChaos -= amount;
-            state.AvailableChaos = checked(state.AvailableChaos + amount);
+            state.AvailableChaos = available;
             return true;
         }
         if (metadata == divineMetadata)
         {
             if (state.CompletedUncollectedDivine < amount) return false;
+            var available = checked(state.AvailableDivine + amount);
             state.CompletedUncollectedDivine -= amount;
-            state.AvailableDivine = checked(state.AvailableDivine + amount);
+            state.AvailableDivine = available;
             return true;
         }
         if (state.TargetMetadata == metadata && state.CompletedUncollectedTarget >= amount)
         {
+            var available = checked(state.AvailableTarget + amount);
             state.CompletedUncollectedTarget -= amount;
-            state.AvailableTarget = checked(state.AvailableTarget + amount);
+            state.AvailableTarget = available;
             return true;
         }
         return false;
@@ -75,16 +80,27 @@ public static class BankrollAccounting
         if (offeredMetadata == chaosMetadata)
         {
             if (state.AvailableChaos < amount) return false;
+            var reserved = checked(state.ReservedChaos + amount);
             state.AvailableChaos -= amount;
-            state.ReservedChaos = checked(state.ReservedChaos + amount);
+            state.ReservedChaos = reserved;
             return true;
         }
 
         if (offeredMetadata == divineMetadata)
         {
             if (state.AvailableDivine < amount) return false;
+            var reserved = checked(state.ReservedDivine + amount);
             state.AvailableDivine -= amount;
-            state.ReservedDivine = checked(state.ReservedDivine + amount);
+            state.ReservedDivine = reserved;
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(state.TargetMetadata) && offeredMetadata == state.TargetMetadata)
+        {
+            if (state.AvailableTarget < amount) return false;
+            var reserved = checked(state.ReservedTarget + amount);
+            state.AvailableTarget -= amount;
+            state.ReservedTarget = reserved;
             return true;
         }
 
@@ -100,41 +116,46 @@ public static class BankrollAccounting
         string chaosMetadata,
         string divineMetadata)
     {
-        if (offeredAmount <= 0 || wantedAmount <= 0)
+        if (offeredAmount <= 0 || wantedAmount <= 0 ||
+            offeredMetadata != chaosMetadata && offeredMetadata != divineMetadata && offeredMetadata != state.TargetMetadata ||
+            wantedMetadata != chaosMetadata && wantedMetadata != divineMetadata &&
+                !string.IsNullOrEmpty(state.TargetMetadata) && wantedMetadata != state.TargetMetadata)
         {
             return false;
         }
 
+        var shadow = Copy(state);
         if (offeredMetadata == chaosMetadata)
         {
-            if (state.ReservedChaos < offeredAmount) return false;
-            state.ReservedChaos -= offeredAmount;
+            if (shadow.ReservedChaos != offeredAmount) return false;
+            shadow.ReservedChaos -= offeredAmount;
         }
         else if (offeredMetadata == divineMetadata)
         {
-            if (state.ReservedDivine < offeredAmount) return false;
-            state.ReservedDivine -= offeredAmount;
+            if (shadow.ReservedDivine != offeredAmount) return false;
+            shadow.ReservedDivine -= offeredAmount;
         }
         else
         {
-            return false;
+            if (shadow.ReservedTarget != offeredAmount) return false;
+            shadow.ReservedTarget -= offeredAmount;
         }
 
         if (wantedMetadata == chaosMetadata)
         {
-            state.CompletedUncollectedChaos = checked(state.CompletedUncollectedChaos + wantedAmount);
+            shadow.CompletedUncollectedChaos = checked(shadow.CompletedUncollectedChaos + wantedAmount);
         }
         else if (wantedMetadata == divineMetadata)
         {
-            state.CompletedUncollectedDivine = checked(state.CompletedUncollectedDivine + wantedAmount);
+            shadow.CompletedUncollectedDivine = checked(shadow.CompletedUncollectedDivine + wantedAmount);
         }
         else
         {
-            if (string.IsNullOrEmpty(state.TargetMetadata)) state.TargetMetadata = wantedMetadata;
-            if (state.TargetMetadata != wantedMetadata) return false;
-            state.CompletedUncollectedTarget = checked(state.CompletedUncollectedTarget + wantedAmount);
+            if (string.IsNullOrEmpty(shadow.TargetMetadata)) shadow.TargetMetadata = wantedMetadata;
+            shadow.CompletedUncollectedTarget = checked(shadow.CompletedUncollectedTarget + wantedAmount);
         }
 
+        CopyAccounting(shadow, state);
         return true;
     }
 
@@ -188,5 +209,33 @@ public static class BankrollAccounting
             if (string.IsNullOrEmpty(state.TargetMetadata)) state.TargetMetadata = metadata;
             state.CompletedUncollectedTarget = checked(state.CompletedUncollectedTarget + amount);
         }
+    }
+
+    private static BankrollState Copy(BankrollState state) => new()
+    {
+        AvailableChaos = state.AvailableChaos,
+        AvailableDivine = state.AvailableDivine,
+        ReservedChaos = state.ReservedChaos,
+        ReservedDivine = state.ReservedDivine,
+        CompletedUncollectedChaos = state.CompletedUncollectedChaos,
+        CompletedUncollectedDivine = state.CompletedUncollectedDivine,
+        TargetMetadata = state.TargetMetadata,
+        AvailableTarget = state.AvailableTarget,
+        ReservedTarget = state.ReservedTarget,
+        CompletedUncollectedTarget = state.CompletedUncollectedTarget,
+    };
+
+    private static void CopyAccounting(BankrollState source, BankrollState destination)
+    {
+        destination.AvailableChaos = source.AvailableChaos;
+        destination.AvailableDivine = source.AvailableDivine;
+        destination.ReservedChaos = source.ReservedChaos;
+        destination.ReservedDivine = source.ReservedDivine;
+        destination.CompletedUncollectedChaos = source.CompletedUncollectedChaos;
+        destination.CompletedUncollectedDivine = source.CompletedUncollectedDivine;
+        destination.TargetMetadata = source.TargetMetadata;
+        destination.AvailableTarget = source.AvailableTarget;
+        destination.ReservedTarget = source.ReservedTarget;
+        destination.CompletedUncollectedTarget = source.CompletedUncollectedTarget;
     }
 }

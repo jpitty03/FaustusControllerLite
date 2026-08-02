@@ -31,8 +31,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private BankrollStore? _bankrollStore;
     private TrackedOrderStore? _trackedOrderStore;
     private BankrollState _bankroll = BankrollState.Uninitialized;
-    private bool _bankrollResetArmed;
-    private DateTimeOffset _bankrollResetArmExpiresAtUtc;
+    private bool _freshStateResetArmed;
+    private DateTimeOffset _freshStateResetArmExpiresAtUtc;
     private DateTimeOffset _nextCatalogueAttemptUtc;
     private Guid _manualProbeSessionId = Guid.NewGuid();
     private string _latestRatePath = string.Empty;
@@ -43,7 +43,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private bool _latestRateCacheAvailable = true;
     private string _observedTargetLabel = string.Empty;
     private string _catalogueStatus = "Waiting for Currency Exchange catalogue.";
-    private string _operationStatus = "Idle (Milestone 8 verified tracked-order collection available; full workflow is blocked).";
+    private string _operationStatus = "Idle (Milestone 9 full-workflow orchestration available; all input remains permission-gated).";
     private string _lastFailure = "None";
     private string _lastCandidate = "None; capture all three markets in one area/session.";
     private string _trackedOrder = "None";
@@ -57,11 +57,21 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private int _placementRefreshAttempts;
     private CollectionFlowState _collectionFlow;
     private long _collectionOwnedBaseline;
+    private long _collectionBatchAmount;
     private DateTimeOffset _nextLifecyclePollAtUtc;
     private DateTimeOffset _collectionOwnershipPhaseStartedAtUtc;
     private string _collectionOwnershipMetadata = string.Empty;
     private string _stashTransferMetadata = string.Empty;
     private long _stashTransferAmount;
+    private bool _fullWorkflowAuthorized;
+    private bool _startingNewWorkflow;
+    private DateTimeOffset? _nextWorkflowScanAtUtc;
+    private PermissionSnapshot? _workflowAuthorization;
+    private RouteLegResult? _workflowPreparedLeg;
+    private string? _lastLoggedFailure;
+    private ContinuousLoopAction? _lastLoopAction;
+    private DateTimeOffset _nextLoopHeartbeatUtc;
+    private DateTimeOffset? _stalePlacementLatchSinceUtc;
 
     private enum CollectionFlowState
     {
@@ -124,8 +134,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _latestRatePath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "latest-rates.json");
         _diagnosticPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "sdk-diagnostic.txt");
         _pickerCalibrationPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "picker-calibration.json");
-        Settings.ArmBankrollReset.OnPressed += ArmBankrollReset;
-        Settings.ApplyArmedBankrollReset.OnPressed += ApplyArmedBankrollReset;
+        Settings.ArmFreshStateReset.OnPressed += ArmFreshStateReset;
+        Settings.ApplyArmedFreshStateReset.OnPressed += ApplyArmedFreshStateReset;
         try
         {
             _rateStore.Load(_latestRatePath);
@@ -151,10 +161,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     public override Job Tick()
     {
-        if (_bankrollResetArmed && DateTimeOffset.UtcNow > _bankrollResetArmExpiresAtUtc)
+        if (_freshStateResetArmed && DateTimeOffset.UtcNow > _freshStateResetArmExpiresAtUtc)
         {
-            _bankrollResetArmed = false;
-            _operationStatus = "Bankroll reset arm expired without changing the ledger.";
+            _freshStateResetArmed = false;
+            _operationStatus = "Fresh-state reset arm expired without changing any durable state.";
         }
 
         if (_catalogue == null && DateTimeOffset.UtcNow >= _nextCatalogueAttemptUtc)
@@ -326,24 +336,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         if (Settings.FullWorkflowHotkey.PressedOnce())
         {
-            if (_trackedCancellation.IsRunning)
-            {
-                _trackedCancellation.Cancel("Full-workflow hotkey interrupted cancellation.");
-            }
-            if (IsPlacementFlowActive())
-            {
-                AbortPlacementFlow("Full-workflow hotkey interrupted placement preparation.");
-            }
-            if (_singleLegStaging.IsRunning)
-            {
-                _singleLegStaging.Cancel("Full-workflow hotkey interrupted single-leg staging.");
-            }
-            _lastFailure = "Full workflow remains blocked until later milestones; no order was placed.";
+            HandleFullWorkflowHotkey();
         }
+        ValidateWorkflowAuthorizationBeforeInput();
         if (IsCollectionFlowActive() &&
             (!(IsStashTransferFlow()
-                ? StashTransferInputPermissions.From(Settings).Ready
-                : CollectionInputPermissions.From(Settings).Ready) ||
+                ? StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready
+                : CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready) ||
              !Settings.AllowQueryInput.Value))
         {
             AbortCollectionFlow("Collection/query permission changed during tracked-order collection.");
@@ -351,7 +350,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         if (_placementPreparation is PlacementPreparationState.Probing or
                 PlacementPreparationState.RefreshingFirstLeg or PlacementPreparationState.Restaging &&
-            (!Settings.AllowOrderPlacement.Value || Settings.AllowFullWorkflow.Value))
+            (!Settings.AllowOrderPlacement.Value || Settings.AllowFullWorkflow.Value && !_fullWorkflowAuthorized))
         {
             AbortPlacementFlow("Placement/full-workflow permission changed during the authorized one-press sequence.");
         }
@@ -375,7 +374,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _singleLegStaging.Tick(
             GameController,
             _pickerCalibration,
-            StagingInputPermissions.From(Settings),
+            StagingInputPermissions.From(Settings, _fullWorkflowAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value,
             Settings.StableRateSampleCount.Value);
@@ -383,7 +382,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _singleLegPlacement.Tick(
             GameController,
             _pickerCalibration,
-            PlacementInputPermissions.From(Settings),
+            PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value);
         SynchronizeSingleLegPlacementStatus();
@@ -402,34 +401,44 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _trackedCollection.Tick(
             GameController,
             _pickerCalibration,
-            CollectionInputPermissions.From(Settings),
+            CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
             IsFullFaustusControllerEnabled());
         SynchronizeTrackedCollection();
         _inventoryStashTransfer.Tick(
             GameController,
-            StashTransferInputPermissions.From(Settings),
+            StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized),
             IsFullFaustusControllerEnabled());
         SynchronizeInventoryStashTransfer();
         _trackedCancellation.Tick(
             GameController,
             _pickerCalibration,
-            CancellationInputPermissions.From(Settings),
+            CancellationInputPermissions.From(Settings, _fullWorkflowAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value);
         SynchronizeTrackedCancellation();
         _canceledReturnCollection.Tick(
             GameController,
             _pickerCalibration,
-            CollectionInputPermissions.From(Settings),
+            CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value);
         SynchronizeCanceledReturnCollection();
+        DriveFullWorkflow();
+        AppendFailureDiagnosticIfNeeded();
 
         return base.Tick();
     }
 
     public override void OnUnload()
     {
+        _fullWorkflowAuthorized = false;
+        _startingNewWorkflow = false;
+        _nextWorkflowScanAtUtc = null;
+        _automatedProbe.Cancel("Plugin unloading during probing.");
+        _placementLegRefresh.Cancel("Plugin unloading during leg refresh.");
+        _singleLegStaging.Cancel("Plugin unloading during staging.");
+        _singleLegPlacement.EmergencyStop("Plugin unloading during placement.");
+        _collectionOwnershipSelector.Cancel("Plugin unloading during ownership observation.");
         _trackedCancellation.EmergencyStop("Plugin unloading during cancellation.");
         _canceledReturnCollection.EmergencyStop("Plugin unloading during canceled return collection.");
         _inventoryStashTransfer.EmergencyStop("Plugin unloading during inventory-to-stash transfer.");
@@ -439,6 +448,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     public override void OnPluginDestroyForHotReload()
     {
+        _fullWorkflowAuthorized = false;
+        _startingNewWorkflow = false;
+        _nextWorkflowScanAtUtc = null;
+        _automatedProbe.Cancel("Plugin hot reload during probing.");
+        _placementLegRefresh.Cancel("Plugin hot reload during leg refresh.");
+        _singleLegStaging.Cancel("Plugin hot reload during staging.");
+        _singleLegPlacement.EmergencyStop("Plugin hot reload during placement.");
+        _collectionOwnershipSelector.Cancel("Plugin hot reload during ownership observation.");
         _trackedCancellation.EmergencyStop("Plugin hot reload during cancellation.");
         _canceledReturnCollection.EmergencyStop("Plugin hot reload during canceled return collection.");
         _inventoryStashTransfer.EmergencyStop("Plugin hot reload during inventory-to-stash transfer.");
@@ -448,6 +465,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     public override void AreaChange(AreaInstance area)
     {
+        var wasAuthorized = _fullWorkflowAuthorized;
         _automatedProbe.Cancel("Area changed.");
         _placementLegRefresh.Cancel("Area changed.");
         _singleLegStaging.Invalidate("Area changed.");
@@ -458,6 +476,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _canceledReturnCollection.Cancel("Area changed.");
         _collectionOwnershipSelector.Cancel("Area changed.");
         _collectionFlow = CollectionFlowState.Idle;
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
+        _workflowPreparedLeg = null;
+        _startingNewWorkflow = false;
+        _nextWorkflowScanAtUtc = null;
         _placementPreparation = PlacementPreparationState.Idle;
         _placementToken = null;
         _lastObservedStagingState = _singleLegStaging.State;
@@ -469,6 +492,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         LoadTrackedOrderForCurrentLeague();
         _operationStatus = "Area changed; manual probe session reset and cached rates retained.";
         _lastCandidate = "None; captures from the prior area cannot form a coherent matrix.";
+        if (wasAuthorized)
+        {
+            RecordContinuousAuthorizationRevoked(
+                "Area changed; continuous trading stopped locally. Any server-side order remains tracked " +
+                "and the workflow hotkey must be pressed again.");
+        }
     }
 
     public override void Render()
@@ -485,7 +514,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         var x = 100f;
         var y = 100f;
-        DrawStatus("FaustusControllerLite - Milestone 8 verified tracked-order collection", ref y, SharpDX.Color.Cyan);
+        DrawStatus("FaustusControllerLite - Milestone 9 full workflow", ref y, SharpDX.Color.Cyan);
         DrawStatus($"Exchange panel: {(panelVisible ? "visible" : "closed")}", ref y, SharpDX.Color.White);
         DrawStatus($"Catalogue: {_catalogueStatus}", ref y, _catalogue == null ? SharpDX.Color.Orange : SharpDX.Color.LimeGreen);
         DrawStatus($"Target: {Settings.TargetCurrencyDisplayName} | {Settings.TargetCurrencyMetadata}", ref y, SharpDX.Color.White);
@@ -513,9 +542,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _trackedCancellation.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
         DrawStatus($"Canceled return: {_canceledReturnCollection.State} | {_canceledReturnCollection.Status}", ref y,
             _canceledReturnCollection.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
+        DrawStatus($"Workflow: {DescribeWorkflow()}", ref y,
+            _bankroll.Workflow?.IsActive == true ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
+        DrawStatus($"Continuous trading: {DescribeContinuousScan()}", ref y,
+            _fullWorkflowAuthorized ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
         DrawStatus($"Tracked order: {_trackedOrder}", ref y, SharpDX.Color.Gray);
         DrawStatus($"Last candidate path: {_lastCandidate}", ref y, SharpDX.Color.Gray);
-        DrawStatus($"Reset armed: {(_bankrollResetArmed ? "YES (apply within 10 seconds)" : "no")}", ref y, _bankrollResetArmed ? SharpDX.Color.OrangeRed : SharpDX.Color.Gray);
+        DrawStatus($"Fresh-state reset armed: {(_freshStateResetArmed ? "YES (apply within 10 seconds)" : "no")}", ref y, _freshStateResetArmed ? SharpDX.Color.OrangeRed : SharpDX.Color.Gray);
 
         void DrawStatus(string text, ref float currentY, SharpDX.Color color)
         {
@@ -586,6 +619,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void PersistTargetSelection()
     {
+        if (_fullWorkflowAuthorized)
+        {
+            StopFullWorkflowLocal("Target currency changed; local workflow authorization was revoked.");
+        }
         if (IsPlacementFlowActive())
         {
             AbortPlacementFlow("Target currency changed during placement preparation.");
@@ -845,8 +882,30 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _manualProbeSessionId = captures[0].SessionId;
                 _operationStatus = $"Atomically published automated probe session {_manualProbeSessionId:D}; three canonical pairs replaced.";
                 _lastFailure = "None";
-                CalculateCandidate();
+                var outcome = CalculateCandidate();
                 restageForPlacement = _placementPreparation == PlacementPreparationState.Probing;
+                if (restageForPlacement && _fullWorkflowAuthorized)
+                {
+                    var preparation = PrepareWorkflowAfterFullProbe(outcome);
+                    if (preparation != WorkflowPreparationResult.Accepted)
+                    {
+                        restageForPlacement = false;
+                        _placementPreparation = PlacementPreparationState.Idle;
+                        _placementToken = null;
+                        _workflowPreparedLeg = null;
+                        if (ContinuousWorkflowLoop.IsRetryable(preparation))
+                        {
+                            ScheduleContinuousScanRetry();
+                        }
+                        else
+                        {
+                            _fullWorkflowAuthorized = false;
+                            _workflowAuthorization = null;
+                            _startingNewWorkflow = false;
+                            _nextWorkflowScanAtUtc = null;
+                        }
+                    }
+                }
             }
             catch (Exception exception)
             {
@@ -877,6 +936,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _placementPreparation = PlacementPreparationState.Idle;
                 _placementToken = null;
+                if (_fullWorkflowAuthorized)
+                {
+                    _fullWorkflowAuthorized = false;
+                    _workflowAuthorization = null;
+                    _startingNewWorkflow = false;
+                }
             }
             if (_automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
             {
@@ -884,6 +949,251 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
         }
     }
+
+    private WorkflowPreparationResult PrepareWorkflowAfterFullProbe(CandidateOutcome outcome)
+    {
+        if (_bankrollStore is null || !_fullWorkflowAuthorized)
+        {
+            _lastFailure = "Workflow probe completed without canonical authorization/store state.";
+            return WorkflowPreparationResult.Failed;
+        }
+        if (_startingNewWorkflow)
+        {
+            var candidate = _selectedCandidate;
+            var classification = ContinuousWorkflowLoop.ClassifyNewWorkflowProbe(outcome, candidate is not null);
+            if (classification == WorkflowPreparationResult.NoCandidate)
+            {
+                _lastFailure = "None";
+                return WorkflowPreparationResult.NoCandidate;
+            }
+            if (classification != WorkflowPreparationResult.Accepted || candidate is null)
+            {
+                _lastFailure = $"Fresh three-market probe could not produce an accepted full-workflow candidate: {_lastCandidate}";
+                return WorkflowPreparationResult.Failed;
+            }
+            if (!TryValidateWorkflowInventoryCapacity(
+                    candidate.Legs.Select(leg =>
+                        (leg.Edge.From.Metadata, leg.Edge.To.Metadata, leg.InputSpent, leg.Output)),
+                    out var capacityFailure))
+            {
+                _lastFailure = capacityFailure;
+                return WorkflowPreparationResult.Failed;
+            }
+            try
+            {
+                var next = CloneBankroll(_bankroll);
+                next.Workflow = WorkflowCoordinator.Create(
+                    next.League, candidate, _manualProbeSessionId, DateTimeOffset.UtcNow);
+                next.UpdatedAtUtc = DateTimeOffset.UtcNow;
+                _bankrollStore.Save(next);
+                _bankroll = next;
+                _workflowPreparedLeg = candidate.Legs[0];
+                _startingNewWorkflow = false;
+                _nextWorkflowScanAtUtc = null;
+                _operationStatus = $"Persisted workflow {next.Workflow.WorkflowId:D} with {candidate.Legs.Count} exact legs before placement.";
+                return WorkflowPreparationResult.Accepted;
+            }
+            catch (Exception exception)
+            {
+                _lastFailure = $"Could not persist exact workflow plan: {exception.Message}";
+                return WorkflowPreparationResult.Failed;
+            }
+        }
+
+        // Later-leg revalidation is never no-trade scanning: a failed replan stops and requires reauthorization.
+        return TryRefreshWorkflowPlan(out _lastFailure)
+            ? WorkflowPreparationResult.Accepted
+            : WorkflowPreparationResult.Failed;
+    }
+
+    private void ScheduleContinuousScanRetry()
+    {
+        var seconds = ContinuousWorkflowLoop.ResolveRetrySeconds(
+            Settings.ContinuousWorkflowRetrySeconds.Value,
+            Random.Shared.Next(ContinuousWorkflowLoop.MinimumJitterSeconds, ContinuousWorkflowLoop.MaximumJitterSeconds + 1));
+        _nextWorkflowScanAtUtc = DateTimeOffset.UtcNow.AddSeconds(seconds);
+        _startingNewWorkflow = true;
+        _lastFailure = "None";
+        _operationStatus = $"No accepted route this scan ({_lastCandidate}); reprobing in {seconds}s.";
+    }
+
+    private bool TryRefreshWorkflowPlan(out string failure)
+    {
+        var workflow = _bankroll.Workflow;
+        if (workflow?.Phase != WorkflowExecutionPhase.ReadyForLeg || _bankrollStore is null)
+        {
+            failure = "Canonical workflow is not ready for a fresh leg plan.";
+            return false;
+        }
+        if (!TryBuildCurrentQuoteMatrix(out var matrix, out failure) || matrix is null ||
+            !TryGetWorkflowSpendCap(workflow, out var spendCap, out failure) ||
+            !WorkflowCoordinator.TryRefreshRemainingPlan(
+                workflow,
+                matrix.Edges,
+                _manualProbeSessionId,
+                spendCap,
+                Settings.MinimumProfitChaos.Value,
+                DateTimeOffset.UtcNow,
+                out var refreshed,
+                out var currentLeg,
+                out failure) || currentLeg is null)
+        {
+            return false;
+        }
+        if (!TryValidateWorkflowInventoryCapacity(
+                refreshed.Legs.Skip(refreshed.CurrentLegIndex).Select(leg =>
+                    (leg.FromMetadata, leg.ToMetadata, leg.InputSpent, leg.Output)),
+                out failure))
+        {
+            return false;
+        }
+        try
+        {
+            var next = CloneBankroll(_bankroll);
+            next.Workflow = refreshed;
+            next.UpdatedAtUtc = refreshed.UpdatedAtUtc;
+            _bankrollStore.Save(next);
+            _bankroll = next;
+            _workflowPreparedLeg = currentLeg;
+            failure = string.Empty;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            failure = $"Fresh workflow plan persistence failed: {exception.Message}";
+            return false;
+        }
+    }
+
+    private bool TryBuildCurrentQuoteMatrix(out CoherentQuoteMatrix? matrix, out string failure)
+    {
+        matrix = null;
+        if (_catalogue is null ||
+            !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
+            !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
+            !_catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out var target) || target is null)
+        {
+            failure = "Workflow quote matrix identities were unavailable.";
+            return false;
+        }
+        return QuoteMatrixBuilder.TryBuild(
+            _rateStore.Captures,
+            GetCurrentLeague(),
+            _manualProbeSessionId,
+            GameController.Game.IngameState.ServerData.InstanceId,
+            chaos,
+            divine,
+            target,
+            DateTimeOffset.UtcNow,
+            TimeSpan.FromSeconds(Settings.MaximumQuoteAgeSeconds.Value),
+            out matrix,
+            out failure);
+    }
+
+    private bool TryGetWorkflowSpendCap(WorkflowExecutionState workflow, out long spendCap, out string failure)
+    {
+        var metadata = workflow.Legs[workflow.CurrentLegIndex].FromMetadata;
+        var ledger = metadata == GetCatalogueMetadata("Chaos Orb")
+            ? _bankroll.AvailableChaos
+            : metadata == GetCatalogueMetadata("Divine Orb")
+                ? _bankroll.AvailableDivine
+                : metadata == _bankroll.TargetMetadata
+                    ? _bankroll.AvailableTarget
+                    : -1;
+        var now = DateTimeOffset.UtcNow;
+        var area = GameController.Game.IngameState.ServerData.InstanceId;
+        if (ledger < 0 || !_liveOwnedByMetadata.TryGetValue(metadata, out var ownership) ||
+            ownership.AreaInstanceId != area || ownership.StableReads < 2 ||
+            now - ownership.ObservedAtUtc < TimeSpan.Zero ||
+            now - ownership.ObservedAtUtc > TimeSpan.FromSeconds(Settings.MaximumQuoteAgeSeconds.Value))
+        {
+            spendCap = 0;
+            failure = $"Fresh exact ledger/live ownership cap was unavailable for workflow currency {metadata}.";
+            return false;
+        }
+        spendCap = Math.Min(ledger, ownership.Count);
+        failure = string.Empty;
+        return spendCap > 0;
+    }
+
+    private bool TryValidateWorkflowInventoryCapacity(
+        IEnumerable<(string FromMetadata, string ToMetadata, long InputAmount, long OutputAmount)> legs,
+        out string failure)
+    {
+        var planned = legs.ToArray();
+        var metadata = planned.SelectMany(leg => new[] { leg.FromMetadata, leg.ToMetadata })
+            .Distinct(StringComparer.Ordinal).ToArray();
+        var snapshots = new Dictionary<string, InventoryTransferSnapshot>(StringComparer.Ordinal);
+        foreach (var currency in metadata)
+        {
+            if (!InventoryStashTransferController.TryReadSnapshot(
+                    GameController, currency, out var current, out failure))
+                return false;
+            if (current.TargetInventoryAmount != 0)
+            {
+                failure = $"Workflow requires zero pre-existing {currency} in inventory before placement.";
+                return false;
+            }
+            snapshots.Add(currency, current);
+        }
+        if (snapshots.Count == 0)
+        {
+            failure = "Workflow had no currencies for inventory-capacity validation.";
+            return false;
+        }
+        foreach (var (currency, snapshot) in snapshots)
+        {
+            if (!InventoryTransferEvidence.TryGetConservativeCollectionCapacity(
+                    snapshot, out var capacity, out failure)) return false;
+            if (capacity <= 0)
+            {
+                failure = "Workflow requires at least one verified free inventory slot for batched collection custody.";
+                return false;
+            }
+            if (snapshot.TargetMaxStackSize <= 0)
+            {
+                var maximumSettlement = planned.SelectMany(leg => new[]
+                    {
+                        leg.FromMetadata == currency ? leg.InputAmount : 0,
+                        leg.ToMetadata == currency ? leg.OutputAmount : 0,
+                    })
+                    .Max();
+                if (maximumSettlement > capacity)
+                {
+                    failure = $"Workflow can require {maximumSettlement} {currency}, exceeding the {capacity}-unit " +
+                        "first-acquisition capacity provable without an existing visible Currency Stash stack.";
+                    return false;
+                }
+            }
+        }
+        failure = string.Empty;
+        return true;
+    }
+
+    private string GetCatalogueMetadata(string name) =>
+        _catalogue?.TryGetUniqueByName(name, out var currency) == true && currency is not null
+            ? currency.Metadata
+            : string.Empty;
+
+    private bool WorkflowUsesCurrentCurrencies(WorkflowExecutionState workflow)
+    {
+        var allowed = new HashSet<string>(StringComparer.Ordinal)
+        {
+            GetCatalogueMetadata("Chaos Orb"),
+            GetCatalogueMetadata("Divine Orb"),
+            Settings.TargetCurrencyMetadata,
+        };
+        return !allowed.Contains(string.Empty) && workflow.Legs.All(leg =>
+            allowed.Contains(leg.FromMetadata) && allowed.Contains(leg.ToMetadata));
+    }
+
+    private RouteLegResult? GetCurrentPlacementLeg() =>
+        _fullWorkflowAuthorized ? _workflowPreparedLeg : _selectedCandidate?.Legs.FirstOrDefault();
+
+    private string GetCurrentPlacementSignature() =>
+        _fullWorkflowAuthorized
+            ? _bankroll.Workflow?.PlanFingerprint ?? string.Empty
+            : _selectedCandidate?.Signature ?? string.Empty;
 
     private void StartSingleLegStaging(bool placementWorkflowArmed = false)
     {
@@ -897,7 +1207,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = "Staging is blocked while tracked-order collection is active.";
             return;
         }
-        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || _trackedOrderState?.IsUnresolved == true || _bankroll.HasUnresolvedOrder)
+        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || _trackedOrderState?.IsUnresolved == true ||
+            _bankroll.HasUnresolvedOrder || _bankroll.Workflow?.IsActive == true && !_fullWorkflowAuthorized)
         {
             _lastFailure = "Single-leg staging is blocked by unresolved tracked-order state.";
             return;
@@ -916,8 +1227,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         _calibrationObservation = null;
-        CalculateCandidate();
-        var leg = _selectedCandidate?.Legs.FirstOrDefault();
+        if (!_fullWorkflowAuthorized) CalculateCandidate();
+        var leg = GetCurrentPlacementLeg();
         if (leg is null)
         {
             _lastFailure = "No current accepted candidate leg is available to stage.";
@@ -928,7 +1239,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 leg,
                 _pickerCalibration,
-                StagingInputPermissions.From(Settings),
+                StagingInputPermissions.From(Settings, _fullWorkflowAuthorized),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 placementWorkflowArmed,
@@ -936,10 +1247,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _lastFailure = failure;
             _operationStatus = "Single-leg dry-run staging did not start; no amount input was sent.";
+            if (_fullWorkflowAuthorized)
+            {
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+            }
             return;
         }
 
-        _operationStatus = $"Dry-run staging first candidate leg: {leg.InputSpent} {leg.Edge.From.Name} -> {leg.Output} {leg.Edge.To.Name}.";
+        _operationStatus = $"Staging current leg: {leg.InputSpent} {leg.Edge.From.Name} -> {leg.Output} {leg.Edge.To.Name}.";
         _lastFailure = "None";
     }
 
@@ -953,7 +1269,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
-        var leg = _selectedCandidate?.Legs.FirstOrDefault();
+        var leg = GetCurrentPlacementLeg();
         var failure = string.Empty;
         if (leg is null || !_placementLegRefresh.StartSingleMarketProbe(
                 GameController,
@@ -968,6 +1284,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _placementPreparation = PlacementPreparationState.Idle;
             _lastFailure = leg is null ? "Fresh probe produced no accepted first leg." : failure;
+            if (_fullWorkflowAuthorized)
+            {
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+            }
             return;
         }
 
@@ -990,8 +1311,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
                 _rateStore.Store(captures[0]);
                 _rateStore.Save(_latestRatePath);
-                CalculateCandidate();
-                var refreshedLeg = _selectedCandidate?.Legs.FirstOrDefault();
+                if (_fullWorkflowAuthorized)
+                {
+                    if (!TryRefreshWorkflowPlan(out var workflowFailure))
+                    {
+                        throw new InvalidOperationException(workflowFailure);
+                    }
+                }
+                else
+                {
+                    CalculateCandidate();
+                }
+                var refreshedLeg = GetCurrentPlacementLeg();
                 if (refreshedLeg is null)
                 {
                     throw new InvalidOperationException("First-leg refresh removed the accepted candidate.");
@@ -1016,6 +1347,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _placementPreparation = PlacementPreparationState.Idle;
                 _placementToken = null;
                 _lastFailure = $"First-leg refresh/recalculation failed: {exception.Message}";
+                if (_fullWorkflowAuthorized)
+                {
+                    _fullWorkflowAuthorized = false;
+                    _workflowAuthorization = null;
+                }
             }
             finally
             {
@@ -1035,6 +1371,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _placementToken = null;
             _lastFailure = _placementLegRefresh.Failure;
             _placementLegRefresh.AcknowledgeCompletion();
+            if (_fullWorkflowAuthorized)
+            {
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+            }
         }
     }
 
@@ -1062,7 +1403,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 var leg = _singleLegStaging.StagedLeg!;
                 _placementToken = new PlacementPreparationToken(
                     _manualProbeSessionId,
-                    _selectedCandidate!.Signature,
+                    GetCurrentPlacementSignature(),
                     Settings.TargetCurrencyMetadata,
                     Settings.MinimumProfitChaos.Value,
                     leg.Edge.From,
@@ -1084,6 +1425,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _placementPreparation = PlacementPreparationState.Idle;
                 _placementToken = null;
+                if (_fullWorkflowAuthorized)
+                {
+                    _fullWorkflowAuthorized = false;
+                    _workflowAuthorization = null;
+                }
             }
         }
 
@@ -1114,7 +1460,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
-        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || _trackedOrderState?.IsUnresolved == true || _bankroll.HasUnresolvedOrder)
+        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || _trackedOrderState?.IsUnresolved == true ||
+            _bankroll.HasUnresolvedOrder || _bankroll.Workflow?.IsActive == true)
         {
             _lastFailure = "Placement is blocked by unresolved or unreadable tracked-order state.";
             return;
@@ -1151,6 +1498,394 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _operationStatus = "Authorized one-press placement sequence started: probing before any possible click.";
     }
 
+    private void HandleFullWorkflowHotkey()
+    {
+        if (_fullWorkflowAuthorized)
+        {
+            StopFullWorkflowLocal("Second workflow hotkey stopped local automation; any server-side order remains tracked.");
+            return;
+        }
+        if (TryGetHotkeyConflict(out var conflict))
+        {
+            _lastFailure = conflict;
+            return;
+        }
+        var permissions = PermissionSnapshot.From(Settings);
+        var ui = GameController.Game.IngameState.IngameUi;
+        if (!permissions.ReadyForFullWorkflow || IsFullFaustusControllerEnabled() ||
+            !GameController.Window.IsForeground() || !ui.CurrencyExchangePanel.IsVisible ||
+            ui.CurrencyExchangePanel.CurrencyPicker.IsVisible || ui.PopUpWindow.IsVisible ||
+            !ui.StashElement.IsVisible || !ui.InventoryPanel.IsVisible)
+        {
+            _lastFailure = "Full workflow requires every input permission, exclusive Lite ownership, foreground exchange/stash/inventory, closed picker, and no popup.";
+            return;
+        }
+        if (!_pickerCalibration.IsComplete || !_pickerCalibration.IsPlacementComplete ||
+            !_pickerCalibration.IsCollectionComplete || !_pickerCalibration.IsCancellationComplete ||
+            !_pickerCalibration.IsReturnCollectionComplete || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
+            !_bankroll.IsInitialized || IsAnyInputOperationActive())
+        {
+            _lastFailure = "Full workflow requires every picker/order calibration, readable initialized state, and no active input operation.";
+            return;
+        }
+        if (_bankroll.Workflow?.Phase == WorkflowExecutionPhase.LegActive &&
+            _bankroll.Workflow.CurrentAttemptId != _trackedOrderState?.AttemptId)
+        {
+            _lastFailure = "Active workflow and tracked-order identity disagree; manual reconciliation is required.";
+            return;
+        }
+        if (_bankroll.Workflow?.IsActive == true && !WorkflowUsesCurrentCurrencies(_bankroll.Workflow))
+        {
+            _lastFailure = "Persisted workflow currencies do not match the configured target; recovery is blocked.";
+            return;
+        }
+        if (_bankroll.Workflow?.IsActive != true &&
+            (_bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true))
+        {
+            _lastFailure = "A new workflow cannot start while an unrelated tracked order is unresolved.";
+            return;
+        }
+
+        _fullWorkflowAuthorized = true;
+        _workflowAuthorization = permissions;
+        _workflowPreparedLeg = null;
+        _lastFailure = "None";
+        _lastLoggedFailure = null;
+        AppendRuntimeDiagnostic("WorkflowAuthorizationStarted", "Full-workflow hotkey authorization accepted.");
+        if (_bankroll.Workflow?.IsActive == true)
+        {
+            if (WorkflowCoordinator.CanReplaceBeforeFirstPlacement(
+                    _bankroll.Workflow, _trackedOrderState) &&
+                _bankroll.ReservedChaos == 0 && _bankroll.ReservedDivine == 0 && _bankroll.ReservedTarget == 0 &&
+                !_bankroll.HasUnresolvedOrder)
+            {
+                _startingNewWorkflow = true;
+                _operationStatus = "New authorization will replace the unstarted leg-1 route from a fresh coherent probe.";
+                StartWorkflowProbe();
+                return;
+            }
+            _operationStatus = $"Workflow {_bankroll.Workflow.WorkflowId:D} reauthorized; recovery will resume from durable {_bankroll.Workflow.Phase} state.";
+            DriveFullWorkflow();
+            return;
+        }
+
+        _startingNewWorkflow = true;
+        StartWorkflowProbe();
+    }
+
+    private void StartWorkflowProbe()
+    {
+        if (!_fullWorkflowAuthorized || _placementPreparation != PlacementPreparationState.Idle)
+        {
+            return;
+        }
+        _nextWorkflowScanAtUtc = null;
+        _placementPreparation = PlacementPreparationState.Probing;
+        _placementRefreshAttempts = 0;
+        _placementToken = null;
+        _workflowPreparedLeg = null;
+        StartAutomatedProbe();
+        if (!_automatedProbe.IsRunning)
+        {
+            _placementPreparation = PlacementPreparationState.Idle;
+            StopFullWorkflowLocal(_lastFailure);
+            return;
+        }
+        _operationStatus = _startingNewWorkflow
+            ? "Full workflow authorized: probing all three markets before persisting an exact route."
+            : "Workflow next leg authorized: freshly probing all three markets before re-planning the remaining route.";
+    }
+
+    private void DriveFullWorkflow()
+    {
+        if (!_fullWorkflowAuthorized)
+        {
+            // No retry may stay armed once local automation is unauthorized, however it was revoked.
+            _nextWorkflowScanAtUtc = null;
+            return;
+        }
+        var currentPermissions = PermissionSnapshot.From(Settings);
+        if (_workflowAuthorization is null || currentPermissions != _workflowAuthorization ||
+            !currentPermissions.ReadyForFullWorkflow)
+        {
+            StopFullWorkflowLocal("A workflow permission changed; local input stopped without altering server-side order state.");
+            return;
+        }
+        var workflow = _bankroll.Workflow;
+        var settled = !ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(
+            _bankroll, _trackedOrderState, out var unsettledReason);
+        var now = DateTimeOffset.UtcNow;
+        var action = ContinuousWorkflowLoop.Decide(new ContinuousLoopSnapshot(
+            _startingNewWorkflow,
+            IsAnyInputOperationActive(),
+            workflow?.Phase,
+            settled,
+            _nextWorkflowScanAtUtc,
+            now));
+        RecordContinuousLoopDecision(action, now, unsettledReason);
+        switch (action)
+        {
+            case ContinuousLoopAction.Wait:
+                if (_startingNewWorkflow && _nextWorkflowScanAtUtc is { } deadline && !IsAnyInputOperationActive())
+                {
+                    _operationStatus = $"Continuous trading idle: reprobing in " +
+                        $"{Math.Max(0, (int)Math.Ceiling((deadline - now).TotalSeconds))}s ({_lastCandidate}).";
+                }
+                ReleaseStalePlacementLatch(now);
+                return;
+            case ContinuousLoopAction.StopWithoutDurableRoute:
+                StopFullWorkflowLocal("Authorized workflow has no durable route state.");
+                return;
+            case ContinuousLoopAction.StopUnsafeTerminalState:
+                StopFullWorkflowLocal(workflow?.Phase == WorkflowExecutionPhase.Ambiguous
+                    ? "Workflow ended ambiguously; manual reconciliation is required before another workflow starts."
+                    : $"Continuous trading stopped before a fresh scan: {unsettledReason}.");
+                return;
+            case ContinuousLoopAction.StartNewWorkflowScan:
+                if (workflow is not null)
+                {
+                    _operationStatus = workflow.Phase == WorkflowExecutionPhase.Completed
+                        ? $"Workflow complete: planned/actual terminal {workflow.PlannedRealizedChaos} Chaos, " +
+                            $"profit {workflow.PlannedProfitChaos} Chaos; scanning for the next route."
+                        : $"Workflow stopped safely: {workflow.Detail}; scanning for the next route.";
+                }
+                _startingNewWorkflow = true;
+                _workflowPreparedLeg = null;
+                StartWorkflowProbe();
+                return;
+            case ContinuousLoopAction.DriveActiveWorkflow:
+                break;
+        }
+
+        switch (WorkflowCoordinator.Decide(workflow!, _trackedOrderState))
+        {
+            case WorkflowDirectiveKind.ReprobeAndPrepareCurrentLeg:
+                StartWorkflowProbe();
+                break;
+            case WorkflowDirectiveKind.ObserveCurrentOrder:
+                _operationStatus = "Workflow is observing its exact pending order; no additional input is active.";
+                break;
+            case WorkflowDirectiveKind.AuthorizeCancellation:
+                InvokeWorkflowAction(HandleCancelTimedOutOrderHotkey);
+                break;
+            case WorkflowDirectiveKind.RecoverCancellationWithoutRetry:
+                _operationStatus = "Workflow cancellation recovery is observation-only; no cancellation click will be retried.";
+                break;
+            case WorkflowDirectiveKind.AuthorizeSettlementCollection:
+            case WorkflowDirectiveKind.RecoverSettlementCollectionWithoutRetry:
+                InvokeWorkflowAction(HandleCollectTrackedOrderHotkey);
+                break;
+            case WorkflowDirectiveKind.AuthorizeStashTransfer:
+            case WorkflowDirectiveKind.RecoverStashTransferWithoutRetry:
+                InvokeWorkflowAction(HandleStashCollectedCurrencyHotkey);
+                break;
+            case WorkflowDirectiveKind.ManualReconciliationRequired:
+                StopFullWorkflowLocal("Workflow reached an uncertain persisted input boundary; manual reconciliation is required and no click was retried.");
+                break;
+        }
+    }
+
+    private void ValidateWorkflowAuthorizationBeforeInput()
+    {
+        if (!_fullWorkflowAuthorized) return;
+        var current = PermissionSnapshot.From(Settings);
+        if (_workflowAuthorization is null || current != _workflowAuthorization || !current.ReadyForFullWorkflow)
+        {
+            StopFullWorkflowLocal("A workflow permission changed; local input stopped before the next controller step.");
+        }
+    }
+
+    private void InvokeWorkflowAction(Action action)
+    {
+        var updatedBefore = _trackedOrderState?.UpdatedAtUtc;
+        action();
+        if (_fullWorkflowAuthorized && !IsAnyInputOperationActive() &&
+            _trackedOrderState?.UpdatedAtUtc == updatedBefore && _lastFailure != "None")
+        {
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
+            _startingNewWorkflow = false;
+            _nextWorkflowScanAtUtc = null;
+            RecordContinuousAuthorizationRevoked($"Workflow stopped before another effect: {_lastFailure}");
+        }
+    }
+
+    /// <summary>
+    /// Records why continuous authorization ended. Every revocation must leave evidence: an idle
+    /// plugin that logged nothing is indistinguishable from one that is still working.
+    /// No server-side order state is touched here.
+    /// </summary>
+    private void RecordContinuousAuthorizationRevoked(string reason)
+    {
+        _operationStatus = reason;
+        _lastLoopAction = null;
+        _stalePlacementLatchSinceUtc = null;
+        _nextLoopHeartbeatUtc = DateTimeOffset.MinValue;
+        AppendRuntimeDiagnostic("ContinuousAuthorizationRevoked", reason);
+    }
+
+    /// <summary>
+    /// An authorized loop that keeps deciding the same thing writes nothing, so a stall used to be
+    /// indistinguishable from progress. Every decision change and a periodic heartbeat are recorded.
+    /// </summary>
+    private void RecordContinuousLoopDecision(ContinuousLoopAction action, DateTimeOffset now, string unsettledReason)
+    {
+        if (action != ContinuousLoopAction.Wait) _stalePlacementLatchSinceUtc = null;
+        var changed = _lastLoopAction != action;
+        _lastLoopAction = action;
+        if (!changed && now < _nextLoopHeartbeatUtc) return;
+        _nextLoopHeartbeatUtc = now.AddSeconds(ContinuousWorkflowLoop.IdleHeartbeatSeconds);
+        var scan = _nextWorkflowScanAtUtc is { } deadline
+            ? $"{Math.Max(0, (int)Math.Ceiling((deadline - now).TotalSeconds))}s"
+            : "none";
+        AppendRuntimeDiagnostic(
+            "ContinuousLoop",
+            $"{action}; startingNewWorkflow={_startingNewWorkflow}; blockedBy={DescribeActiveInputOperation()}; " +
+            $"nextScanIn={scan}; unsettled={(string.IsNullOrWhiteSpace(unsettledReason) ? "none" : unsettledReason)}");
+    }
+
+    /// <summary>
+    /// Releases a placement latch that no controller owns. Such a latch can hold no armed input, but
+    /// it blocks every scan, which would otherwise stall continuous trading silently and indefinitely.
+    /// </summary>
+    private void ReleaseStalePlacementLatch(DateTimeOffset now)
+    {
+        var owningControllerRunning = _automatedProbe.IsRunning || _placementLegRefresh.IsRunning ||
+            _singleLegStaging.IsRunning || _singleLegPlacement.IsRunning;
+        if (!ContinuousWorkflowLoop.IsStalePlacementLatch(
+                _placementPreparation != PlacementPreparationState.Idle, owningControllerRunning))
+        {
+            _stalePlacementLatchSinceUtc = null;
+            return;
+        }
+        _stalePlacementLatchSinceUtc ??= now;
+        if (!ContinuousWorkflowLoop.HasPersistedFor(
+                _stalePlacementLatchSinceUtc, now, ContinuousWorkflowLoop.StalePlacementLatchSeconds))
+        {
+            return;
+        }
+        var stale = _placementPreparation;
+        _placementPreparation = PlacementPreparationState.Idle;
+        _placementToken = null;
+        _stalePlacementLatchSinceUtc = null;
+        AppendRuntimeDiagnostic(
+            "ContinuousLoopLatchReleased",
+            $"Placement preparation {stale} owned no running controller for " +
+            $"{ContinuousWorkflowLoop.StalePlacementLatchSeconds}s; no input was armed, so the latch was released.");
+    }
+
+    /// <summary>Names whatever currently makes <see cref="IsAnyInputOperationActive"/> true.</summary>
+    private string DescribeActiveInputOperation()
+    {
+        if (_automatedProbe.IsRunning) return $"probe {_automatedProbe.State}";
+        if (_placementLegRefresh.IsRunning) return $"leg refresh {_placementLegRefresh.State}";
+        if (_singleLegStaging.IsRunning) return $"staging {_singleLegStaging.State}";
+        if (_singleLegPlacement.IsRunning) return $"placement {_singleLegPlacement.State}";
+        if (_trackedCancellation.IsRunning) return $"cancellation {_trackedCancellation.State}";
+        if (_trackedCollection.IsRunning) return $"collection {_trackedCollection.State}";
+        if (_canceledReturnCollection.IsRunning) return $"return collection {_canceledReturnCollection.State}";
+        if (_inventoryStashTransfer.IsRunning) return $"stash transfer {_inventoryStashTransfer.State}";
+        if (_collectionOwnershipSelector.IsRunning) return $"ownership read {_collectionOwnershipSelector.State}";
+        if (_collectionFlow != CollectionFlowState.Idle) return $"collection flow {_collectionFlow}";
+        if (_placementPreparation != PlacementPreparationState.Idle) return $"placement preparation {_placementPreparation}";
+        if (_calibrationObservation is not null) return "picker calibration observation";
+        return "nothing";
+    }
+
+    private void StopFullWorkflowLocal(string reason)
+    {
+        if (_trackedCancellation.IsRunning) _trackedCancellation.Cancel(reason);
+        if (IsCollectionFlowActive()) AbortCollectionFlow(reason);
+        if (IsPlacementFlowActive() || _automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _singleLegStaging.IsRunning)
+            AbortPlacementFlow(reason);
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
+        _workflowPreparedLeg = null;
+        _startingNewWorkflow = false;
+        _nextWorkflowScanAtUtc = null;
+        _lastFailure = reason;
+        _operationStatus = reason;
+    }
+
+    private void AppendFailureDiagnosticIfNeeded()
+    {
+        if (string.IsNullOrWhiteSpace(_lastFailure) || _lastFailure == "None")
+        {
+            _lastLoggedFailure = null;
+            return;
+        }
+        if (_fullWorkflowAuthorized && IsAnyInputOperationActive()) return;
+        if (_lastLoggedFailure == _lastFailure) return;
+        _lastLoggedFailure = _lastFailure;
+        AppendRuntimeDiagnostic("Failure", _lastFailure);
+    }
+
+    private void AppendRuntimeDiagnostic(string eventType, string detail)
+    {
+        try
+        {
+            Directory.CreateDirectory(ConfigDirectory);
+            var workflow = _bankroll.Workflow;
+            var diagnostic = new
+            {
+                TimestampUtc = DateTimeOffset.UtcNow,
+                EventType = eventType,
+                Detail = detail,
+                OperationStatus = _operationStatus,
+                FullWorkflowAuthorized = _fullWorkflowAuthorized,
+                PlacementPreparation = _placementPreparation.ToString(),
+                AutomatedProbe = _automatedProbe.State.ToString(),
+                LegRefresh = _placementLegRefresh.State.ToString(),
+                Staging = _singleLegStaging.State.ToString(),
+                Placement = _singleLegPlacement.State.ToString(),
+                Cancellation = _trackedCancellation.State.ToString(),
+                CollectionFlow = _collectionFlow.ToString(),
+                TrackedCollection = _trackedCollection.State.ToString(),
+                TerminalCollection = _canceledReturnCollection.State.ToString(),
+                StashTransfer = _inventoryStashTransfer.State.ToString(),
+                WorkflowId = workflow?.WorkflowId,
+                WorkflowPhase = workflow?.Phase.ToString(),
+                WorkflowLeg = workflow is null ? (int?)null : workflow.CurrentLegIndex + 1,
+                WorkflowLegCount = workflow?.Legs.Count,
+                WorkflowDetail = workflow?.Detail,
+                CandidateStatus = _lastCandidate,
+                CandidatePath = _selectedCandidate is null
+                    ? null
+                    : string.Join(" -> ", _selectedCandidate.Path.Select(currency => currency.Name)),
+                CandidateProfitChaos = _selectedCandidate?.ProfitChaos,
+                CandidateCompetingLegs = _selectedCandidate?.CompetingEdgeCount,
+                CandidateLegs = _selectedCandidate?.Legs.Select(leg => new
+                {
+                    From = leg.Edge.From.Name,
+                    To = leg.Edge.To.Name,
+                    leg.InputSpent,
+                    leg.Output,
+                    Rate = leg.Edge.Rate.ToString(),
+                    Intent = leg.Edge.ExecutionIntent.ToString(),
+                    leg.InputRemainder,
+                }).ToArray(),
+                TrackedStatus = _trackedOrderState?.Status.ToString(),
+                _bankroll.AvailableChaos,
+                _bankroll.AvailableDivine,
+                _bankroll.AvailableTarget,
+                _bankroll.ReservedChaos,
+                _bankroll.ReservedDivine,
+                _bankroll.ReservedTarget,
+                _bankroll.CompletedUncollectedChaos,
+                _bankroll.CompletedUncollectedDivine,
+                _bankroll.CompletedUncollectedTarget,
+                _bankroll.HasUnresolvedOrder,
+            };
+            File.AppendAllText(
+                Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "workflow-runtime.log"),
+                Newtonsoft.Json.JsonConvert.SerializeObject(diagnostic) + Environment.NewLine);
+        }
+        catch
+        {
+            // Runtime diagnostics must never alter workflow behavior.
+        }
+    }
+
     private void StartPreparedPlacement(RouteLegResult stagedLeg)
     {
         var preparationFailure = string.Empty;
@@ -1162,6 +1897,34 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 : preparationFailure;
             _placementPreparation = PlacementPreparationState.Idle;
             _placementToken = null;
+            if (_fullWorkflowAuthorized)
+            {
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+            }
+            return;
+        }
+
+        if (!InventoryStashTransferController.TryReadSnapshot(
+                GameController, stagedLeg.Edge.From.Metadata, out var offeredInventory, out preparationFailure) ||
+            !InventoryStashTransferController.TryReadSnapshot(
+                GameController, stagedLeg.Edge.To.Metadata, out var wantedInventory, out preparationFailure))
+        {
+            _lastFailure = $"Placement stack-size evidence was unavailable: {preparationFailure}";
+            _placementPreparation = PlacementPreparationState.Idle;
+            _placementToken = null;
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
+            return;
+        }
+        if (!UnknownStackCapacityAllows(offeredInventory, stagedLeg.InputSpent, out preparationFailure) ||
+            !UnknownStackCapacityAllows(wantedInventory, stagedLeg.Output, out preparationFailure))
+        {
+            _lastFailure = preparationFailure;
+            _placementPreparation = PlacementPreparationState.Idle;
+            _placementToken = null;
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
             return;
         }
 
@@ -1169,12 +1932,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 stagedLeg,
                 _pickerCalibration,
-                PlacementInputPermissions.From(Settings),
+                PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 Settings.CompetingOrderWaitMinutes.Value,
                 _placementToken!.ProbeSessionId,
                 _placementToken.CandidateSignature,
+                offeredInventory.TargetMaxStackSize,
+                wantedInventory.TargetMaxStackSize,
                 leg => ValidatePlacementPreparation(leg, out var finalFailure)
                     ? (true, string.Empty)
                     : (false, finalFailure),
@@ -1184,11 +1949,33 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = placementFailure;
             _placementPreparation = PlacementPreparationState.Idle;
             _placementToken = null;
+            if (_fullWorkflowAuthorized)
+            {
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+            }
             return;
         }
 
         _placementPreparation = PlacementPreparationState.Placing;
         _operationStatus = "Fresh probe/restage passed; one verified Place Order click is armed automatically.";
+    }
+
+    private static bool UnknownStackCapacityAllows(
+        InventoryTransferSnapshot snapshot,
+        long settlementAmount,
+        out string failure)
+    {
+        if (!InventoryTransferEvidence.TryGetConservativeCollectionCapacity(
+                snapshot, out var capacity, out failure)) return false;
+        if (snapshot.TargetMaxStackSize <= 0 && settlementAmount > capacity)
+        {
+            failure = $"Settlement amount {settlementAmount} exceeds the {capacity}-unit first-acquisition " +
+                "capacity provable without an existing visible Currency Stash stack.";
+            return false;
+        }
+        failure = string.Empty;
+        return true;
     }
 
     private void SynchronizeSingleLegPlacementStatus()
@@ -1211,7 +1998,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
         else if (_singleLegPlacement.State is SingleLegPlacementState.Ambiguous or SingleLegPlacementState.Cancelled)
         {
-            _lastFailure = _singleLegPlacement.Failure;
+            // A blank controller failure must never become the reported reason: overwriting a real
+            // failure with an empty string is what once made an aborted placement silently idle.
+            _lastFailure = string.IsNullOrWhiteSpace(_singleLegPlacement.Failure)
+                ? $"Placement ended {_singleLegPlacement.State} without reporting a reason."
+                : _singleLegPlacement.Failure;
+            if (_fullWorkflowAuthorized)
+            {
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+                _startingNewWorkflow = false;
+                _nextWorkflowScanAtUtc = null;
+                RecordContinuousAuthorizationRevoked($"Placement did not resolve cleanly: {_lastFailure}");
+            }
         }
 
         _placementPreparation = PlacementPreparationState.Idle;
@@ -1230,11 +2029,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return false;
         }
 
-        CalculateCandidate(invalidateStaging: false);
-        var candidate = _selectedCandidate;
-        var currentLeg = candidate?.Legs.FirstOrDefault();
-        if (candidate is null || currentLeg is null ||
-            !string.Equals(candidate.Signature, token.CandidateSignature, StringComparison.Ordinal) ||
+        if (!_fullWorkflowAuthorized) CalculateCandidate(invalidateStaging: false);
+        var currentLeg = GetCurrentPlacementLeg();
+        if (currentLeg is null ||
+            !string.Equals(GetCurrentPlacementSignature(), token.CandidateSignature, StringComparison.Ordinal) ||
             !currentLeg.Edge.From.Equals(token.From) || !currentLeg.Edge.To.Equals(token.To) ||
             currentLeg.Edge.ExecutionIntent != token.ExecutionIntent || currentLeg.Edge.Rate != token.Rate ||
             currentLeg.InputSpent != token.InputSpent || currentLeg.Output != token.Output ||
@@ -1252,7 +2050,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         if (_bankrollStore is null || !_bankroll.IsInitialized)
         {
-            return false;
+            return RejectTrackedOrderPersist(state, eventType, "Canonical bankroll is not loaded.");
         }
 
         try
@@ -1263,12 +2061,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 if (previous?.IsUnresolved == true || !TryMoveAvailableToReserved(next, state.OfferedMetadata, state.OfferedAmount))
                 {
-                    return false;
+                    return RejectTrackedOrderPersist(state, eventType,
+                        $"Arming requires no unresolved order and {state.OfferedAmount} available " +
+                        $"{state.OfferedMetadata} to reserve; previous={previous?.Status.ToString() ?? "none"}.");
                 }
             }
             else if (previous is null || previous.AttemptId != state.AttemptId || !previous.IsUnresolved)
             {
-                return false;
+                return RejectTrackedOrderPersist(state, eventType,
+                    $"Transition requires the same unresolved attempt; previous={previous?.Status.ToString() ?? "none"}, " +
+                    $"attemptMatches={previous?.AttemptId == state.AttemptId}.");
             }
 
             if (state.Status is TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.CanceledUncollected &&
@@ -1279,7 +2081,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     state.TerminalReceivedWantedAmount is not { } received ||
                     !TrySettleTerminal(next, state, remaining, received))
                 {
-                    return false;
+                    return RejectTrackedOrderPersist(state, eventType,
+                        $"Terminal settlement refused for remaining={state.TerminalRemainingOfferedAmount?.ToString() ?? "unknown"}, " +
+                        $"received={state.TerminalReceivedWantedAmount?.ToString() ?? "unknown"}.");
                 }
                 state.LedgerCommittedAtUtc = DateTimeOffset.UtcNow;
             }
@@ -1287,6 +2091,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             next.TrackedOrder = state;
             next.HasUnresolvedOrder = state.IsUnresolved;
             next.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            var priorWorkflowPhase = next.Workflow?.Phase;
+            if (next.Workflow?.IsActive == true)
+            {
+                if (!WorkflowCoordinator.TryApplyTrackedState(
+                        next.Workflow, state, next.UpdatedAtUtc, out var workflow, out var workflowFailure))
+                {
+                    return RejectTrackedOrderPersist(state, eventType, workflowFailure);
+                }
+                next.Workflow = workflow;
+            }
             _bankrollStore.Save(next);
             _bankroll = next;
             _trackedOrderState = state;
@@ -1295,6 +2109,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             try
             {
                 _trackedOrderStore?.AppendAudit(state, eventType);
+                if (next.Workflow is { } workflow && workflow.Phase != priorWorkflowPhase &&
+                    workflow.Phase is WorkflowExecutionPhase.Completed or WorkflowExecutionPhase.Stopped)
+                {
+                    _bankrollStore.AppendWorkflowAudit(WorkflowAuditEvent.From(workflow, state));
+                }
             }
             catch (Exception auditException)
             {
@@ -1304,17 +2123,35 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
         catch (Exception exception)
         {
-            _lastFailure = $"Tracked-order persistence failed: {exception.Message}";
-            return false;
+            return RejectTrackedOrderPersist(state, eventType, $"Persistence threw: {exception.Message}");
         }
+    }
+
+    /// <summary>
+    /// Refuses a durable write and leaves evidence. A rejected canonical write means the plugin's
+    /// belief and the file have diverged; discarding that silently once froze a live order at
+    /// <see cref="TrackedOrderStatus.Armed"/> with reserved principal and no log line anywhere.
+    /// </summary>
+    private bool RejectTrackedOrderPersist(TrackedOrderState state, string eventType, string reason)
+    {
+        _lastFailure = $"Tracked-order persistence refused ({eventType} -> {state.Status}): {reason}";
+        AppendRuntimeDiagnostic("TrackedOrderPersistRejected", _lastFailure);
+        return false;
     }
 
     private void PollTrackedOrderLifecycle()
     {
-        if (_trackedOrderState?.Status is not TrackedOrderStatus.Pending and not TrackedOrderStatus.TimedOut and
-                not TrackedOrderStatus.CancelArmed and not TrackedOrderStatus.CancelClicked ||
+        if (_trackedOrderState?.Status is not TrackedOrderStatus.Armed and not TrackedOrderStatus.Pending and
+                not TrackedOrderStatus.TimedOut and not TrackedOrderStatus.CancelArmed and
+                not TrackedOrderStatus.CancelClicked ||
             DateTimeOffset.UtcNow < _nextLifecyclePollAtUtc || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
             _trackedCancellation.IsRunning)
+        {
+            return;
+        }
+        // An armed placement is still owned by the placement controller until that controller stops.
+        if (_trackedOrderState.Status == TrackedOrderStatus.Armed &&
+            (_singleLegPlacement.IsRunning || _placementPreparation != PlacementPreparationState.Idle))
         {
             return;
         }
@@ -1333,6 +2170,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         var observedAt = DateTimeOffset.UtcNow;
+        if (_trackedOrderState.Status == TrackedOrderStatus.Armed)
+        {
+            ReconcileArmedPlacement(orders, observedAt);
+            return;
+        }
+
         var observation = TrackedOrderLifecycle.Evaluate(_trackedOrderState, orders, observedAt);
         if (observation.Kind == LifecycleObservationKind.NotVisible)
         {
@@ -1418,6 +2261,66 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             next.TerminalReceivedWantedAmount = order.ReceivedWantedAmount;
         }
         PersistTrackedOrder(next, $"TrackedOrderLifecycle{nextStatus}");
+    }
+
+    /// <summary>
+    /// Binds an armed placement whose click already happened to the order it produced. The placement
+    /// controller observes for only a few seconds; anything that outlives that window leaves reserved
+    /// principal against a state that carries no creation date or placed ratio, which no other path
+    /// can reconcile and which reset refuses to clear. Observation only: nothing here sends input.
+    /// </summary>
+    private void ReconcileArmedPlacement(IReadOnlyList<PlacedOrderSnapshot> orders, DateTimeOffset observedAt)
+    {
+        if (_trackedOrderState is not { } armed) return;
+        var reconciliation = ArmedPlacementReconciliation.Evaluate(armed, orders, observedAt);
+        if (reconciliation.Kind == ArmedReconciliationKind.Waiting)
+        {
+            _operationStatus = reconciliation.Detail;
+            return;
+        }
+        if (reconciliation.Kind == ArmedReconciliationKind.Ambiguous || reconciliation.Order is not { } order)
+        {
+            var ambiguous = TrackedOrderCollectionController.CloneTracked(
+                armed, TrackedOrderStatus.Ambiguous, reconciliation.Detail);
+            PersistTrackedOrder(ambiguous, "TrackedOrderArmedReconciliationAmbiguous");
+            return;
+        }
+
+        if (reconciliation.Status is TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.CanceledUncollected &&
+            !TrackedOrderCancellationController.TryValidateTerminalRow(
+                GameController, order,
+                reconciliation.Status == TrackedOrderStatus.CanceledUncollected
+                    ? LifecycleObservationKind.Canceled
+                    : LifecycleObservationKind.Completed,
+                out var terminalFailure))
+        {
+            var ambiguous = TrackedOrderCollectionController.CloneTracked(
+                armed, TrackedOrderStatus.Ambiguous, terminalFailure);
+            PersistTrackedOrder(ambiguous, "TrackedOrderArmedReconciliationTerminalRowAmbiguous");
+            return;
+        }
+
+        var bound = TrackedOrderCollectionController.CloneTracked(armed, reconciliation.Status, reconciliation.Detail);
+        bound.PlayerOrderId = order.PlayerOrderId;
+        bound.GoldCost = order.GoldCost;
+        bound.OrderCreationDateUtc = order.CreationDate;
+        bound.PlacedOfferedRatioPart = order.OfferedRatioPart;
+        bound.PlacedWantedRatioPart = order.WantedRatioPart;
+        bound.WaitStartedAtUtc = order.CreationDate;
+        bound.WaitUntilUtc = order.CreationDate.AddMinutes(Settings.CompetingOrderWaitMinutes.Value);
+        bound.LastObservedAtUtc = observedAt;
+        bound.LastRemainingOfferedAmount = order.RemainingOfferedAmount;
+        bound.LastReceivedWantedAmount = order.ReceivedWantedAmount;
+        if (reconciliation.Status != TrackedOrderStatus.Pending)
+        {
+            bound.TerminalObservedAtUtc = observedAt;
+            bound.TerminalRemainingOfferedAmount = order.RemainingOfferedAmount;
+            bound.TerminalReceivedWantedAmount = order.ReceivedWantedAmount;
+        }
+        if (PersistTrackedOrder(bound, $"TrackedOrderArmedReconciliation{reconciliation.Status}"))
+        {
+            AppendRuntimeDiagnostic("TrackedOrderArmedReconciled", reconciliation.Detail);
+        }
     }
 
     private void CalibrateTrackedCollectionSlot()
@@ -1512,7 +2415,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = "Collection is blocked while another input operation or calibration is active.";
             return;
         }
-        if (_trackedOrderState?.Status == TrackedOrderStatus.Ambiguous &&
+        if (_trackedOrderState?.Status is TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous &&
             _trackedOrderState.CollectionAssetIntent is not null)
         {
             ReconcileInterruptedTerminalCollection();
@@ -1523,27 +2426,29 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             (_trackedOrderState.TerminalRemainingOfferedAmount is > 0 ||
              _trackedOrderState.Status == TrackedOrderStatus.CanceledUncollected))
         {
-            var assets = _trackedOrderState.TerminalRemainingOfferedAmount is { } remaining &&
-                _trackedOrderState.TerminalReceivedWantedAmount is { } received
-                    ? TrackedOrderLifecycle.CreateSettlementAssets(_trackedOrderState, remaining, received)
-                    : Array.Empty<SettlementAsset>();
-            var pending = assets.Where(asset => asset.WantedSlot
-                ? !_trackedOrderState.WantedAssetCollected
-                : !_trackedOrderState.OfferedReturnCollected).ToArray();
-            if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || pending.Length == 0 ||
-                pending[0].WantedSlot && !_pickerCalibration.IsCollectionComplete ||
-                !pending[0].WantedSlot && !_pickerCalibration.IsReturnCollectionComplete)
+            if (_trackedOrderState.PendingWantedBatchAmount > 0 || _trackedOrderState.PendingReturnBatchAmount > 0)
             {
-                _lastFailure = "Terminal settlement collection requires exact pending asset and its calibrated left/right slot.";
+                _lastFailure = "A collected batch is still pending stash custody; authorize stash transfer first.";
                 return;
             }
-            if (!CollectionInputPermissions.From(Settings).Ready || !Settings.AllowQueryInput.Value)
+            var wantedSidePending = TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState) > 0;
+            var returnSidePending = TrackedOrderLifecycle.RemainingReturnToCollect(_trackedOrderState) > 0;
+            var nextWantedSlot = wantedSidePending;
+            if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || !wantedSidePending && !returnSidePending ||
+                nextWantedSlot && !_pickerCalibration.IsCollectionComplete ||
+                !nextWantedSlot && !_pickerCalibration.IsReturnCollectionComplete)
+            {
+                _lastFailure = "Terminal settlement collection requires exact pending amounts and the calibrated left/right slot.";
+                return;
+            }
+            if (!CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready || !Settings.AllowQueryInput.Value)
             {
                 _lastFailure = "Enable movement, clicks, query input, and collection; disable placement/full workflow/cancellation.";
                 return;
             }
             StartCollectionOwnershipRead(
-                CollectionFlowState.ReadingCanceledReturnBaseline, pending[0].Metadata);
+                CollectionFlowState.ReadingCanceledReturnBaseline,
+                nextWantedSlot ? _trackedOrderState.WantedMetadata : _trackedOrderState.OfferedMetadata);
             return;
         }
         if (_bankrollLoadBlocked || _trackedOrderLoadBlocked ||
@@ -1553,7 +2458,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = "Collection requires readable canonical CompletedUncollected state and calibrated tracked-order slot.";
             return;
         }
-        if (!CollectionInputPermissions.From(Settings).Ready || !Settings.AllowQueryInput.Value)
+        if (!CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready || !Settings.AllowQueryInput.Value)
         {
             _lastFailure = "Enable movement, clicks, query input, and collection; disable placement and full workflow.";
             return;
@@ -1566,49 +2471,66 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         var failure = string.Empty;
         SettlementAsset? asset = null;
-        if (_trackedOrderState?.CollectionAssetIntent is not { } intent ||
-            !CanceledReturnCollectionController.VerifyInterruptedPostState(
+        if (_trackedOrderState?.CollectionAssetIntent is not { } intent)
+        {
+            _lastFailure = "Interrupted terminal collection lacked a durable asset intent.";
+            return;
+        }
+        if (!CanceledReturnCollectionController.VerifyInterruptedPostState(
                 GameController, _trackedOrderState, _pickerCalibration, out asset, out failure) || asset is null)
         {
-            _lastFailure = string.IsNullOrEmpty(failure)
-                ? "Interrupted terminal collection post-state was not exact; no retry or reconciliation performed."
-                : failure;
-            return;
-        }
-        var progress = TrackedOrderCollectionController.CloneTracked(
-            _trackedOrderState, intent.TerminalStatus,
-            $"Reconciled exact interrupted {(asset.WantedSlot ? "wanted proceeds" : "offered return")} post-state without retrying input.");
-        progress.CollectionAssetIntent = null;
-        if (asset.WantedSlot) progress.WantedAssetCollected = true;
-        else progress.OfferedReturnCollected = true;
-        var assets = TrackedOrderLifecycle.CreateSettlementAssets(
-            progress, progress.TerminalRemainingOfferedAmount!.Value,
-            progress.TerminalReceivedWantedAmount!.Value);
-        var allCollected = assets.All(settlementAsset => settlementAsset.WantedSlot
-            ? progress.WantedAssetCollected
-            : progress.OfferedReturnCollected);
-        if (!allCollected)
-        {
-            if (!PersistTrackedOrder(progress, "TerminalAssetCollectionInterruptedPostStateReconciled"))
+            if (CanceledReturnCollectionController.VerifyInterruptedPreState(
+                    GameController, _trackedOrderState, _pickerCalibration, out var preFailure))
             {
-                _lastFailure = "Exact interrupted terminal collection evidence was observed but canonical progress could not be persisted.";
+                var disarmed = TrackedOrderCollectionController.CloneTracked(
+                    _trackedOrderState, intent.TerminalStatus,
+                    "Recovered exact interrupted terminal-asset pre-click state; no input was retried.");
+                disarmed.CollectionAssetIntent = null;
+                if (PersistTrackedOrder(disarmed, "TerminalAssetCollectionInterruptedPreStateRecovered"))
+                {
+                    var wasAuthorized = _fullWorkflowAuthorized;
+                    _fullWorkflowAuthorized = false;
+                    _workflowAuthorization = null;
+                    _startingNewWorkflow = false;
+                    _nextWorkflowScanAtUtc = null;
+                    _operationStatus = "Recovered exact terminal-asset pre-click state; a new hotkey authorization is required.";
+                    _lastFailure = "None";
+                    if (wasAuthorized) RecordContinuousAuthorizationRevoked(_operationStatus);
+                }
+                else
+                {
+                    _lastFailure = "Exact terminal-asset pre-click state was observed but could not be persisted.";
+                }
                 return;
             }
-            _operationStatus = "Interrupted terminal asset was reconciled from exact post-state without retry; authorize collection for the remaining slot.";
-            _lastFailure = "None";
+            _lastFailure = string.IsNullOrEmpty(failure)
+                ? preFailure
+                : $"{failure} Pre-click classification also failed: {preFailure}";
             return;
         }
-
         try
         {
             var next = CloneBankroll(_bankroll);
-            foreach (var settlementAsset in assets)
+            if (!TryCreditCollected(next, intent.Metadata, intent.Amount))
+                throw new InvalidDataException("Recovered batch did not match canonical completed buckets.");
+            var progress = TrackedOrderCollectionController.CloneTracked(
+                _trackedOrderState, TrackedOrderStatus.Collected,
+                $"Reconciled exact interrupted {(asset.WantedSlot ? "wanted proceeds" : "offered return")} batch of {intent.Amount} and credited it without retrying input.");
+            progress.CollectionAssetIntent = null;
+            if (asset.WantedSlot)
             {
-                if (!TryCreditCollected(next, settlementAsset.Metadata, settlementAsset.Amount))
-                    throw new InvalidDataException("Recovered terminal assets did not match canonical completed buckets.");
+                progress.PendingWantedBatchAmount = intent.Amount;
+                progress.WantedAssetCollected =
+                    progress.SettledWantedAmount + progress.PendingWantedBatchAmount ==
+                    TrackedOrderLifecycle.TotalWantedProceeds(progress);
             }
-            progress.Status = TrackedOrderStatus.Collected;
-            progress.Detail = "Reconciled final interrupted terminal asset and atomically credited every settlement asset without retrying input.";
+            else
+            {
+                progress.PendingReturnBatchAmount = intent.Amount;
+                progress.OfferedReturnCollected =
+                    progress.SettledReturnAmount + progress.PendingReturnBatchAmount ==
+                    TrackedOrderLifecycle.TotalOfferedReturn(progress);
+            }
             progress.UpdatedAtUtc = DateTimeOffset.UtcNow;
             next.TrackedOrder = progress;
             next.HasUnresolvedOrder = true;
@@ -1616,18 +2538,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _bankrollStore!.Save(next);
             _bankroll = next;
             _trackedOrderState = progress;
-            _trackedOrder = "Collected all terminal assets after exact interrupted post-state reconciliation";
-            try { _trackedOrderStore?.AppendAudit(progress, "TerminalAssetsInterruptedFinalPostStateReconciledAndCredited"); }
+            _trackedOrder = $"Reconciled and credited interrupted batch of {intent.Amount} {intent.Metadata}";
+            try { _trackedOrderStore?.AppendAudit(progress, "TerminalAssetBatchInterruptedPostStateReconciledAndCredited"); }
             catch (Exception auditException)
             {
-                _lastFailure = $"Recovered assets settled canonically, audit append failed: {auditException.Message}";
+                _lastFailure = $"Recovered batch settled canonically, audit append failed: {auditException.Message}";
             }
-            _operationStatus = "Final interrupted terminal asset reconciled and all assets credited atomically; stash custody remains.";
-            if (!_lastFailure.StartsWith("Recovered assets settled", StringComparison.Ordinal)) _lastFailure = "None";
+            _operationStatus = "Interrupted collection batch reconciled and credited; verified stash custody remains.";
+            if (!_lastFailure.StartsWith("Recovered batch settled", StringComparison.Ordinal)) _lastFailure = "None";
         }
         catch (Exception exception)
         {
-            _lastFailure = $"Final interrupted terminal collection reconciliation failed closed: {exception.Message}";
+            _lastFailure = $"Interrupted terminal batch reconciliation failed closed: {exception.Message}";
         }
     }
 
@@ -1757,7 +2679,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 _trackedOrderState,
                 _pickerCalibration,
-                CancellationInputPermissions.From(Settings),
+                CancellationInputPermissions.From(Settings, _fullWorkflowAuthorized),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 PersistTrackedOrder,
@@ -1779,7 +2701,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
         if (IsAnyInputOperationActive() || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
             !_bankroll.IsInitialized || _bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true ||
-            _bankrollStore is null || _catalogue is null)
+            _bankroll.Workflow?.IsActive == true || _bankrollStore is null || _catalogue is null)
         {
             _lastFailure = "Pending adoption requires initialized resolved bankroll and no active operation.";
             return;
@@ -1940,6 +2862,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _operationStatus = _trackedCancellation.Status;
             _lastFailure = _trackedCancellation.Failure;
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
         }
     }
 
@@ -1981,27 +2905,28 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
         if (_trackedOrderState.Status == TrackedOrderStatus.Collected)
         {
-            var assets = _trackedOrderState.TerminalRemainingOfferedAmount is { } remaining &&
-                _trackedOrderState.TerminalReceivedWantedAmount is { } received
-                    ? TrackedOrderLifecycle.CreateSettlementAssets(_trackedOrderState, remaining, received)
-                    : Array.Empty<SettlementAsset>();
-            var pending = assets.Where(asset => asset.WantedSlot
-                ? _trackedOrderState.WantedAssetCollected && !_trackedOrderState.WantedAssetStashed
-                : _trackedOrderState.OfferedReturnCollected && !_trackedOrderState.OfferedReturnStashed).ToArray();
-            if (pending.Length == 0)
+            if (_trackedOrderState.PendingWantedBatchAmount > 0)
             {
-                _lastFailure = "No ownership-verified terminal asset remains pending stash custody.";
+                _stashTransferMetadata = _trackedOrderState.WantedMetadata;
+                _stashTransferAmount = _trackedOrderState.PendingWantedBatchAmount;
+            }
+            else if (_trackedOrderState.PendingReturnBatchAmount > 0)
+            {
+                _stashTransferMetadata = _trackedOrderState.OfferedMetadata;
+                _stashTransferAmount = _trackedOrderState.PendingReturnBatchAmount;
+            }
+            else
+            {
+                _lastFailure = "No ownership-verified collection batch remains pending stash custody.";
                 return;
             }
-            _stashTransferMetadata = pending[0].Metadata;
-            _stashTransferAmount = pending[0].Amount;
         }
         else if (_trackedOrderState.StashTransferIntent is { } recoveryIntent)
         {
             _stashTransferMetadata = recoveryIntent.Metadata;
             _stashTransferAmount = recoveryIntent.Amount;
         }
-        if (!StashTransferInputPermissions.From(Settings).Ready || !Settings.AllowQueryInput.Value)
+        if (!StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready || !Settings.AllowQueryInput.Value)
         {
             _lastFailure = "Enable movement, clicks, query input, collection, and stash transfer; disable placement and full workflow.";
             return;
@@ -2074,13 +2999,52 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             if (_collectionFlow == CollectionFlowState.ReadingBaseline)
             {
                 _collectionOwnedBaseline = owned;
+                if (!InventoryStashTransferController.TryReadSnapshot(
+                        GameController, _trackedOrderState!.WantedMetadata, out var inventory, out failure) ||
+                    inventory.TargetInventoryAmount != 0)
+                {
+                    AbortCollectionFlow(string.IsNullOrEmpty(failure)
+                        ? "Simple collection requires zero pre-existing wanted currency in inventory for exact custody."
+                        : failure);
+                    return;
+                }
+                if (!InventoryTransferEvidence.TryGetConservativeCollectionCapacity(
+                        inventory with
+                        {
+                            TargetMaxStackSize = inventory.TargetMaxStackSize > 0
+                                ? inventory.TargetMaxStackSize
+                                : _trackedOrderState.WantedMaxStackSize
+                        }, out var capacity, out failure))
+                {
+                    AbortCollectionFlow(failure);
+                    return;
+                }
+                var remainingProceeds = _trackedOrderState.TerminalReceivedWantedAmount is null
+                    ? _trackedOrderState.WantedAmount
+                    : TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState);
+                if (inventory.TargetMaxStackSize <= 0 && _trackedOrderState.WantedMaxStackSize <= 0 &&
+                    remainingProceeds > capacity)
+                {
+                    AbortCollectionFlow(
+                        $"First acquisition of {_trackedOrderState.WantedMetadata} exceeds the {capacity}-unit " +
+                        "capacity provable without an existing stack; seed one visible Currency Stash stack first.");
+                    return;
+                }
+                _collectionBatchAmount = Math.Min(capacity, remainingProceeds);
+                if (_collectionBatchAmount <= 0)
+                {
+                    AbortCollectionFlow("No verified free inventory capacity was available for a collection batch.");
+                    return;
+                }
                 if (!_trackedCollection.Start(
                         GameController,
                         _trackedOrderState!,
                         _pickerCalibration,
-                        CollectionInputPermissions.From(Settings),
+                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
                         IsFullFaustusControllerEnabled(),
                         Settings.CursorTweenSpeed.Value,
+                        _collectionBatchAmount,
+                        _collectionOwnedBaseline,
                         PersistTrackedOrder,
                         out failure))
                 {
@@ -2089,11 +3053,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 }
 
                 _collectionFlow = CollectionFlowState.ClickingTrackedOrder;
-                _operationStatus = $"Pre-collection owned count {_collectionOwnedBaseline}; collecting exact tracked order once.";
+                _operationStatus = $"Pre-collection owned count {_collectionOwnedBaseline}; collecting one exact batch of {_collectionBatchAmount}.";
             }
             else if (_collectionFlow == CollectionFlowState.ReadingAfter)
             {
-                var expected = checked(_collectionOwnedBaseline + _trackedOrderState!.WantedAmount);
+                var expected = checked(_collectionOwnedBaseline + _collectionBatchAmount);
                 if (owned != expected)
                 {
                     MarkCollectionAmbiguous($"Post-collection owned count was {owned}, expected exactly {expected}.");
@@ -2108,7 +3072,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 if (!_inventoryStashTransfer.Start(
                         GameController,
                         _trackedOrderState!,
-                        StashTransferInputPermissions.From(Settings),
+                        StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized),
                         IsFullFaustusControllerEnabled(),
                         Settings.CursorTweenSpeed.Value,
                         _stashTransferMetadata,
@@ -2145,7 +3109,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         GameController,
                         _trackedOrderState!,
                         _pickerCalibration,
-                        CollectionInputPermissions.From(Settings),
+                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
                         IsFullFaustusControllerEnabled(),
                         Settings.CursorTweenSpeed.Value,
                         owned,
@@ -2243,44 +3207,39 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 MarkCollectionAmbiguous(custodyFailure);
                 return;
             }
-            var assets = TrackedOrderLifecycle.CreateSettlementAssets(_trackedOrderState, remaining, received);
-            if (!assets.Any(asset => asset.Metadata == intent.Metadata && asset.Amount == intent.Amount &&
-                    asset.WantedSlot == intent.WantedSlot))
+            var sideRemaining = intent.WantedSlot
+                ? TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState)
+                : TrackedOrderLifecycle.RemainingReturnToCollect(_trackedOrderState);
+            if (intent.Amount <= 0 || intent.Amount > sideRemaining ||
+                intent.Metadata != (intent.WantedSlot
+                    ? _trackedOrderState.WantedMetadata
+                    : _trackedOrderState.OfferedMetadata))
             {
-                throw new InvalidDataException("Collection intent did not match a terminal settlement asset.");
+                throw new InvalidDataException("Collection intent did not match the remaining terminal settlement amount.");
+            }
+            var next = CloneBankroll(_bankroll);
+            if (!TryCreditCollected(next, intent.Metadata, intent.Amount))
+            {
+                throw new InvalidDataException("Completed-uncollected batch did not match canonical currency bucket.");
             }
             var progress = TrackedOrderCollectionController.CloneTracked(
-                _trackedOrderState, intent.TerminalStatus,
-                $"Verified terminal {(intent.WantedSlot ? "wanted proceeds" : "offered return")} entered inventory; owned count is {observedOwned}.");
+                _trackedOrderState, TrackedOrderStatus.Collected,
+                $"Verified terminal {(intent.WantedSlot ? "wanted proceeds" : "offered return")} batch of {intent.Amount} entered inventory; owned count is {observedOwned}.");
             progress.CollectionAssetIntent = null;
-            if (intent.WantedSlot) progress.WantedAssetCollected = true;
-            else progress.OfferedReturnCollected = true;
-            var allCollected = assets.All(asset => asset.WantedSlot
-                ? progress.WantedAssetCollected
-                : progress.OfferedReturnCollected);
-
-            if (!allCollected)
+            if (intent.WantedSlot)
             {
-                if (!PersistTrackedOrder(progress, "TerminalAssetCollectionProgressVerified"))
-                {
-                    throw new InvalidDataException("Could not persist first terminal asset progress.");
-                }
-                _collectionFlow = CollectionFlowState.Idle;
-                _operationStatus = "First terminal asset verified in inventory; authorize collection again for the remaining slot.";
-                _lastFailure = "None";
-                return;
+                progress.PendingWantedBatchAmount = intent.Amount;
+                progress.WantedAssetCollected =
+                    progress.SettledWantedAmount + progress.PendingWantedBatchAmount ==
+                    TrackedOrderLifecycle.TotalWantedProceeds(progress);
             }
-
-            var next = CloneBankroll(_bankroll);
-            foreach (var asset in assets)
+            else
             {
-                if (!TryCreditCollected(next, asset.Metadata, asset.Amount))
-                {
-                    throw new InvalidDataException("Completed-uncollected settlement assets did not match canonical buckets.");
-                }
+                progress.PendingReturnBatchAmount = intent.Amount;
+                progress.OfferedReturnCollected =
+                    progress.SettledReturnAmount + progress.PendingReturnBatchAmount ==
+                    TrackedOrderLifecycle.TotalOfferedReturn(progress);
             }
-            progress.Status = TrackedOrderStatus.Collected;
-            progress.Detail = "All terminal settlement assets are ownership-verified in inventory and credited atomically.";
             progress.UpdatedAtUtc = DateTimeOffset.UtcNow;
             next.TrackedOrder = progress;
             next.HasUnresolvedOrder = progress.IsUnresolved;
@@ -2288,12 +3247,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _bankrollStore.Save(next);
             _bankroll = next;
             _trackedOrderState = progress;
-            _trackedOrder = $"Collected {assets.Count} terminal settlement asset(s)";
-            try { _trackedOrderStore?.AppendAudit(progress, "TerminalAssetsCollectedAndCreditedAtomically"); }
-            catch (Exception auditException) { _lastFailure = $"Terminal assets settled canonically, audit append failed: {auditException.Message}"; }
+            _trackedOrder = $"Collected terminal batch of {intent.Amount} {intent.Metadata}";
+            try { _trackedOrderStore?.AppendAudit(progress, "TerminalAssetBatchCollectedAndCredited"); }
+            catch (Exception auditException) { _lastFailure = $"Terminal batch settled canonically, audit append failed: {auditException.Message}"; }
             _collectionFlow = CollectionFlowState.Idle;
-            _operationStatus = "All terminal assets collected and credited atomically; sequential stash custody remains required.";
-            if (!_lastFailure.StartsWith("Terminal assets settled", StringComparison.Ordinal)) _lastFailure = "None";
+            _operationStatus = "Terminal batch collected and credited; verified stash custody is required before the next batch.";
+            if (!_lastFailure.StartsWith("Terminal batch settled", StringComparison.Ordinal)) _lastFailure = "None";
         }
         catch (Exception exception)
         {
@@ -2330,34 +3289,50 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
-        var assets = _trackedOrderState.TerminalRemainingOfferedAmount is { } remaining &&
-            _trackedOrderState.TerminalReceivedWantedAmount is { } received
-                ? TrackedOrderLifecycle.CreateSettlementAssets(_trackedOrderState, remaining, received)
-                : Array.Empty<SettlementAsset>();
-        var matchingAsset = assets.SingleOrDefault(asset =>
-            asset.Metadata == intent.Metadata && asset.Amount == intent.Amount);
-        if (matchingAsset is null)
+        var wantedSide = intent.Metadata == _trackedOrderState.WantedMetadata;
+        var pendingBatch = wantedSide
+            ? _trackedOrderState.PendingWantedBatchAmount
+            : _trackedOrderState.PendingReturnBatchAmount;
+        if (pendingBatch <= 0 || intent.Amount != pendingBatch ||
+            !wantedSide && intent.Metadata != _trackedOrderState.OfferedMetadata)
         {
-            MarkStashTransferAmbiguous("Stash intent did not match one terminal settlement asset.");
+            MarkStashTransferAmbiguous("Stash intent did not match the exact pending collection batch.");
             return;
         }
         var stashed = TrackedOrderCollectionController.CloneTracked(
             _trackedOrderState,
             TrackedOrderStatus.Collected,
             $"Verified {intent.Amount} {intent.Metadata} left inventory, entered visible Currency Stash, and aggregate ownership remained {observedOwned}.");
-        if (matchingAsset.WantedSlot) stashed.WantedAssetStashed = true;
-        else stashed.OfferedReturnStashed = true;
+        if (wantedSide)
+        {
+            stashed.SettledWantedAmount = checked(stashed.SettledWantedAmount + pendingBatch);
+            stashed.PendingWantedBatchAmount = 0;
+            stashed.WantedAssetStashed =
+                stashed.SettledWantedAmount == TrackedOrderLifecycle.TotalWantedProceeds(stashed);
+        }
+        else
+        {
+            stashed.SettledReturnAmount = checked(stashed.SettledReturnAmount + pendingBatch);
+            stashed.PendingReturnBatchAmount = 0;
+            stashed.OfferedReturnStashed =
+                stashed.SettledReturnAmount == TrackedOrderLifecycle.TotalOfferedReturn(stashed);
+        }
         if (!_inventoryStashTransfer.VerifyPostState(GameController, out var custodyFailure))
         {
             MarkStashTransferAmbiguous(custodyFailure);
             return;
         }
         stashed.StashTransferIntent = null;
-        var allStashed = assets.All(asset => asset.WantedSlot
-            ? stashed.WantedAssetStashed
-            : stashed.OfferedReturnStashed);
-        if (allStashed) stashed.Status = TrackedOrderStatus.Stashed;
-        var eventType = allStashed ? "TerminalAssetsStashedAndVerified" : "TerminalAssetStashProgressVerified";
+        var remainingToCollect = TrackedOrderLifecycle.RemainingToCollect(stashed);
+        var anotherBatchPending = stashed.PendingWantedBatchAmount > 0 || stashed.PendingReturnBatchAmount > 0;
+        var allStashed = remainingToCollect == 0 &&
+            !anotherBatchPending;
+        stashed.Status = allStashed
+            ? TrackedOrderStatus.Stashed
+            : anotherBatchPending
+                ? TrackedOrderStatus.Collected
+                : TrackedOrderStatus.CompletedUncollected;
+        var eventType = allStashed ? "TerminalAssetsStashedAndVerified" : "CollectionBatchStashProgressVerified";
         if (!PersistTrackedOrder(stashed, eventType))
         {
             MarkStashTransferAmbiguous("Could not persist verified stashed state.");
@@ -2366,8 +3341,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         _collectionFlow = CollectionFlowState.Idle;
         _operationStatus = allStashed
-            ? "Lifecycle custody complete: every terminal asset is verified in Currency Stash."
-            : "One terminal asset is stashed; authorize stash transfer again for the remaining asset.";
+            ? "Lifecycle custody complete: every collected batch is verified in Currency Stash."
+            : $"Batch stashed; {remainingToCollect} settlement units remain to collect in further batches.";
         _lastFailure = "None";
     }
 
@@ -2406,35 +3381,56 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _collectionFlow = CollectionFlowState.Idle;
             _operationStatus = "Recovered exact pre-click inventory/stash state; press stash-transfer hotkey again for a new authorization.";
             _lastFailure = "None";
+            var wasAuthorized = _fullWorkflowAuthorized;
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
+            _startingNewWorkflow = false;
+            _nextWorkflowScanAtUtc = null;
+            if (wasAuthorized) RecordContinuousAuthorizationRevoked(_operationStatus);
             return;
         }
 
         if (recovery == InventoryTransferEvidence.RecoveryKind.PostTransfer)
         {
-            var assets = _trackedOrderState.TerminalRemainingOfferedAmount is { } remaining &&
-                _trackedOrderState.TerminalReceivedWantedAmount is { } received
-                    ? TrackedOrderLifecycle.CreateSettlementAssets(_trackedOrderState, remaining, received)
-                    : Array.Empty<SettlementAsset>();
-            var matchingAsset = assets.SingleOrDefault(asset =>
-                asset.Metadata == intent.Metadata && asset.Amount == intent.Amount);
-            if (matchingAsset is null)
+            var wantedSide = intent.Metadata == _trackedOrderState.WantedMetadata;
+            var pendingBatch = wantedSide
+                ? _trackedOrderState.PendingWantedBatchAmount
+                : _trackedOrderState.PendingReturnBatchAmount;
+            if (pendingBatch <= 0 || intent.Amount != pendingBatch ||
+                !wantedSide && intent.Metadata != _trackedOrderState.OfferedMetadata)
             {
-                MarkStashTransferAmbiguous("Recovered stash intent did not match one terminal asset.");
+                MarkStashTransferAmbiguous("Recovered stash intent did not match the exact pending collection batch.");
                 return;
             }
             var stashed = TrackedOrderCollectionController.CloneTracked(
                 _trackedOrderState, TrackedOrderStatus.Collected,
                 "Recovered interrupted stash transfer from exact post-state and unchanged aggregate ownership.");
-            if (matchingAsset.WantedSlot) stashed.WantedAssetStashed = true;
-            else stashed.OfferedReturnStashed = true;
+            if (wantedSide)
+            {
+                stashed.SettledWantedAmount = checked(stashed.SettledWantedAmount + pendingBatch);
+                stashed.PendingWantedBatchAmount = 0;
+                stashed.WantedAssetStashed =
+                    stashed.SettledWantedAmount == TrackedOrderLifecycle.TotalWantedProceeds(stashed);
+            }
+            else
+            {
+                stashed.SettledReturnAmount = checked(stashed.SettledReturnAmount + pendingBatch);
+                stashed.PendingReturnBatchAmount = 0;
+                stashed.OfferedReturnStashed =
+                    stashed.SettledReturnAmount == TrackedOrderLifecycle.TotalOfferedReturn(stashed);
+            }
             stashed.StashTransferIntent = null;
-            var allStashed = assets.All(asset => asset.WantedSlot
-                ? stashed.WantedAssetStashed
-                : stashed.OfferedReturnStashed);
-            if (allStashed) stashed.Status = TrackedOrderStatus.Stashed;
+            var allStashed = TrackedOrderLifecycle.RemainingToCollect(stashed) == 0 &&
+                stashed.PendingWantedBatchAmount == 0 && stashed.PendingReturnBatchAmount == 0;
+            var anotherBatchPending = stashed.PendingWantedBatchAmount > 0 || stashed.PendingReturnBatchAmount > 0;
+            stashed.Status = allStashed
+                ? TrackedOrderStatus.Stashed
+                : anotherBatchPending
+                    ? TrackedOrderStatus.Collected
+                    : TrackedOrderStatus.CompletedUncollected;
             if (!PersistTrackedOrder(stashed, allStashed
                     ? "TerminalAssetsStashRecoveredAndVerified"
-                    : "TerminalAssetStashProgressRecovered"))
+                    : "CollectionBatchStashProgressRecovered"))
             {
                 MarkStashTransferAmbiguous("Could not persist recovered post-transfer state.");
                 return;
@@ -2507,19 +3503,28 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 MarkCollectionAmbiguous(unrelatedFailure);
                 return;
             }
-
-            var next = CloneBankroll(_bankroll);
-            var amount = _trackedOrderState.WantedAmount;
-            if (!TryCreditCollected(next, _trackedOrderState.WantedMetadata, amount))
+            if (!_trackedCollection.VerifyInventoryPostState(GameController, out var custodyFailure))
             {
-                throw new InvalidDataException("Completed-uncollected proceeds did not match canonical currency bucket.");
+                MarkCollectionAmbiguous(custodyFailure);
+                return;
             }
 
+            var next = CloneBankroll(_bankroll);
+            var amount = _collectionBatchAmount;
+            if (amount <= 0 || !TryCreditCollected(next, _trackedOrderState.WantedMetadata, amount))
+            {
+                throw new InvalidDataException("Completed-uncollected batch proceeds did not match canonical currency bucket.");
+            }
+
+            var totalProceeds = TrackedOrderLifecycle.TotalWantedProceeds(_trackedOrderState);
             var collected = TrackedOrderCollectionController.CloneTracked(
                 _trackedOrderState,
                 TrackedOrderStatus.Collected,
-                $"Verified exact order disappearance and owned-count increase to {observedOwned}.");
-            collected.WantedAssetCollected = true;
+                $"Verified exact batch of {amount} proceeds entered inventory and owned count rose to {observedOwned}.");
+            collected.CollectionAssetIntent = null;
+            collected.PendingWantedBatchAmount = amount;
+            collected.WantedAssetCollected =
+                collected.SettledWantedAmount + collected.PendingWantedBatchAmount == totalProceeds;
             next.TrackedOrder = collected;
             next.HasUnresolvedOrder = collected.IsUnresolved;
             next.UpdatedAtUtc = DateTimeOffset.UtcNow;
@@ -2571,6 +3576,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void AbortCollectionFlow(string reason)
     {
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
         var collectionAfterClick = _trackedOrderState?.Status == TrackedOrderStatus.CollectionArmed ||
             _trackedCollection.State == TrackedCollectionState.CollectedEvidence ||
             _collectionFlow == CollectionFlowState.ReadingAfter;
@@ -2612,6 +3619,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void AbortPlacementFlow(string reason)
     {
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
         if (_singleLegPlacement.IsRunning)
         {
             _singleLegPlacement.Cancel(reason);
@@ -2652,6 +3661,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         CompletedUncollectedTarget = state.CompletedUncollectedTarget,
         HasUnresolvedOrder = state.HasUnresolvedOrder,
         TrackedOrder = state.TrackedOrder,
+        Workflow = state.Workflow is null ? null : WorkflowCoordinator.Clone(state.Workflow),
         UpdatedAtUtc = state.UpdatedAtUtc
     };
 
@@ -2890,7 +3900,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
-    private void CalculateCandidate(bool invalidateStaging = true)
+    /// <summary>
+    /// Recalculates the best route. <see cref="CandidateOutcome.NoneAccepted"/> means the planner ran to
+    /// completion and accepted nothing; every unavailable prerequisite or error is <see cref="CandidateOutcome.Blocked"/>.
+    /// </summary>
+    private CandidateOutcome CalculateCandidate(bool invalidateStaging = true)
     {
         if (invalidateStaging && _singleLegStaging.State == SingleLegStagingState.Staged)
         {
@@ -2904,7 +3918,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             !_catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out var target) || target is null)
         {
             _lastCandidate = "Blocked: catalogue, target, or explicitly initialized bankroll is unavailable.";
-            return;
+            return CandidateOutcome.Blocked;
         }
 
         var now = DateTimeOffset.UtcNow;
@@ -2917,7 +3931,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             now - divineOwnership.ObservedAtUtc < TimeSpan.Zero || now - divineOwnership.ObservedAtUtc > maximumAge)
         {
             _lastCandidate = "Blocked: refresh picker reads for exact live Chaos and Divine ownership.";
-            return;
+            return CandidateOutcome.Blocked;
         }
 
         var league = GetCurrentLeague();
@@ -2935,7 +3949,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 out var matrixFailure))
         {
             _lastCandidate = $"Blocked: {matrixFailure}";
-            return;
+            return CandidateOutcome.Blocked;
         }
 
         try
@@ -2964,81 +3978,130 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     string.Join(", ", best.Remainders.Select(item => $"{item.Value} {item.Key.Name}")) +
                     $"; competing legs {best.CompetingEdgeCount}; " +
                     $"expected gold {(best.ExpectedGold?.ToString() ?? "unknown")}";
+            return best is null ? CandidateOutcome.NoneAccepted : CandidateOutcome.Accepted;
         }
         catch (Exception exception)
         {
             _lastCandidate = $"Calculation blocked: {exception.Message}";
+            return CandidateOutcome.Blocked;
         }
     }
 
-    private void ArmBankrollReset()
+    private bool TryGetFreshStateResetBlock(out string failure)
     {
-        if (_automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _singleLegStaging.IsRunning || _singleLegPlacement.IsRunning ||
-            IsCollectionFlowActive() ||
-            _placementPreparation != PlacementPreparationState.Idle)
+        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked)
         {
-            _lastFailure = "Bankroll reset cannot be armed during any input operation or placement preparation.";
-            return;
+            failure = "Fresh-state reset blocked: corrupt canonical state must be preserved and repaired first.";
+            return true;
+        }
+        if (_bankroll.Workflow?.IsActive == true)
+        {
+            failure = "Fresh-state reset blocked: a workflow is still active.";
+            return true;
+        }
+        if (ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(_bankroll, _trackedOrderState, out var reason))
+        {
+            failure = $"Fresh-state reset blocked: {reason}.";
+            return true;
         }
 
-        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || _trackedOrderState?.IsUnresolved == true || _bankroll.HasUnresolvedOrder)
-        {
-            _lastFailure = "Bankroll reset blocked: a tracked order is unresolved.";
-            return;
-        }
-
-        _bankrollResetArmed = true;
-        _bankrollResetArmExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(10);
-        _operationStatus = "Bankroll reset armed. Apply within 10 seconds to use current seed settings.";
+        failure = string.Empty;
+        return false;
     }
 
-    private void ApplyArmedBankrollReset()
+    private void ArmFreshStateReset()
     {
-        if (_automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _singleLegStaging.IsRunning || _singleLegPlacement.IsRunning ||
-            IsCollectionFlowActive() ||
-            _placementPreparation != PlacementPreparationState.Idle)
+        if (IsAnyInputOperationActive())
         {
-            _bankrollResetArmed = false;
-            _lastFailure = "Bankroll reset cancelled because an input operation or placement preparation is active.";
+            _lastFailure = "Fresh-state reset cannot be armed during any input operation or placement preparation.";
             return;
         }
 
-        if (!_bankrollResetArmed || DateTimeOffset.UtcNow > _bankrollResetArmExpiresAtUtc)
+        if (TryGetFreshStateResetBlock(out var block))
         {
-            _bankrollResetArmed = false;
+            _lastFailure = block;
+            return;
+        }
+
+        // An idle continuous cooldown must not fire a probe between arming and applying.
+        if (_fullWorkflowAuthorized)
+        {
+            StopFullWorkflowLocal("Continuous trading stopped so a fresh-state reset can be armed without racing a scheduled scan.");
+        }
+
+        _freshStateResetArmed = true;
+        _freshStateResetArmExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(10);
+        _operationStatus = "Fresh-state reset armed. Apply within 10 seconds to reseed from the configured bankroll seeds.";
+    }
+
+    private void ApplyArmedFreshStateReset()
+    {
+        if (IsAnyInputOperationActive())
+        {
+            _freshStateResetArmed = false;
+            _lastFailure = "Fresh-state reset cancelled because an input operation or placement preparation is active.";
+            return;
+        }
+
+        if (!_freshStateResetArmed || DateTimeOffset.UtcNow > _freshStateResetArmExpiresAtUtc)
+        {
+            _freshStateResetArmed = false;
             _placementToken = null;
-            _lastFailure = "Bankroll reset not applied: arm it first.";
+            _lastFailure = "Fresh-state reset not applied: arm it first.";
             return;
         }
 
-        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked || _trackedOrderState?.IsUnresolved == true || _bankroll.HasUnresolvedOrder)
+        if (TryGetFreshStateResetBlock(out var block))
         {
-            _bankrollResetArmed = false;
-            _lastFailure = "Bankroll reset blocked: a tracked order is unresolved.";
+            _freshStateResetArmed = false;
+            _lastFailure = block;
             return;
         }
 
         var league = GetCurrentLeague();
         if (string.IsNullOrWhiteSpace(league) || _bankrollStore == null)
         {
-            _bankrollResetArmed = false;
-            _lastFailure = "Bankroll reset blocked until the current league is readable.";
+            _freshStateResetArmed = false;
+            _lastFailure = "Fresh-state reset blocked until the current league is readable.";
             return;
         }
 
         try
         {
+            // Create drops the resolved workflow and tracked-order records and reseeds balances;
+            // rates, calibrations, audit, and runtime evidence on disk are untouched.
             _bankroll = BankrollState.Create(league, Settings.StartingChaos.Value, Settings.StartingDivine.Value);
             _bankrollStore.Save(_bankroll);
             _bankrollStore.AppendAudit(BankrollAuditEvent.Seeded(_bankroll));
-            _bankrollResetArmed = false;
-            _operationStatus = $"Isolated bankroll initialized/reset for {league}.";
+            _freshStateResetArmed = false;
+            _trackedOrderState = null;
+            _trackedOrder = "None";
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
+            _workflowPreparedLeg = null;
+            _startingNewWorkflow = false;
+            _nextWorkflowScanAtUtc = null;
+            _placementPreparation = PlacementPreparationState.Idle;
+            _placementToken = null;
+            _placementRefreshAttempts = 0;
+            _collectionFlow = CollectionFlowState.Idle;
+            _collectionOwnedBaseline = 0;
+            _collectionBatchAmount = 0;
+            _collectionOwnershipMetadata = string.Empty;
+            _stashTransferMetadata = string.Empty;
+            _stashTransferAmount = 0;
+            _selectedCandidate = null;
+            _lastCandidate = "None; capture all three markets in one area/session.";
+            _liveOwnedByMetadata.Clear();
+            _manualProbeSessionId = Guid.NewGuid();
             _lastFailure = "None";
+            _lastLoggedFailure = null;
+            _operationStatus = $"Fresh state reset for {league}: seeded balances, no workflow, no tracked order.";
         }
         catch (Exception exception)
         {
-            _bankrollResetArmed = false;
-            _lastFailure = $"Bankroll reset failed: {exception.Message}";
+            _freshStateResetArmed = false;
+            _lastFailure = $"Fresh-state reset failed: {exception.Message}";
         }
     }
 
@@ -3099,10 +4162,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _trackedOrder = $"{_trackedOrderState.Status}: id={_trackedOrderState.PlayerOrderId?.ToString() ?? "unknown"}, " +
                 $"{_trackedOrderState.OfferedAmount} {_trackedOrderState.OfferedMetadata} -> " +
                 $"{_trackedOrderState.WantedAmount} {_trackedOrderState.WantedMetadata}";
-            if (_trackedOrderState.Status == TrackedOrderStatus.CollectionArmed)
+            if (_trackedOrderState.Status == TrackedOrderStatus.CollectionArmed &&
+                _trackedOrderState.CollectionAssetIntent is null)
             {
                 _trackedOrderLoadBlocked = true;
                 _trackedOrder = "BLOCKED: collection intent was interrupted; manual reconciliation required";
+            }
+            else if (_trackedOrderState.Status == TrackedOrderStatus.CollectionArmed)
+            {
+                _trackedOrder = "RECOVERY: terminal-asset collection intent can be reconciled read-only without retrying input";
             }
             else if (_trackedOrderState.Status is TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked)
             {
@@ -3144,9 +4212,37 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return "not initialized; spend is zero until explicitly armed and applied";
         }
 
-        return $"{_bankroll.League}: ledger {_bankroll.AvailableChaos} Chaos/{_bankroll.AvailableDivine} Divine; " +
+        return $"{_bankroll.League}: ledger {_bankroll.AvailableChaos} Chaos/{_bankroll.AvailableDivine} Divine/" +
+            $"{_bankroll.AvailableTarget} target; " +
             $"I-have reads Chaos={DescribeOwned("Chaos Orb")}, Divine={DescribeOwned("Divine Orb")}; " +
             $"seeded {_bankroll.SeededChaos}/{_bankroll.SeededDivine}";
+    }
+
+    private string DescribeWorkflow()
+    {
+        var workflow = _bankroll.Workflow;
+        if (workflow is null) return "none";
+        var leg = workflow.CurrentLegIndex >= workflow.Legs.Count
+            ? workflow.Legs.Count
+            : workflow.CurrentLegIndex + 1;
+        return $"{workflow.Phase}, leg {leg}/{workflow.Legs.Count}, authorized={_fullWorkflowAuthorized}, " +
+            $"planned profit={workflow.PlannedProfitChaos} Chaos | {workflow.Detail}";
+    }
+
+    private string DescribeContinuousScan()
+    {
+        if (!_fullWorkflowAuthorized) return "stopped; press the workflow hotkey to authorize";
+        if (_nextWorkflowScanAtUtc is not { } deadline)
+        {
+            var blocking = DescribeActiveInputOperation();
+            if (blocking != "nothing") return $"authorized; waiting on {blocking}";
+            return _startingNewWorkflow ? "authorized; scanning for a route" : "authorized; executing the current workflow";
+        }
+
+        var remaining = deadline - DateTimeOffset.UtcNow;
+        return remaining <= TimeSpan.Zero
+            ? "authorized; retry cooldown elapsed"
+            : $"authorized; no accepted route, reprobing in {(int)Math.Ceiling(remaining.TotalSeconds)}s";
     }
 
     private string DescribeOwned(string currencyName)

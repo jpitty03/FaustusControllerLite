@@ -38,19 +38,22 @@ public sealed record StagingInputPermissions(
     bool QueryInput,
     bool AmountInput,
     bool Placement,
-    bool FullWorkflow)
+    bool FullWorkflow,
+    bool WorkflowAuthorized = false)
 {
     public bool Ready => MouseMovement && Clicking && QueryInput && AmountInput && !Placement && !FullWorkflow;
     public bool ReadyForPlacementWorkflow =>
-        MouseMovement && Clicking && QueryInput && AmountInput && Placement && !FullWorkflow;
+        MouseMovement && Clicking && QueryInput && AmountInput && Placement &&
+        (!FullWorkflow || WorkflowAuthorized);
 
-    public static StagingInputPermissions From(FaustusControllerLiteSettings settings) => new(
+    public static StagingInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowQueryInput.Value,
         settings.AllowAmountInput.Value,
         settings.AllowOrderPlacement.Value,
-        settings.AllowFullWorkflow.Value);
+        settings.AllowFullWorkflow.Value,
+        workflowAuthorized);
 }
 
 public readonly record struct StagingQuoteSample(
@@ -336,9 +339,11 @@ public sealed class SingleLegStagingController
             return false;
         }
 
-        var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        var ui = gameController.Game.IngameState.IngameUi;
+        var panel = ui.CurrencyExchangePanel;
         var server = gameController.Game.IngameState.ServerData;
-        if (!panel.IsVisible || !string.Equals(server.League, _league, StringComparison.Ordinal) ||
+        if (!panel.IsVisible || ui.PopUpWindow.IsVisible ||
+            !string.Equals(server.League, _league, StringComparison.Ordinal) ||
             server.InstanceId != _areaInstanceId)
         {
             failure = "Exchange visibility, league, or area changed during staging.";
@@ -665,7 +670,9 @@ public sealed class SingleLegStagingController
             return;
         }
 
-        if (!TryCreateStagingSample(_leg!, capture, out var sample, out var sampleFailure))
+        if (!TryCreateStagingSample(
+                _leg!, capture, out var sample, out var sampleFailure,
+                preserveCompetingLimit: _placementWorkflowArmed))
         {
             Cancel(sampleFailure);
             return;
@@ -764,20 +771,36 @@ public sealed class SingleLegStagingController
         RouteLegResult leg,
         MarketCapture capture,
         out StagingQuoteSample sample,
-        out string failure)
+        out string failure,
+        bool preserveCompetingLimit = false)
     {
         ArgumentNullException.ThrowIfNull(leg);
         ArgumentNullException.ThrowIfNull(capture);
         var edges = MarketCaptureNormalizer.CreateEdges(capture);
-        if (!TryValidateLiveEdge(leg, edges, out failure))
+        DirectedExchangeEdge? matching;
+        if (preserveCompetingLimit && leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing)
+        {
+            matching = edges.FirstOrDefault(edge =>
+                edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
+                edge.ExecutionIntent == QuoteExecutionIntent.Competing);
+            if (matching is null)
+            {
+                sample = default;
+                failure = "The competing limit pair or readable book head disappeared during staging.";
+                return false;
+            }
+        }
+        else if (!TryValidateLiveEdge(leg, edges, out failure))
         {
             sample = default;
             return false;
         }
-
-        var matching = edges.First(edge =>
-            edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
-            edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate);
+        else
+        {
+            matching = edges.First(edge =>
+                edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
+                edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate);
+        }
         var relevantRows = matching.SourceBook == QuoteBookSource.WantedItemStock
             ? capture.WantedItemStock
             : capture.OfferedItemStock;

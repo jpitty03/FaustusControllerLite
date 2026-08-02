@@ -27,6 +27,21 @@ public sealed record SettlementAsset(
 
 public static class TrackedOrderLifecycle
 {
+    public static long TotalWantedProceeds(TrackedOrderState tracked) =>
+        tracked.TerminalReceivedWantedAmount ?? 0;
+
+    public static long TotalOfferedReturn(TrackedOrderState tracked) =>
+        tracked.TerminalRemainingOfferedAmount ?? 0;
+
+    public static long RemainingWantedToCollect(TrackedOrderState tracked) =>
+        TotalWantedProceeds(tracked) - tracked.SettledWantedAmount - tracked.PendingWantedBatchAmount;
+
+    public static long RemainingReturnToCollect(TrackedOrderState tracked) =>
+        TotalOfferedReturn(tracked) - tracked.SettledReturnAmount - tracked.PendingReturnBatchAmount;
+
+    public static long RemainingToCollect(TrackedOrderState tracked) =>
+        RemainingWantedToCollect(tracked) + RemainingReturnToCollect(tracked);
+
     public static void MigrateLegacyAssetProgress(TrackedOrderState tracked)
     {
         if (tracked.SchemaVersion > 3 || tracked.TerminalRemainingOfferedAmount is not { } remaining ||
@@ -48,8 +63,35 @@ public static class TrackedOrderLifecycle
         }
     }
 
+    public static void MigrateLegacyAssetAmounts(TrackedOrderState tracked)
+    {
+        if (tracked.SchemaVersion > 4) return;
+        if (tracked.TerminalRemainingOfferedAmount is null || tracked.TerminalReceivedWantedAmount is null)
+        {
+            if (tracked.Status is TrackedOrderStatus.Collected or TrackedOrderStatus.StashTransferArmed or
+                    TrackedOrderStatus.Stashed)
+            {
+                tracked.Status = TrackedOrderStatus.Ambiguous;
+                tracked.Detail = "Legacy custody state lacked terminal amounts; manual reconciliation is required.";
+                tracked.LedgerCommittedAtUtc ??= tracked.UpdatedAtUtc == default
+                    ? DateTimeOffset.UtcNow
+                    : tracked.UpdatedAtUtc;
+            }
+            return;
+        }
+        var totalWanted = TotalWantedProceeds(tracked);
+        var totalReturn = TotalOfferedReturn(tracked);
+        tracked.SettledWantedAmount = tracked.WantedAssetStashed ? totalWanted : 0;
+        tracked.PendingWantedBatchAmount =
+            tracked.WantedAssetCollected && !tracked.WantedAssetStashed ? totalWanted : 0;
+        tracked.SettledReturnAmount = tracked.OfferedReturnStashed ? totalReturn : 0;
+        tracked.PendingReturnBatchAmount =
+            tracked.OfferedReturnCollected && !tracked.OfferedReturnStashed ? totalReturn : 0;
+    }
+
     public static bool AssetProgressIsValid(TrackedOrderState tracked)
     {
+        if (tracked.OfferedMaxStackSize < 0 || tracked.WantedMaxStackSize < 0) return false;
         if (tracked.WantedAssetStashed && !tracked.WantedAssetCollected ||
             tracked.OfferedReturnStashed && !tracked.OfferedReturnCollected)
         {
@@ -58,34 +100,60 @@ public static class TrackedOrderLifecycle
         if (tracked.TerminalRemainingOfferedAmount is not { } remaining ||
             tracked.TerminalReceivedWantedAmount is not { } received)
         {
-            if (tracked.Status == TrackedOrderStatus.Stashed) return false;
+            if (tracked.Status is TrackedOrderStatus.Collected or TrackedOrderStatus.StashTransferArmed or
+                    TrackedOrderStatus.Stashed) return false;
             return !tracked.WantedAssetCollected && !tracked.OfferedReturnCollected &&
-                !tracked.WantedAssetStashed && !tracked.OfferedReturnStashed;
+                !tracked.WantedAssetStashed && !tracked.OfferedReturnStashed &&
+                tracked.SettledWantedAmount == 0 && tracked.PendingWantedBatchAmount == 0 &&
+                tracked.SettledReturnAmount == 0 && tracked.PendingReturnBatchAmount == 0;
         }
         var assets = CreateSettlementAssets(tracked, remaining, received);
         if (tracked.Status == TrackedOrderStatus.Stashed && assets.Count == 0) return false;
-        var hasWanted = assets.Any(asset => asset.WantedSlot);
-        var hasReturn = assets.Any(asset => !asset.WantedSlot);
-        if (tracked.WantedAssetCollected && !hasWanted || tracked.OfferedReturnCollected && !hasReturn ||
-            tracked.WantedAssetStashed && !hasWanted || tracked.OfferedReturnStashed && !hasReturn)
+        var totalWanted = received;
+        var totalReturn = remaining;
+        long wantedProgress;
+        long returnProgress;
+        try
+        {
+            wantedProgress = checked(tracked.SettledWantedAmount + tracked.PendingWantedBatchAmount);
+            returnProgress = checked(tracked.SettledReturnAmount + tracked.PendingReturnBatchAmount);
+        }
+        catch (OverflowException)
         {
             return false;
         }
-        var allCollected = assets.All(asset => asset.WantedSlot
-            ? tracked.WantedAssetCollected
-            : tracked.OfferedReturnCollected);
-        var allStashed = assets.All(asset => asset.WantedSlot
-            ? tracked.WantedAssetStashed
-            : tracked.OfferedReturnStashed);
-        if ((tracked.Status is TrackedOrderStatus.Collected or TrackedOrderStatus.StashTransferArmed or
-                TrackedOrderStatus.Stashed) && !allCollected ||
-            tracked.Status == TrackedOrderStatus.Stashed && !allStashed)
+        if (tracked.SettledWantedAmount < 0 || tracked.PendingWantedBatchAmount < 0 ||
+            tracked.SettledReturnAmount < 0 || tracked.PendingReturnBatchAmount < 0 ||
+            wantedProgress > totalWanted || returnProgress > totalReturn)
+        {
+            return false;
+        }
+        var wantedCollected = totalWanted > 0 &&
+            wantedProgress == totalWanted;
+        var returnCollected = totalReturn > 0 &&
+            returnProgress == totalReturn;
+        var wantedStashed = totalWanted > 0 && tracked.SettledWantedAmount == totalWanted;
+        var returnStashed = totalReturn > 0 && tracked.SettledReturnAmount == totalReturn;
+        if (tracked.WantedAssetCollected != wantedCollected ||
+            tracked.OfferedReturnCollected != returnCollected ||
+            tracked.WantedAssetStashed != wantedStashed ||
+            tracked.OfferedReturnStashed != returnStashed)
+        {
+            return false;
+        }
+        var allSettled = tracked.SettledWantedAmount == totalWanted && tracked.SettledReturnAmount == totalReturn;
+        var anyPending = tracked.PendingWantedBatchAmount > 0 || tracked.PendingReturnBatchAmount > 0;
+        if ((tracked.Status is TrackedOrderStatus.Collected or TrackedOrderStatus.StashTransferArmed) && !anyPending ||
+            (tracked.Status is TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.CanceledUncollected or
+                TrackedOrderStatus.CollectionArmed) && anyPending ||
+            tracked.Status == TrackedOrderStatus.Stashed && (!allSettled || anyPending))
         {
             return false;
         }
         if (tracked.Status is TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous &&
             tracked.CollectionAssetIntent is { } intent &&
-            (intent.WantedSlot ? tracked.WantedAssetCollected : tracked.OfferedReturnCollected))
+            (intent.WantedSlot ? RemainingWantedToCollect(tracked) : RemainingReturnToCollect(tracked)) <
+                intent.Amount)
         {
             return false;
         }
@@ -132,10 +200,10 @@ public static class TrackedOrderLifecycle
                 return new LifecycleObservation(LifecycleObservationKind.Transitioning, order,
                     "Canceled flag appeared before the completed terminal flag; waiting for stable terminal evidence.");
             }
-            if (!CanceledAmountsMatchPlacedRatio(order))
+            if (!PlacementOrderMatcher.TerminalAmountsProvable(order, tracked.WantedAmount))
             {
                 return new LifecycleObservation(LifecycleObservationKind.Ambiguous, order,
-                    "Canceled order lacked completed flag or exact placed-ratio terminal arithmetic.");
+                    "Canceled order lacked completed flag or provable placed-ratio terminal arithmetic.");
             }
             var kind = order.RemainingOfferedAmount == 0 && order.ReceivedWantedAmount == tracked.WantedAmount
                 ? LifecycleObservationKind.Completed
@@ -147,11 +215,17 @@ public static class TrackedOrderLifecycle
         }
         if (order.IsCompleted)
         {
-            return order.ReceivedWantedAmount == tracked.WantedAmount
-                ? new LifecycleObservation(LifecycleObservationKind.Completed, order,
-                    "Exact order completed; any remaining offered amount is a collectible return.")
-                : new LifecycleObservation(LifecycleObservationKind.Ambiguous, order,
-                    "Completed order did not report the planned wanted amount.");
+            // An order the book could only fill in part still ends completed; its unfilled offered
+            // amount is a collectible return, exactly like the canceled case above.
+            if (!PlacementOrderMatcher.CompletedFillProvable(order, tracked.WantedAmount))
+            {
+                return new LifecycleObservation(LifecycleObservationKind.Ambiguous, order,
+                    "Completed order reported terminal amounts its placed ratio cannot prove.");
+            }
+            return new LifecycleObservation(LifecycleObservationKind.Completed, order,
+                order.ReceivedWantedAmount == tracked.WantedAmount
+                    ? "Exact order completed; any remaining offered amount is a collectible return."
+                    : "Exact order completed without filling everything; the offered remainder is a collectible return.");
         }
         if (order.RemainingOfferedAmount == 0)
         {
@@ -205,15 +279,6 @@ public static class TrackedOrderLifecycle
         order.OfferedRatioPart == tracked.PlacedOfferedRatioPart &&
         order.WantedRatioPart == tracked.PlacedWantedRatioPart &&
         (tracked.GoldCost is null || order.GoldCost == tracked.GoldCost || order.GoldCost == 0);
-
-    private static bool CanceledAmountsMatchPlacedRatio(PlacedOrderSnapshot order)
-    {
-        var spent = order.OriginalOfferedAmount - order.RemainingOfferedAmount;
-        return spent >= 0 && order.OfferedRatioPart > 0 && order.WantedRatioPart > 0 &&
-            spent % order.OfferedRatioPart == 0 &&
-            (System.Numerics.BigInteger)(spent / order.OfferedRatioPart) * order.WantedRatioPart ==
-                order.ReceivedWantedAmount;
-    }
 
     public static string OrderSetFingerprint(IEnumerable<PlacedOrderSnapshot> orders)
     {

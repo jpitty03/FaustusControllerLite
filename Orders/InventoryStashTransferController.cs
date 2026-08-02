@@ -29,19 +29,22 @@ public sealed record StashTransferInputPermissions(
     bool StashTransfer,
     bool Cancellation,
     bool Placement,
-    bool FullWorkflow)
+    bool FullWorkflow,
+    bool WorkflowAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Collection && StashTransfer && !Cancellation &&
-        !Placement && !FullWorkflow;
+    public bool Ready => MouseMovement && Clicking && Collection && StashTransfer &&
+        (!FullWorkflow && !Cancellation && !Placement ||
+         FullWorkflow && WorkflowAuthorized && Cancellation && Placement);
 
-    public static StashTransferInputPermissions From(FaustusControllerLiteSettings settings) => new(
+    public static StashTransferInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderCollection.Value,
         settings.AllowStashTransfer.Value,
         settings.AllowOrderCancellation.Value,
         settings.AllowOrderPlacement.Value,
-        settings.AllowFullWorkflow.Value);
+        settings.AllowFullWorkflow.Value,
+        workflowAuthorized);
 }
 
 public sealed record InventoryItemEvidence(
@@ -60,7 +63,10 @@ public sealed record InventoryItemEvidence(
 public sealed record InventoryTransferSnapshot(
     IReadOnlyList<InventoryItemEvidence> Items,
     long TargetInventoryAmount,
-    long TargetVisibleStashAmount)
+    long TargetVisibleStashAmount,
+    float InventorySlotWidth = 0,
+    float InventorySlotHeight = 0,
+    int TargetMaxStackSize = 0)
 {
     public IReadOnlyList<InventoryItemEvidence> NonTarget(string metadata) =>
         Items.Where(item => item.Metadata != metadata).OrderBy(item => item.EntityAddress).ToArray();
@@ -68,6 +74,8 @@ public sealed record InventoryTransferSnapshot(
 
 public static class InventoryTransferEvidence
 {
+    public const int InventorySlotCount = 60;
+
     public enum RecoveryKind
     {
         PreTransfer,
@@ -104,6 +112,32 @@ public static class InventoryTransferEvidence
             return false;
         }
 
+        failure = string.Empty;
+        return true;
+    }
+
+    public static bool TryGetConservativeCollectionCapacity(
+        InventoryTransferSnapshot snapshot,
+        out long capacity,
+        out string failure)
+    {
+        capacity = 0;
+        if (snapshot.InventorySlotWidth <= 0 || snapshot.InventorySlotHeight <= 0 ||
+            snapshot.Items.Any(item => item.Width <= 0 || item.Height <= 0))
+        {
+            failure = "Inventory slot geometry was unreadable for collection-capacity proof.";
+            return false;
+        }
+        var occupied = snapshot.Items.Sum(item =>
+            checked((int)Math.Ceiling(item.Width / snapshot.InventorySlotWidth - 0.01f) *
+                    (int)Math.Ceiling(item.Height / snapshot.InventorySlotHeight - 0.01f)));
+        if (occupied is < 0 or > InventorySlotCount)
+        {
+            failure = $"Inventory geometry implied {occupied} occupied slots; expected 0-{InventorySlotCount}.";
+            return false;
+        }
+        var authenticatedStackSize = snapshot.TargetMaxStackSize > 0 ? snapshot.TargetMaxStackSize : 1;
+        capacity = checked((long)(InventorySlotCount - occupied) * authenticatedStackSize);
         failure = string.Empty;
         return true;
     }
@@ -205,13 +239,10 @@ public sealed class InventoryStashTransferController
     {
         ArgumentNullException.ThrowIfNull(tracked);
         ArgumentNullException.ThrowIfNull(persist);
-        var assets = tracked.TerminalRemainingOfferedAmount is { } remaining &&
-            tracked.TerminalReceivedWantedAmount is { } received
-                ? TrackedOrderLifecycle.CreateSettlementAssets(tracked, remaining, received)
-                : Array.Empty<SettlementAsset>();
         if (IsRunning || tracked.Status != TrackedOrderStatus.Collected || !permissions.Ready ||
             conflictingControllerEnabled || amount <= 0 || aggregateOwnedBefore < amount ||
-            !assets.Any(asset => asset.Metadata == metadata && asset.Amount == amount))
+            !(metadata == tracked.WantedMetadata && amount == tracked.PendingWantedBatchAmount ||
+              metadata == tracked.OfferedMetadata && amount == tracked.PendingReturnBatchAmount))
         {
             failure = "Stash transfer requires collected inventory state, complete collection permissions, and controller exclusion.";
             return false;
@@ -311,10 +342,10 @@ public sealed class InventoryStashTransferController
             failure = "Inventory or stash UI was unavailable.";
             return false;
         }
-        var inventory = inventoryPanel[InventoryIndex.PlayerInventory];
+            var inventory = inventoryPanel[InventoryIndex.PlayerInventory];
         var visibleStash = stashElement.VisibleStash;
         if (!gameController.Window.IsForeground() || !panel.IsVisible || panel.CurrencyPicker.IsVisible ||
-            !inventoryPanel.IsVisible || !stashElement.IsVisible || inventory is null ||
+            ui.PopUpWindow.IsVisible || !inventoryPanel.IsVisible || !stashElement.IsVisible || inventory is null ||
             visibleStash is null || !visibleStash.IsVisible ||
             !string.Equals(visibleStash.InvType.ToString(), "CurrencyStash", StringComparison.Ordinal))
         {
@@ -323,7 +354,15 @@ public sealed class InventoryStashTransferController
         }
 
         var exchangeRight = panel.GetClientRectCache.Right;
-        var evidence = new List<InventoryItemEvidence>();
+            var inventoryRect = inventory.GetClientRectCache;
+            var slotWidth = inventoryRect.Width / 12f;
+            var slotHeight = inventoryRect.Height / 5f;
+            if (slotWidth <= 0 || slotHeight <= 0)
+            {
+                failure = "Player inventory grid geometry was unreadable.";
+                return false;
+            }
+            var evidence = new List<InventoryItemEvidence>();
         try
         {
             foreach (var item in inventory.VisibleInventoryItems)
@@ -361,6 +400,7 @@ public sealed class InventoryStashTransferController
             }
 
             long stashTarget = 0;
+            var maxStackSize = 0;
             foreach (var item in visibleStash.VisibleInventoryItems.Where(item => item?.Item?.Path == targetMetadata))
             {
                 if (item?.Item?.IsValid != true || !item.Item.TryGetComponent<Stack>(out var stack) || stack.Size <= 0)
@@ -368,13 +408,30 @@ public sealed class InventoryStashTransferController
                     failure = "Visible Currency Stash target amount was unreadable.";
                     return false;
                 }
+                var currentMax = stack.Info.MaxStackSize;
+                if (currentMax <= 0 || maxStackSize != 0 && maxStackSize != currentMax)
+                {
+                    failure = "Visible Currency Stash target maximum stack size was unreadable or inconsistent.";
+                    return false;
+                }
+                maxStackSize = currentMax;
                 stashTarget = checked(stashTarget + stack.Size);
             }
 
+            foreach (var item in inventory.VisibleInventoryItems.Where(item => item?.Item?.Path == targetMetadata))
+            {
+                if (item?.Item?.TryGetComponent<Stack>(out var stack) != true || stack.Info.MaxStackSize <= 0 ||
+                    maxStackSize != 0 && maxStackSize != stack.Info.MaxStackSize)
+                {
+                    failure = "Player inventory target maximum stack size was unreadable or inconsistent.";
+                    return false;
+                }
+                maxStackSize = stack.Info.MaxStackSize;
+            }
             var inventoryTarget = evidence.Where(item => item.Metadata == targetMetadata)
                 .Aggregate(0L, (total, item) => checked(total + item.Amount));
             snapshot = new InventoryTransferSnapshot(evidence.OrderBy(item => item.EntityAddress).ToArray(),
-                inventoryTarget, stashTarget);
+                inventoryTarget, stashTarget, slotWidth, slotHeight, maxStackSize);
             failure = string.Empty;
             return true;
         }

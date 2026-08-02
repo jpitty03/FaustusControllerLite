@@ -422,9 +422,11 @@ public sealed class AutomatedProbeController
             return false;
         }
 
-        var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        var ui = gameController.Game.IngameState.IngameUi;
+        var panel = ui.CurrencyExchangePanel;
         var server = gameController.Game.IngameState.ServerData;
-        if (!panel.IsVisible || !string.Equals(server.League, _league, StringComparison.Ordinal) ||
+        if (!panel.IsVisible || ui.PopUpWindow.IsVisible ||
+            !string.Equals(server.League, _league, StringComparison.Ordinal) ||
             server.InstanceId != _areaInstanceId)
         {
             failure = "Exchange visibility, league, or area instance changed.";
@@ -1042,7 +1044,15 @@ public sealed class AutomatedProbeController
         if (marketRate is null || immediate is null || competing is null)
         {
             head = default;
-            failure = "A normalized market or book head was unreadable.";
+            var missing = new List<string>(3);
+            if (marketRate is null) missing.Add("market rate");
+            if (immediate is null) missing.Add("wanted/immediate positive head");
+            if (competing is null) missing.Add("offered/competing positive head");
+            failure = $"Normalized head unreadable for {capture.OfferedCurrency.Name} " +
+                $"({capture.OfferedCurrency.Metadata}) -> {capture.WantedCurrency.Name} " +
+                $"({capture.WantedCurrency.Metadata}); missing {string.Join(", ", missing)}; " +
+                $"raw market={capture.MarketRateGet}:{capture.MarketRateGive}, " +
+                $"wantedRows={capture.WantedItemStock.Count}, offeredRows={capture.OfferedItemStock.Count}.";
             return false;
         }
 

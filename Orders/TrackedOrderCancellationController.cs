@@ -29,19 +29,22 @@ public sealed record CancellationInputPermissions(
     bool Placement,
     bool Collection,
     bool StashTransfer,
-    bool FullWorkflow)
+    bool FullWorkflow,
+    bool WorkflowAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Cancellation && !Placement && !Collection &&
-        !StashTransfer && !FullWorkflow;
+    public bool Ready => MouseMovement && Clicking && Cancellation &&
+        (!FullWorkflow && !Placement && !Collection && !StashTransfer ||
+         FullWorkflow && WorkflowAuthorized && Placement && Collection && StashTransfer);
 
-    public static CancellationInputPermissions From(FaustusControllerLiteSettings settings) => new(
+    public static CancellationInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderCancellation.Value,
         settings.AllowOrderPlacement.Value,
         settings.AllowOrderCollection.Value,
         settings.AllowStashTransfer.Value,
-        settings.AllowFullWorkflow.Value);
+        settings.AllowFullWorkflow.Value,
+        workflowAuthorized);
 }
 
 public sealed class TrackedOrderCancellationController
@@ -230,10 +233,11 @@ public sealed class TrackedOrderCancellationController
         return values.Any(text =>
         {
             var parts = text.Split(':', StringSplitOptions.TrimEntries);
-            return parts.Length == 2 && long.TryParse(parts[0].Replace(",", string.Empty), out var left) &&
-                long.TryParse(parts[1].Replace(",", string.Empty), out var right) &&
-                (PlacementOrderMatcher.RatiosEquivalent(left, right, tracked.OfferedAmount, tracked.WantedAmount) ||
-                 PlacementOrderMatcher.RatiosEquivalent(left, right, tracked.WantedAmount, tracked.OfferedAmount));
+            return parts.Length == 2 &&
+                (TrackedOrderCollectionController.DisplayedRatioMatches(
+                     parts[0], parts[1], tracked.OfferedAmount, tracked.WantedAmount) ||
+                 TrackedOrderCollectionController.DisplayedRatioMatches(
+                     parts[0], parts[1], tracked.WantedAmount, tracked.OfferedAmount));
         });
     }
 

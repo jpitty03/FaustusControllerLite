@@ -2,7 +2,7 @@ namespace FaustusControllerLite.Domain;
 
 public sealed class BankrollState
 {
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
 
     public static BankrollState Uninitialized => new();
 
@@ -23,6 +23,7 @@ public sealed class BankrollState
     public long CompletedUncollectedTarget { get; set; }
     public bool HasUnresolvedOrder { get; set; }
     public global::FaustusControllerLite.Orders.TrackedOrderState? TrackedOrder { get; set; }
+    public WorkflowExecutionState? Workflow { get; set; }
     public DateTimeOffset UpdatedAtUtc { get; set; }
 
     public static BankrollState Create(string league, long chaos, long divine) => new()

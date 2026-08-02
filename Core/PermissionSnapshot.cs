@@ -9,6 +9,7 @@ public sealed record PermissionSnapshot(
     bool Placement,
     bool Cancellation,
     bool Collection,
+    bool StashTransfer,
     bool FullWorkflow)
 {
     public static PermissionSnapshot From(FaustusControllerLiteSettings settings) => new(
@@ -20,8 +21,12 @@ public sealed record PermissionSnapshot(
         settings.AllowOrderPlacement.Value,
         settings.AllowOrderCancellation.Value,
         settings.AllowOrderCollection.Value,
+        settings.AllowStashTransfer.Value,
         settings.AllowFullWorkflow.Value);
 
     public bool AllDisabled => !Probing && !MouseMovement && !Clicking && !QueryInput && !AmountInput &&
-        !Placement && !Cancellation && !Collection && !FullWorkflow;
+        !Placement && !Cancellation && !Collection && !StashTransfer && !FullWorkflow;
+
+    public bool ReadyForFullWorkflow => Probing && MouseMovement && Clicking && QueryInput && AmountInput &&
+        Placement && Cancellation && Collection && StashTransfer && FullWorkflow;
 }

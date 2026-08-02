@@ -24,15 +24,17 @@ public sealed record PlacementInputPermissions(
     bool MouseMovement,
     bool Clicking,
     bool Placement,
-    bool FullWorkflow)
+    bool FullWorkflow,
+    bool WorkflowAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Placement && !FullWorkflow;
+    public bool Ready => MouseMovement && Clicking && Placement && (!FullWorkflow || WorkflowAuthorized);
 
-    public static PlacementInputPermissions From(FaustusControllerLiteSettings settings) => new(
+    public static PlacementInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderPlacement.Value,
-        settings.AllowFullWorkflow.Value);
+        settings.AllowFullWorkflow.Value,
+        workflowAuthorized);
 }
 
 public sealed record PlacedOrderSnapshot(
@@ -119,10 +121,10 @@ public static class PlacementOrderMatcher
             (BigInteger)(order.OriginalOfferedAmount / order.OfferedRatioPart) * order.WantedRatioPart == leg.Output &&
             order.RemainingOfferedAmount is >= 0 && order.RemainingOfferedAmount <= order.OriginalOfferedAmount &&
             order.ReceivedWantedAmount >= 0;
-        if (order.IsCompleted && order.ReceivedWantedAmount != leg.Output)
+        if (order.IsCompleted && !CompletedFillProvable(order, leg.Output))
         {
             return new PlacementObservation(PlacementObservationKind.Ambiguous, order,
-                "Completed order amounts did not prove the full expected fill.");
+                "Completed order reported terminal amounts its placed ratio cannot prove.");
         }
         if (!creationPlausible || !economicsMatch || order.IsCanceled)
         {
@@ -130,8 +132,48 @@ public static class PlacementOrderMatcher
                 "The single new order did not match timestamp, pair, amount, ratio, or non-canceled status.");
         }
 
-        return new PlacementObservation(PlacementObservationKind.Matched, order,
-            order.IsCompleted ? "Matching order completed immediately." : "Matching order is pending.");
+        if (!order.IsCompleted)
+        {
+            return new PlacementObservation(PlacementObservationKind.Matched, order, "Matching order is pending.");
+        }
+
+        return new PlacementObservation(PlacementObservationKind.Matched, order, order.RemainingOfferedAmount == 0
+            ? "Matching order completed immediately with the full planned fill."
+            : "Matching order completed immediately without filling everything; the offered remainder is collectible.");
+    }
+
+    /// <summary>
+    /// True when a completed order's terminal amounts are provable from the row itself. An order that
+    /// executes immediately is terminal even when the book could not fill all of it: the unfilled
+    /// offered amount is a collectible return. A fill may improve on the placed limit ratio, so the
+    /// received amount is bounded below by what that ratio entitles for the filled portion and above
+    /// by the whole order's wanted amount. Anything outside those bounds is genuine ambiguity.
+    /// </summary>
+    public static bool TerminalAmountsProvable(PlacedOrderSnapshot order, long orderedWantedAmount)
+    {
+        ArgumentNullException.ThrowIfNull(order);
+        if (order.OfferedRatioPart <= 0 || order.WantedRatioPart <= 0 || orderedWantedAmount <= 0 ||
+            order.RemainingOfferedAmount < 0 || order.RemainingOfferedAmount > order.OriginalOfferedAmount ||
+            order.ReceivedWantedAmount < 0 || order.ReceivedWantedAmount > orderedWantedAmount)
+        {
+            return false;
+        }
+
+        var filled = (BigInteger)order.OriginalOfferedAmount - order.RemainingOfferedAmount;
+        if (filled == 0) return order.ReceivedWantedAmount == 0;
+        return filled * order.WantedRatioPart / order.OfferedRatioPart <= order.ReceivedWantedAmount;
+    }
+
+    /// <summary>
+    /// True when a <em>completed</em> order's amounts are believable. Completion means the book
+    /// executed the order, so at least one unit must have filled; a completed row that filled nothing
+    /// is a misread, not a terminal outcome. Cancellation has no such requirement.
+    /// </summary>
+    public static bool CompletedFillProvable(PlacedOrderSnapshot order, long orderedWantedAmount)
+    {
+        ArgumentNullException.ThrowIfNull(order);
+        return order.RemainingOfferedAmount < order.OriginalOfferedAmount &&
+            TerminalAmountsProvable(order, orderedWantedAmount);
     }
 
     public static bool RatiosEquivalent(long offeredLeft, long wantedLeft, long offeredRight, long wantedRight)
@@ -170,6 +212,8 @@ public sealed class SingleLegPlacementController
     private Guid _probeSessionId;
     private string _candidateSignature = string.Empty;
     private int _competingOrderWaitMinutes;
+    private int _offeredMaxStackSize;
+    private int _wantedMaxStackSize;
     private SingleLegPlacementState _releaseTarget;
     private string _releaseStatus = string.Empty;
 
@@ -191,6 +235,8 @@ public sealed class SingleLegPlacementController
         int competingOrderWaitMinutes,
         Guid probeSessionId,
         string candidateSignature,
+        int offeredMaxStackSize,
+        int wantedMaxStackSize,
         Func<RouteLegResult, (bool IsValid, string Failure)> finalValidation,
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
@@ -216,6 +262,8 @@ public sealed class SingleLegPlacementController
         _attemptId = Guid.NewGuid();
         _probeSessionId = probeSessionId;
         _candidateSignature = candidateSignature;
+        _offeredMaxStackSize = offeredMaxStackSize;
+        _wantedMaxStackSize = wantedMaxStackSize;
         _competingOrderWaitMinutes = competingOrderWaitMinutes;
         _clickAttempted = false;
         _league = gameController.Game.IngameState.ServerData.League;
@@ -288,6 +336,13 @@ public sealed class SingleLegPlacementController
         FinishAmbiguousOrCancel(reason, clicked: _clickAttempted);
     }
 
+    public void EmergencyStop(string reason)
+    {
+        if (IsRunning && State != SingleLegPlacementState.ReleasingInput)
+            FinishAmbiguousOrCancel(reason, clicked: _clickAttempted);
+        TryReleaseOwnedInput();
+    }
+
     private bool ValidateGlobal(
         GameController gameController,
         PlacementInputPermissions permissions,
@@ -348,10 +403,10 @@ public sealed class SingleLegPlacementController
         out string failure)
     {
         target = default;
-        var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        var ui = gameController.Game.IngameState.IngameUi;
+        var panel = ui.CurrencyExchangePanel;
         if (!gameController.Window.IsForeground() || !panel.IsVisible || panel.CurrencyPicker.IsVisible ||
-            !gameController.Game.IngameState.IngameUi.StashElement.IsVisible ||
-            !gameController.Game.IngameState.IngameUi.InventoryPanel.IsVisible ||
+            ui.PopUpWindow.IsVisible || !ui.StashElement.IsVisible || !ui.InventoryPanel.IsVisible ||
             !string.Equals(panel.OfferedItemType?.Metadata, leg.Edge.From.Metadata, StringComparison.Ordinal) ||
             !string.Equals(panel.WantedItemType?.Metadata, leg.Edge.To.Metadata, StringComparison.Ordinal) ||
             !SingleLegStagingController.TryReadExactDigits(panel.OfferedItemCountInput, out var offered, out _) ||
@@ -421,7 +476,7 @@ public sealed class SingleLegPlacementController
 
         if (!CurrentMarketReader.TryCapture(
                 gameController, Guid.NewGuid(), out var capture, out failure, requireSelectedMarketHead: false) || capture is null ||
-            !SingleLegStagingController.TryCreateStagingSample(_leg!, capture, out _, out failure))
+            !LiveQuoteAllowsPlacement(_leg!, capture, out failure))
         {
             FinishAmbiguousOrCancel($"Final live quote rejected placement: {failure}", clicked: false);
             return;
@@ -470,6 +525,32 @@ public sealed class SingleLegPlacementController
         Status = "Clicked Place Order exactly once; matching the resulting order.";
     }
 
+    public static bool LiveQuoteAllowsPlacement(
+        RouteLegResult leg,
+        MarketCapture capture,
+        out string failure)
+    {
+        ArgumentNullException.ThrowIfNull(leg);
+        ArgumentNullException.ThrowIfNull(capture);
+        failure = string.Empty;
+        if (leg.Edge.ExecutionIntent == QuoteExecutionIntent.Immediate)
+            return SingleLegStagingController.TryCreateStagingSample(leg, capture, out _, out failure);
+
+        if (capture.OfferedCurrency.Metadata != leg.Edge.From.Metadata ||
+            capture.WantedCurrency.Metadata != leg.Edge.To.Metadata ||
+            capture.OfferedCurrency.Hash != leg.Edge.From.Hash ||
+            capture.WantedCurrency.Hash != leg.Edge.To.Hash ||
+            !AutomatedProbeController.TryCreateStableHead(capture, out _, out failure))
+        {
+            if (string.IsNullOrEmpty(failure))
+                failure = "Competing placement market identity changed or its live book became unreadable.";
+            return false;
+        }
+
+        failure = string.Empty;
+        return true;
+    }
+
     private void ObserveOrder(GameController gameController)
     {
         if (!TryReadOrders(gameController, out var orders, out var failure))
@@ -505,6 +586,7 @@ public sealed class SingleLegPlacementController
                 var recovery = CreateTrackedState(TrackedOrderStatus.Ambiguous, match.PlayerOrderId,
                     "Order matched but durable matched-state persistence failed; retain known ID for reconciliation.");
                 Outcome = recovery;
+                Failure = recovery.Detail;
                 _persist?.Invoke(recovery, "OrderPlacementPersistenceAmbiguous");
                 BeginRelease(SingleLegPlacementState.Ambiguous, recovery.Detail);
                 return;
@@ -522,6 +604,8 @@ public sealed class SingleLegPlacementController
                 var ambiguous = CreateTrackedState(
                     TrackedOrderStatus.Ambiguous, ambiguousMatch.PlayerOrderId, observation.Detail);
                 Outcome = ambiguous;
+                // Without this the caller reads an empty failure and reports nothing at all.
+                Failure = observation.Detail;
                 _persist?.Invoke(ambiguous, "OrderPlacementAmbiguousMatchedId");
                 BeginRelease(SingleLegPlacementState.Ambiguous, $"AMBIGUOUS: {observation.Detail}");
             }
@@ -555,6 +639,8 @@ public sealed class SingleLegPlacementController
         CandidateSignature = _candidateSignature,
         OfferedHash = _leg.Edge.From.Hash,
         WantedHash = _leg.Edge.To.Hash,
+        OfferedMaxStackSize = _offeredMaxStackSize,
+        WantedMaxStackSize = _wantedMaxStackSize,
         BaselineOrderIds = _baselineOrderIds.Order().ToList()
     };
 

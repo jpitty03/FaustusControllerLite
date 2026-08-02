@@ -28,19 +28,22 @@ public sealed record CollectionInputPermissions(
     bool Cancellation,
     bool StashTransfer,
     bool Placement,
-    bool FullWorkflow)
+    bool FullWorkflow,
+    bool WorkflowAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Collection && !Cancellation && !StashTransfer &&
-        !Placement && !FullWorkflow;
+    public bool Ready => MouseMovement && Clicking && Collection &&
+        (!FullWorkflow && !Cancellation && !StashTransfer && !Placement ||
+         FullWorkflow && WorkflowAuthorized && Cancellation && StashTransfer && Placement);
 
-    public static CollectionInputPermissions From(FaustusControllerLiteSettings settings) => new(
+    public static CollectionInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderCollection.Value,
         settings.AllowOrderCancellation.Value,
         settings.AllowStashTransfer.Value,
         settings.AllowOrderPlacement.Value,
-        settings.AllowFullWorkflow.Value);
+        settings.AllowFullWorkflow.Value,
+        workflowAuthorized);
 }
 
 public static class CollectionOrderMatcher
@@ -79,7 +82,9 @@ public static class CollectionOrderMatcher
         order.OfferedMetadata == tracked.OfferedMetadata && order.WantedMetadata == tracked.WantedMetadata &&
         order.OfferedHash == tracked.OfferedHash && order.WantedHash == tracked.WantedHash &&
         order.OriginalOfferedAmount == tracked.OfferedAmount && order.RemainingOfferedAmount == 0 &&
-        order.ReceivedWantedAmount == tracked.WantedAmount &&
+        order.ReceivedWantedAmount ==
+            (tracked.TerminalReceivedWantedAmount ?? tracked.WantedAmount) -
+            tracked.SettledWantedAmount - tracked.PendingWantedBatchAmount &&
         PlacementOrderMatcher.RatiosEquivalent(
             order.OfferedRatioPart, order.WantedRatioPart, tracked.OfferedAmount, tracked.WantedAmount);
 }
@@ -104,6 +109,11 @@ public sealed class TrackedOrderCollectionController
     private DateTimeOffset _deadline;
     private bool _mouseDown;
     private bool _clickAttempted;
+    private long _batchAmount;
+    private long _remainingBefore;
+    private long _aggregateOwnedBefore;
+    private InventoryTransferSnapshot? _inventoryBefore;
+    private string _unrelatedFingerprint = string.Empty;
     private TrackedCollectionState _releaseTarget;
     private string _releaseStatus = string.Empty;
 
@@ -120,6 +130,8 @@ public sealed class TrackedOrderCollectionController
         CollectionInputPermissions permissions,
         bool conflictingControllerEnabled,
         int cursorSpeed,
+        long batchAmount,
+        long aggregateOwnedBefore,
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
     {
@@ -130,9 +142,26 @@ public sealed class TrackedOrderCollectionController
             failure = "Collection is running, permissions are incomplete, placement/full workflow is enabled, or controller exclusion failed.";
             return false;
         }
-
-        if (!TryResolveTarget(gameController, tracked, calibration, out var target, out var orders, out failure))
+        var remainingToCollect = tracked.TerminalReceivedWantedAmount is null
+            ? tracked.WantedAmount
+            : TrackedOrderLifecycle.RemainingWantedToCollect(tracked);
+        if (batchAmount <= 0 || batchAmount > remainingToCollect ||
+            tracked.PendingWantedBatchAmount != 0 || tracked.PendingReturnBatchAmount != 0)
         {
+            failure = $"Collection batch {batchAmount} was not a positive amount within the remaining " +
+                $"{remainingToCollect} uncollected proceeds with no batch already pending stash.";
+            return false;
+        }
+
+        if (!TryResolveTarget(gameController, tracked, calibration, out var target, out var orders, out failure) ||
+            !InventoryStashTransferController.TryReadSnapshot(
+                gameController, tracked.WantedMetadata, out var inventory, out failure))
+        {
+            return false;
+        }
+        if (inventory.TargetInventoryAmount != 0 || aggregateOwnedBefore < 0)
+        {
+            failure = "Collection batch requires zero target inventory and a nonnegative aggregate ownership baseline.";
             return false;
         }
 
@@ -151,6 +180,12 @@ public sealed class TrackedOrderCollectionController
         _baselineOrderIds.UnionWith(orders.Select(order => order.PlayerOrderId));
         _baselineOrders.Clear();
         foreach (var order in orders) _baselineOrders.Add(order.PlayerOrderId, order);
+        _batchAmount = batchAmount;
+        _remainingBefore = liveMatch.ReceivedWantedAmount;
+        _aggregateOwnedBefore = aggregateOwnedBefore;
+        _inventoryBefore = inventory;
+        _unrelatedFingerprint = TrackedOrderLifecycle.OrderSetFingerprint(
+            orders.Where(order => order.PlayerOrderId != liveMatch.PlayerOrderId));
         _clickAttempted = false;
         Failure = string.Empty;
         BeginMovement(target, cursorSpeed);
@@ -236,20 +271,13 @@ public sealed class TrackedOrderCollectionController
             return false;
         }
 
-        var matchingRows = elements.Where(element =>
-            element.IsVisible && RowTextsMatchTrackedOrder(EnumerateVisibleText(element, 0), tracked)).ToArray();
-        if (matchingRows.Length != 1)
-        {
-            failure = $"Expected one unique visible row matching status/amount/ratio evidence, found {matchingRows.Length}.";
-            return false;
-        }
         var modelIndex = orders.Select((order, index) => (order, index))
             .Single(pair => pair.order.PlayerOrderId == match.PlayerOrderId).index;
         row = elements[modelIndex];
-        if (!ReferenceEquals(row, matchingRows[0]) && row.Address != matchingRows[0].Address)
+        if (!row.IsVisible || !RowTextsMatchTrackedOrder(EnumerateVisibleText(row, 0), tracked))
         {
             row = null;
-            failure = "Unique row evidence was not parallel with the exact SDK order model.";
+            failure = "Parallel SDK order row lacked exact completed-status and ratio evidence.";
             return false;
         }
         var rect = row.GetClientRectCache;
@@ -269,25 +297,78 @@ public sealed class TrackedOrderCollectionController
         var texts = rowTexts.Select(text => text.Trim()).Where(text => text.Length > 0).ToArray();
         if (!texts.Any(text => text.Equals("Order Completed", StringComparison.OrdinalIgnoreCase))) return false;
 
-        var numbers = texts.Select(text => text.Replace(",", string.Empty, StringComparison.Ordinal))
-            .Where(text => long.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out _))
-            .Select(text => long.Parse(text, CultureInfo.InvariantCulture))
-            .ToHashSet();
-        if (!numbers.Contains(tracked.OfferedAmount) || !numbers.Contains(tracked.WantedAmount)) return false;
-
         foreach (var text in texts)
         {
-            var match = Regex.Match(text, @"(?<left>[\d,]+)\s*:\s*(?<right>[\d,]+)");
+            var match = Regex.Match(text, @"(?<left>[\d,]+(?:\.\d+)?)\s*:\s*(?<right>[\d,]+(?:\.\d+)?)");
             if (!match.Success) continue;
-            var left = long.Parse(match.Groups["left"].Value.Replace(",", string.Empty), CultureInfo.InvariantCulture);
-            var right = long.Parse(match.Groups["right"].Value.Replace(",", string.Empty), CultureInfo.InvariantCulture);
-            if (PlacementOrderMatcher.RatiosEquivalent(left, right, tracked.OfferedAmount, tracked.WantedAmount) ||
-                PlacementOrderMatcher.RatiosEquivalent(left, right, tracked.WantedAmount, tracked.OfferedAmount))
+            if (DisplayedRatioMatches(
+                    match.Groups["left"].Value,
+                    match.Groups["right"].Value,
+                    tracked.OfferedAmount,
+                    tracked.WantedAmount) ||
+                DisplayedRatioMatches(
+                    match.Groups["left"].Value,
+                    match.Groups["right"].Value,
+                    tracked.WantedAmount,
+                    tracked.OfferedAmount))
             {
                 return true;
             }
         }
         return false;
+    }
+
+    public static bool DisplayedRatioMatches(
+        string leftText,
+        string rightText,
+        long expectedLeft,
+        long expectedRight)
+    {
+        if (expectedLeft <= 0 || expectedRight <= 0 ||
+            !TryParseDisplayedDecimal(leftText, out var left, out var leftScale) ||
+            !TryParseDisplayedDecimal(rightText, out var right, out var rightScale))
+            return false;
+
+        var displayedNumerator = left.Numerator * right.Denominator;
+        var displayedDenominator = left.Denominator * right.Numerator;
+        if (displayedNumerator * expectedRight == (BigInteger)expectedLeft * displayedDenominator)
+            return true;
+
+        if (right.Numerator == right.Denominator && leftScale > 0)
+            return RoundsToDisplayed(left, leftScale, expectedLeft, expectedRight);
+        if (left.Numerator == left.Denominator && rightScale > 0)
+            return RoundsToDisplayed(right, rightScale, expectedRight, expectedLeft);
+        return false;
+    }
+
+    private static bool RoundsToDisplayed(
+        (BigInteger Numerator, BigInteger Denominator) displayed,
+        int scale,
+        long expectedNumerator,
+        long expectedDenominator)
+    {
+        var factor = BigInteger.Pow(10, scale);
+        var unscaled = displayed.Numerator * factor / displayed.Denominator;
+        var difference = BigInteger.Abs((BigInteger)expectedNumerator * factor - unscaled * expectedDenominator);
+        return difference * 2 <= expectedDenominator;
+    }
+
+    private static bool TryParseDisplayedDecimal(
+        string text,
+        out (BigInteger Numerator, BigInteger Denominator) value,
+        out int scale)
+    {
+        value = default;
+        scale = 0;
+        var normalized = text.Replace(",", string.Empty, StringComparison.Ordinal).Trim();
+        var parts = normalized.Split('.');
+        if (parts.Length is < 1 or > 2 || parts.Any(part => part.Length == 0 || !part.All(char.IsDigit)))
+            return false;
+        scale = parts.Length == 2 ? parts[1].Length : 0;
+        if (scale > 9 || !BigInteger.TryParse(string.Concat(parts), out var numerator) || numerator <= 0)
+            return false;
+        value = (numerator, BigInteger.Pow(10, scale));
+        return true;
     }
 
     private static IEnumerable<string> EnumerateVisibleText(Element element, int depth)
@@ -357,7 +438,8 @@ public sealed class TrackedOrderCollectionController
     {
         var ui = gameController.Game.IngameState.IngameUi;
         if (!gameController.Window.IsForeground() || !ui.CurrencyExchangePanel.IsVisible ||
-            ui.CurrencyExchangePanel.CurrencyPicker.IsVisible || !ui.StashElement.IsVisible || !ui.InventoryPanel.IsVisible)
+            ui.CurrencyExchangePanel.CurrencyPicker.IsVisible || ui.PopUpWindow.IsVisible ||
+            !ui.StashElement.IsVisible || !ui.InventoryPanel.IsVisible)
         {
             failure = "Collection requires foreground exchange, stash, and inventory with picker closed.";
             return false;
@@ -402,10 +484,15 @@ public sealed class TrackedOrderCollectionController
 
     private void ClickOnce(GameController gameController, PickerCalibration calibration)
     {
-        if (!TryResolveTarget(gameController, _tracked!, calibration, out var fresh, out var orders, out var failure) ||
+        var tracked = _tracked!;
+        if (!TryResolveTarget(gameController, tracked, calibration, out var fresh, out var orders, out var failure) ||
             Vector2.Distance(fresh, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
-            !SnapshotsEqual(_baselineOrders.Values, orders))
+            !SnapshotsEqual(_baselineOrders.Values, orders) ||
+            !InventoryStashTransferController.TryReadSnapshot(
+                gameController, tracked.WantedMetadata, out var inventory, out failure) ||
+            !_inventoryBefore!.Items.SequenceEqual(inventory.Items) ||
+            _inventoryBefore.TargetVisibleStashAmount != inventory.TargetVisibleStashAmount)
         {
             Finish(string.IsNullOrEmpty(failure) ? "Final collection context changed." : failure, clicked: false);
             return;
@@ -413,6 +500,22 @@ public sealed class TrackedOrderCollectionController
 
         var armed = CloneTracked(_tracked!, TrackedOrderStatus.CollectionArmed,
             $"Collection intent persisted before Ctrl-right-click. {_tracked!.Detail}");
+        armed.CollectionAssetIntent = new CollectionAssetIntentState
+        {
+            IntentId = Guid.NewGuid(),
+            Metadata = armed.WantedMetadata,
+            Amount = _batchAmount,
+            WantedSlot = true,
+            TerminalStatus = TrackedOrderStatus.CompletedUncollected,
+            InventoryAmountBefore = _inventoryBefore!.TargetInventoryAmount,
+            VisibleStashAmountBefore = _inventoryBefore.TargetVisibleStashAmount,
+            AggregateOwnedBefore = _aggregateOwnedBefore,
+            NonTargetInventoryFingerprint = InventoryTransferEvidence.NonTargetFingerprint(
+                _inventoryBefore, armed.WantedMetadata),
+            UnrelatedOrdersFingerprint = _unrelatedFingerprint,
+            AreaInstanceId = _areaInstanceId,
+            ArmedAtUtc = DateTimeOffset.UtcNow,
+        };
         if (!_persist!(armed, "OrderCollectionArmed"))
         {
             Finish("Could not persist collection intent before click.", clicked: false);
@@ -423,7 +526,11 @@ public sealed class TrackedOrderCollectionController
         if (!TryResolveTarget(gameController, _tracked, calibration, out fresh, out orders, out failure) ||
             Vector2.Distance(fresh, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
-            !SnapshotsEqual(_baselineOrders.Values, orders))
+            !SnapshotsEqual(_baselineOrders.Values, orders) ||
+            !InventoryStashTransferController.TryReadSnapshot(
+                gameController, _tracked.WantedMetadata, out inventory, out failure) ||
+            !_inventoryBefore.Items.SequenceEqual(inventory.Items) ||
+            _inventoryBefore.TargetVisibleStashAmount != inventory.TargetVisibleStashAmount)
         {
             var reason = string.IsNullOrEmpty(failure)
                 ? "Collection context changed after durable arming and before input."
@@ -490,31 +597,97 @@ public sealed class TrackedOrderCollectionController
         var trackedId = _tracked!.PlayerOrderId!.Value;
         var trackedSnapshot = _baselineOrders[trackedId];
         var expected = _baselineOrders.Values.Where(order => order.PlayerOrderId != trackedId).ToArray();
-        if (!orders.Any(order => SameOrderIgnoringId(order, trackedSnapshot)) &&
-            SnapshotsEqualIgnoringIds(expected, orders))
+        var expectedRemainingAfter = _remainingBefore - _batchAmount;
+        if (expectedRemainingAfter == 0)
         {
-            BeginRelease(TrackedCollectionState.CollectedEvidence,
-                "Tracked order disappeared with every unrelated order ID unchanged.");
-            return;
+            if (!orders.Any(order => SameOrderIgnoringId(order, trackedSnapshot)) &&
+                SnapshotsEqualIgnoringIds(expected, orders))
+            {
+                BeginRelease(TrackedCollectionState.CollectedEvidence,
+                    "Tracked order disappeared with every unrelated order ID unchanged.");
+                return;
+            }
+        }
+        else
+        {
+            var reduced = orders.Where(order =>
+                SameOrderWithReducedProceeds(trackedSnapshot, order, expectedRemainingAfter)).ToArray();
+            if (reduced.Length == 1 &&
+                SnapshotsEqualIgnoringIds(
+                    expected,
+                    orders.Where(order => order.PlayerOrderId != reduced[0].PlayerOrderId).ToArray()))
+            {
+                BeginRelease(TrackedCollectionState.CollectedEvidence,
+                    $"Tracked order proceeds reduced exactly to {expectedRemainingAfter} with unrelated orders unchanged.");
+                return;
+            }
         }
 
         if (DateTimeOffset.UtcNow >= _deadline)
         {
             var reason = orders.Any(order => SameOrderIgnoringId(order, trackedSnapshot))
-                ? "Tracked order did not disappear within three seconds after collection click."
-                : "Order list did not stabilize to exact unrelated snapshots within three seconds after tracked disappearance.";
+                ? "Tracked order did not change within three seconds after collection click."
+                : "Order list did not stabilize to exact expected snapshots within three seconds after the collection click.";
             Finish(reason, clicked: true);
         }
     }
+
+    private static bool SameOrderWithReducedProceeds(
+        PlacedOrderSnapshot before,
+        PlacedOrderSnapshot after,
+        long expectedRemainingAfter) =>
+        after.CreationDate == before.CreationDate &&
+        after.OfferedMetadata == before.OfferedMetadata && after.OfferedHash == before.OfferedHash &&
+        after.WantedMetadata == before.WantedMetadata && after.WantedHash == before.WantedHash &&
+        after.OriginalOfferedAmount == before.OriginalOfferedAmount &&
+        after.RemainingOfferedAmount == before.RemainingOfferedAmount &&
+        after.ReceivedWantedAmount == expectedRemainingAfter &&
+        after.OfferedRatioPart == before.OfferedRatioPart && after.WantedRatioPart == before.WantedRatioPart &&
+        (after.GoldCost == before.GoldCost || after.GoldCost == 0) &&
+        after.IsCompleted == before.IsCompleted && after.IsCanceled == before.IsCanceled;
 
     public bool VerifyUnrelatedOrders(GameController gameController, out string failure)
     {
         if (!SingleLegPlacementController.TryReadOrders(gameController, out var current, out failure)) return false;
         var trackedId = _tracked?.PlayerOrderId;
         var expected = _baselineOrders.Values.Where(order => order.PlayerOrderId != trackedId).ToArray();
-        if (!SnapshotsEqualIgnoringIds(expected, current))
+        var expectedRemainingAfter = _remainingBefore - _batchAmount;
+        IReadOnlyList<PlacedOrderSnapshot> unrelated = current;
+        if (expectedRemainingAfter > 0 && trackedId is { } id && _baselineOrders.TryGetValue(id, out var snapshot))
         {
-            failure = "Unrelated order snapshots changed after tracked-order disappearance.";
+            var reduced = current.Where(order =>
+                SameOrderWithReducedProceeds(snapshot, order, expectedRemainingAfter)).ToArray();
+            if (reduced.Length != 1)
+            {
+                failure = $"Expected one exactly reduced tracked row after the batch; found {reduced.Length}.";
+                return false;
+            }
+            unrelated = current.Where(order => order.PlayerOrderId != reduced[0].PlayerOrderId).ToArray();
+        }
+        if (!SnapshotsEqualIgnoringIds(expected, unrelated))
+        {
+            failure = "Unrelated order snapshots changed after the collection click.";
+            return false;
+        }
+        failure = string.Empty;
+        return true;
+    }
+
+    public bool VerifyInventoryPostState(GameController gameController, out string failure)
+    {
+        if (_tracked is null || _inventoryBefore is null)
+        {
+            failure = "Collection batch lacked durable in-memory inventory evidence.";
+            return false;
+        }
+        if (!InventoryStashTransferController.TryReadSnapshot(
+                gameController, _tracked.WantedMetadata, out var current, out failure)) return false;
+        if (current.TargetInventoryAmount != checked(_inventoryBefore.TargetInventoryAmount + _batchAmount) ||
+            current.TargetVisibleStashAmount != _inventoryBefore.TargetVisibleStashAmount ||
+            InventoryTransferEvidence.NonTargetFingerprint(current, _tracked.WantedMetadata) !=
+                InventoryTransferEvidence.NonTargetFingerprint(_inventoryBefore, _tracked.WantedMetadata))
+        {
+            failure = "Collection batch inventory, stash, or non-target custody did not match the durable intent.";
             return false;
         }
         failure = string.Empty;
@@ -647,7 +820,13 @@ public sealed class TrackedOrderCollectionController
         WantedAssetCollected = source.WantedAssetCollected,
         OfferedReturnCollected = source.OfferedReturnCollected,
         WantedAssetStashed = source.WantedAssetStashed,
-        OfferedReturnStashed = source.OfferedReturnStashed
+        OfferedReturnStashed = source.OfferedReturnStashed,
+        SettledWantedAmount = source.SettledWantedAmount,
+        PendingWantedBatchAmount = source.PendingWantedBatchAmount,
+        SettledReturnAmount = source.SettledReturnAmount,
+        PendingReturnBatchAmount = source.PendingReturnBatchAmount,
+        OfferedMaxStackSize = source.OfferedMaxStackSize,
+        WantedMaxStackSize = source.WantedMaxStackSize
     };
 
     private void PressKey(Keys key)

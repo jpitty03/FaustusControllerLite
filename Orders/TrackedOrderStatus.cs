@@ -19,7 +19,7 @@ public enum TrackedOrderStatus
 
 public sealed class TrackedOrderState
 {
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public string League { get; set; } = string.Empty;
@@ -59,6 +59,12 @@ public sealed class TrackedOrderState
     public bool OfferedReturnCollected { get; set; }
     public bool WantedAssetStashed { get; set; }
     public bool OfferedReturnStashed { get; set; }
+    public long SettledWantedAmount { get; set; }
+    public long PendingWantedBatchAmount { get; set; }
+    public long SettledReturnAmount { get; set; }
+    public long PendingReturnBatchAmount { get; set; }
+    public int OfferedMaxStackSize { get; set; }
+    public int WantedMaxStackSize { get; set; }
 
     public bool IsUnresolved => Status is TrackedOrderStatus.Armed or
         TrackedOrderStatus.Pending or TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.Ambiguous or

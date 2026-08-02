@@ -31,7 +31,8 @@ public sealed class CanceledReturnCollectionController
     private string _unrelatedFingerprint = string.Empty;
     private long _aggregateOwnedBefore;
     private SettlementAsset? _asset;
-    private bool _isFinalAsset;
+    private bool _rowShouldDisappear;
+    private long _sideRemainingBefore;
     private TrackedOrderStatus _terminalStatus;
     private PickerCalibration? _calibration;
     private Vector2 _target;
@@ -65,24 +66,25 @@ public sealed class CanceledReturnCollectionController
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
     {
-        var assets = tracked.TerminalRemainingOfferedAmount is { } remaining &&
-            tracked.TerminalReceivedWantedAmount is { } received
-                ? TrackedOrderLifecycle.CreateSettlementAssets(tracked, remaining, received)
-                : Array.Empty<SettlementAsset>();
-        var pendingAssets = assets.Where(asset => asset.WantedSlot
-            ? !tracked.WantedAssetCollected
-            : !tracked.OfferedReturnCollected).ToArray();
+        var remainingWanted = TrackedOrderLifecycle.RemainingWantedToCollect(tracked);
+        var remainingReturn = TrackedOrderLifecycle.RemainingReturnToCollect(tracked);
         if (IsRunning || tracked.Status is not TrackedOrderStatus.CanceledUncollected and
-                not TrackedOrderStatus.CompletedUncollected || pendingAssets.Length == 0 ||
+                not TrackedOrderStatus.CompletedUncollected ||
+            remainingWanted <= 0 && remainingReturn <= 0 ||
+            tracked.PendingWantedBatchAmount != 0 || tracked.PendingReturnBatchAmount != 0 ||
             !permissions.Ready || conflictingControllerEnabled || aggregateOwnedBefore < 0)
         {
-            failure = "Terminal asset collection requires exact terminal state, pending settlement asset, and isolated collection permissions.";
+            failure = "Terminal asset collection requires exact terminal state, a pending settlement amount, no batch awaiting stash, and isolated collection permissions.";
             return false;
         }
-        var asset = pendingAssets[0];
-        if (!TryResolveTarget(gameController, tracked, asset, calibration, out var target, out var orders, out failure) ||
+        var wantedSide = remainingWanted > 0;
+        var sideRemaining = wantedSide ? remainingWanted : remainingReturn;
+        var sideMetadata = wantedSide ? tracked.WantedMetadata : tracked.OfferedMetadata;
+        if (!TryResolveTarget(gameController, tracked,
+                new SettlementAsset(sideMetadata, sideRemaining, wantedSide), calibration,
+                out var target, out var orders, out failure) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, asset.Metadata, out var inventory, out failure))
+                gameController, sideMetadata, out var inventory, out failure))
         {
             return false;
         }
@@ -91,13 +93,39 @@ public sealed class CanceledReturnCollectionController
             failure = "Terminal asset collection requires zero pre-existing target currency in inventory for exact custody.";
             return false;
         }
+        var persistedMaxStackSize = wantedSide ? tracked.WantedMaxStackSize : tracked.OfferedMaxStackSize;
+        var capacitySnapshot = inventory with
+        {
+            TargetMaxStackSize = inventory.TargetMaxStackSize > 0
+                ? inventory.TargetMaxStackSize
+                : persistedMaxStackSize
+        };
+        if (!InventoryTransferEvidence.TryGetConservativeCollectionCapacity(
+                capacitySnapshot, out var capacity, out failure))
+        {
+            return false;
+        }
+        if (inventory.TargetMaxStackSize <= 0 && persistedMaxStackSize <= 0 && sideRemaining > capacity)
+        {
+            failure = $"First acquisition exceeds the {capacity}-unit capacity provable without an existing " +
+                "Currency Stash stack for this asset.";
+            return false;
+        }
+        var batch = Math.Min(capacity, sideRemaining);
+        if (batch <= 0)
+        {
+            failure = "No verified free inventory capacity was available for a terminal collection batch.";
+            return false;
+        }
+        var asset = new SettlementAsset(sideMetadata, batch, wantedSide);
 
         _tracked = tracked;
         _persist = persist;
         _inventoryBefore = inventory;
         _aggregateOwnedBefore = aggregateOwnedBefore;
         _asset = asset;
-        _isFinalAsset = pendingAssets.Length == 1;
+        _sideRemainingBefore = sideRemaining;
+        _rowShouldDisappear = remainingWanted + remainingReturn - batch == 0;
         _terminalStatus = tracked.Status;
         _calibration = calibration;
         _unrelatedFingerprint = TrackedOrderLifecycle.OrderSetFingerprint(
@@ -161,12 +189,12 @@ public sealed class CanceledReturnCollectionController
     {
         row = null;
         if (!SingleLegPlacementController.TryReadOrders(gameController, out orders, out failure)) return false;
+        var expectedLiveWanted = TrackedOrderLifecycle.RemainingWantedToCollect(tracked);
+        var expectedLiveReturn = TrackedOrderLifecycle.RemainingReturnToCollect(tracked);
         var matches = orders.Where(order => TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order) &&
             order.IsCompleted &&
-            (order.RemainingOfferedAmount == tracked.TerminalRemainingOfferedAmount ||
-             tracked.OfferedReturnCollected && order.RemainingOfferedAmount == 0) &&
-            (order.ReceivedWantedAmount == tracked.TerminalReceivedWantedAmount ||
-             tracked.WantedAssetCollected && order.ReceivedWantedAmount == 0)).ToArray();
+            order.RemainingOfferedAmount == expectedLiveReturn &&
+            order.ReceivedWantedAmount == expectedLiveWanted).ToArray();
         if (matches.Length != 1)
         {
             failure = $"Expected one exact terminal settlement row; found {matches.Length}.";
@@ -182,13 +210,11 @@ public sealed class CanceledReturnCollectionController
             .Single(pair => pair.order.PlayerOrderId == matches[0].PlayerOrderId).orderIndex;
         row = panel.OrderElements[index];
         var expectedStatus = matches[0].IsCanceled ? "Order Cancelled" : "Order Completed";
-        var matchingRows = panel.OrderElements.Where(element => element.IsVisible &&
-            TrackedOrderCancellationController.TerminalRowTextsMatch(
-                EnumerateText(element, 0), matches[0], expectedStatus)).ToArray();
-        if (matchingRows.Length != 1 || row.Address != matchingRows[0].Address)
+        if (!row.IsVisible || !EnumerateText(row, 0).Any(text =>
+                text.Equals(expectedStatus, StringComparison.OrdinalIgnoreCase)))
         {
             row = null;
-            failure = $"Terminal settlement model did not align with one unique row; found {matchingRows.Length}.";
+            failure = "Parallel terminal settlement row lacked exact visible status evidence.";
             return false;
         }
         failure = string.Empty;
@@ -360,10 +386,19 @@ public sealed class CanceledReturnCollectionController
             return false;
         }
         var trackedMatches = orders.Where(order => TrackedOrderLifecycle.TerminalIdentityMatches(_tracked!, order)).ToArray();
-        var rowEvidence = _isFinalAsset
+        var expectedWantedAfter = TrackedOrderLifecycle.RemainingWantedToCollect(_tracked!) -
+            (_asset!.WantedSlot ? _asset.Amount : 0);
+        var expectedReturnAfter = TrackedOrderLifecycle.RemainingReturnToCollect(_tracked!) -
+            (_asset.WantedSlot ? 0 : _asset.Amount);
+        var batchClearsSlot = _asset!.Amount == _sideRemainingBefore;
+        var rowEvidence = _rowShouldDisappear
             ? trackedMatches.Length == 0
-            : trackedMatches.Length == 1 && ClickedSlotIconCleared(
-                gameController, _tracked!, _asset!, _calibration!, out failure);
+            : trackedMatches.Length == 1 &&
+              trackedMatches[0].ReceivedWantedAmount == expectedWantedAfter &&
+              trackedMatches[0].RemainingOfferedAmount == expectedReturnAfter &&
+              (batchClearsSlot
+                ? ClickedSlotIconCleared(gameController, _tracked!, _asset, _calibration!, out failure)
+                : TerminalSlotHasIcon(gameController, _tracked!, _asset, _calibration!, out failure));
         var unrelated = orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(_tracked!, order));
         if (rowEvidence && TrackedOrderLifecycle.OrderSetFingerprint(unrelated) == _unrelatedFingerprint &&
             InventoryStashTransferController.TryReadSnapshot(
@@ -400,23 +435,37 @@ public sealed class CanceledReturnCollectionController
             return false;
         }
         var assets = TrackedOrderLifecycle.CreateSettlementAssets(tracked, remaining, received);
-        collectedAsset = assets.SingleOrDefault(asset => asset.Metadata == intent.Metadata &&
-            asset.Amount == intent.Amount && asset.WantedSlot == intent.WantedSlot);
+        var sideRemainingBefore = intent.WantedSlot
+            ? TrackedOrderLifecycle.RemainingWantedToCollect(tracked)
+            : TrackedOrderLifecycle.RemainingReturnToCollect(tracked);
+        var sideMetadata = intent.WantedSlot ? tracked.WantedMetadata : tracked.OfferedMetadata;
+        collectedAsset = intent.Metadata == sideMetadata && intent.Amount > 0 &&
+            intent.Amount <= sideRemainingBefore &&
+            assets.Any(asset => asset.WantedSlot == intent.WantedSlot)
+                ? new SettlementAsset(intent.Metadata, intent.Amount, intent.WantedSlot)
+                : null;
         if (collectedAsset is null || !SingleLegPlacementController.TryReadOrders(
                 gameController, out var orders, out failure))
         {
             if (string.IsNullOrEmpty(failure)) failure = "Interrupted collection intent did not match one terminal asset.";
             return false;
         }
-        var pendingAssets = assets.Where(asset => asset.WantedSlot
-            ? !tracked.WantedAssetCollected
-            : !tracked.OfferedReturnCollected).ToArray();
         var trackedMatches = orders.Where(order =>
             TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)).ToArray();
-        var rowEvidence = pendingAssets.Length == 1
+        var expectedWantedAfter = TrackedOrderLifecycle.RemainingWantedToCollect(tracked) -
+            (intent.WantedSlot ? intent.Amount : 0);
+        var expectedReturnAfter = TrackedOrderLifecycle.RemainingReturnToCollect(tracked) -
+            (intent.WantedSlot ? 0 : intent.Amount);
+        var rowShouldDisappear =
+            TrackedOrderLifecycle.RemainingToCollect(tracked) - intent.Amount == 0;
+        var rowEvidence = rowShouldDisappear
             ? trackedMatches.Length == 0
-            : trackedMatches.Length == 1 && ClickedSlotIconCleared(
-                gameController, tracked, collectedAsset, calibration, out failure);
+            : trackedMatches.Length == 1 &&
+              trackedMatches[0].ReceivedWantedAmount == expectedWantedAfter &&
+              trackedMatches[0].RemainingOfferedAmount == expectedReturnAfter &&
+              (intent.Amount == sideRemainingBefore
+                ? ClickedSlotIconCleared(gameController, tracked, collectedAsset, calibration, out failure)
+                : TerminalSlotHasIcon(gameController, tracked, collectedAsset, calibration, out failure));
         var unrelated = orders.Where(order =>
             !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order));
         if (!rowEvidence || TrackedOrderLifecycle.OrderSetFingerprint(unrelated) != intent.UnrelatedOrdersFingerprint ||
@@ -432,6 +481,60 @@ public sealed class CanceledReturnCollectionController
         {
             if (string.IsNullOrEmpty(failure))
                 failure = "Interrupted terminal collection did not match exact row/inventory/stash/ownership post-state.";
+            return false;
+        }
+        failure = string.Empty;
+        return true;
+    }
+
+    public static bool VerifyInterruptedPreState(
+        GameController gameController,
+        TrackedOrderState tracked,
+        PickerCalibration calibration,
+        out string failure)
+    {
+        failure = string.Empty;
+        if (tracked.CollectionAssetIntent is not { } intent || intent.IntentId == Guid.Empty ||
+            tracked.TerminalRemainingOfferedAmount is not { } remaining ||
+            tracked.TerminalReceivedWantedAmount is not { } received ||
+            gameController.Game.IngameState.ServerData.InstanceId != intent.AreaInstanceId)
+        {
+            failure = "Interrupted terminal collection lacked exact durable pre-click identity.";
+            return false;
+        }
+        var preSideRemaining = intent.WantedSlot
+            ? TrackedOrderLifecycle.RemainingWantedToCollect(tracked)
+            : TrackedOrderLifecycle.RemainingReturnToCollect(tracked);
+        var preSideMetadata = intent.WantedSlot ? tracked.WantedMetadata : tracked.OfferedMetadata;
+        var asset = intent.Metadata == preSideMetadata && intent.Amount > 0 &&
+            intent.Amount <= preSideRemaining &&
+            TrackedOrderLifecycle.CreateSettlementAssets(tracked, remaining, received)
+                .Any(candidate => candidate.WantedSlot == intent.WantedSlot)
+                ? new SettlementAsset(intent.Metadata, intent.Amount, intent.WantedSlot)
+                : null;
+        if (asset is null || !SingleLegPlacementController.TryReadOrders(
+                gameController, out var orders, out failure))
+        {
+            if (string.IsNullOrEmpty(failure)) failure = "Interrupted collection intent did not match one pre-click asset.";
+            return false;
+        }
+        var trackedMatches = orders.Where(order => TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)).ToArray();
+        var unrelated = orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order));
+        if (trackedMatches.Length != 1 ||
+            trackedMatches[0].ReceivedWantedAmount != TrackedOrderLifecycle.RemainingWantedToCollect(tracked) ||
+            trackedMatches[0].RemainingOfferedAmount != TrackedOrderLifecycle.RemainingReturnToCollect(tracked) ||
+            TrackedOrderLifecycle.OrderSetFingerprint(unrelated) != intent.UnrelatedOrdersFingerprint ||
+            !TerminalSlotHasIcon(gameController, tracked, asset, calibration, out failure) ||
+            !InventoryStashTransferController.TryReadSnapshot(
+                gameController, intent.Metadata, out var inventory, out failure) ||
+            inventory.TargetInventoryAmount != intent.InventoryAmountBefore ||
+            inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore ||
+            InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
+                intent.NonTargetInventoryFingerprint ||
+            checked(inventory.TargetInventoryAmount + inventory.TargetVisibleStashAmount) > intent.AggregateOwnedBefore)
+        {
+            if (string.IsNullOrEmpty(failure))
+                failure = "Interrupted terminal collection did not match exact durable pre-click evidence.";
             return false;
         }
         failure = string.Empty;
@@ -485,6 +588,96 @@ public sealed class CanceledReturnCollectionController
             }))
         {
             failure = "Clicked terminal slot did not become uniquely icon-cleared.";
+            return false;
+        }
+        failure = string.Empty;
+        return true;
+    }
+
+    private static bool TerminalSlotStackEquals(
+        GameController gameController,
+        TrackedOrderState tracked,
+        SettlementAsset asset,
+        PickerCalibration calibration,
+        long expectedStack,
+        out string failure)
+    {
+        if (!SingleLegPlacementController.TryReadOrders(gameController, out var orders, out failure)) return false;
+        var matches = orders.Where(order => TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)).ToArray();
+        var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        if (matches.Length != 1 || panel.OrderElements.Count != orders.Count)
+        {
+            failure = "Terminal row was not uniquely resolvable after the batch collection.";
+            return false;
+        }
+        var index = orders.Select((order, orderIndex) => (order, orderIndex))
+            .Single(pair => pair.order.PlayerOrderId == matches[0].PlayerOrderId).orderIndex;
+        var row = panel.OrderElements[index];
+        var rect = row.GetClientRectCache;
+        Vector2 point;
+        var resolved = asset.WantedSlot
+            ? calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure)
+            : calibration.TryResolveReturnSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure);
+        if (!resolved) return false;
+        var slots = EnumerateElements(row, 0).Where(element =>
+        {
+            var candidate = element.GetClientRectCache;
+            return element.IsVisible && candidate.Width is >= 68 and <= 76 && candidate.Height is >= 68 and <= 76 &&
+                candidate.Contains(point.X, point.Y);
+        }).ToArray();
+        if (slots.Length != 1 ||
+            !slots[0].Children.Any(child =>
+            {
+                var childRect = child.GetClientRectCache;
+                return child.IsVisible && childRect.Width >= 80 && childRect.Height >= 80;
+            }) ||
+            !EnumerateText(slots[0], 0).Any(text =>
+                long.TryParse(text.Replace(",", string.Empty), out var stack) && stack == expectedStack))
+        {
+            failure = $"Clicked terminal slot did not retain one icon with an exact remaining stack of {expectedStack}.";
+            return false;
+        }
+        failure = string.Empty;
+        return true;
+    }
+
+    private static bool TerminalSlotHasIcon(
+        GameController gameController,
+        TrackedOrderState tracked,
+        SettlementAsset asset,
+        PickerCalibration calibration,
+        out string failure)
+    {
+        if (!SingleLegPlacementController.TryReadOrders(gameController, out var orders, out failure)) return false;
+        var matches = orders.Where(order => TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)).ToArray();
+        var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        if (matches.Length != 1 || panel.OrderElements.Count != orders.Count)
+        {
+            failure = "Terminal pre-click row was not uniquely resolvable.";
+            return false;
+        }
+        var index = orders.Select((order, orderIndex) => (order, orderIndex))
+            .Single(pair => pair.order.PlayerOrderId == matches[0].PlayerOrderId).orderIndex;
+        var row = panel.OrderElements[index];
+        var rect = row.GetClientRectCache;
+        Vector2 point;
+        var resolved = asset.WantedSlot
+            ? calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure)
+            : calibration.TryResolveReturnSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure);
+        if (!resolved) return false;
+        var slots = EnumerateElements(row, 0).Where(element =>
+        {
+            var candidate = element.GetClientRectCache;
+            return element.IsVisible && candidate.Width is >= 68 and <= 76 && candidate.Height is >= 68 and <= 76 &&
+                candidate.Contains(point.X, point.Y);
+        }).ToArray();
+        if (slots.Length != 1 || !slots[0].Children.Any(child =>
+            {
+                var childRect = child.GetClientRectCache;
+                return child.IsVisible && childRect.Width >= 80 && childRect.Height >= 80;
+            }))
+        {
+            failure = "Terminal pre-click slot did not retain one exact visible asset icon.";
             return false;
         }
         failure = string.Empty;

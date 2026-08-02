@@ -32,6 +32,9 @@ public sealed class FaustusControllerLiteSettings : ISettings
     [Category("Strategy")]
     public RangeNode<int> CompetingOrderWaitMinutes { get; set; } = new(5, 1, 120);
 
+    [Category("Strategy")]
+    public RangeNode<int> ContinuousWorkflowRetrySeconds { get; set; } = new(10, 2, 90);
+
     [Category("Probing")]
     public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
 
@@ -116,13 +119,13 @@ public sealed class FaustusControllerLiteSettings : ISettings
     [Category("Hotkeys")]
     public HotkeyNodeV2 FullWorkflowHotkey { get; set; } = CreateUnboundHotkey();
 
-    [Category("Bankroll Safety")]
+    [Category("Fresh State Reset")]
     [JsonIgnore]
-    public ButtonNode ArmBankrollReset { get; set; } = new();
+    public ButtonNode ArmFreshStateReset { get; set; } = new();
 
-    [Category("Bankroll Safety")]
+    [Category("Fresh State Reset")]
     [JsonIgnore]
-    public ButtonNode ApplyArmedBankrollReset { get; set; } = new();
+    public ButtonNode ApplyArmedFreshStateReset { get; set; } = new();
 
     private static HotkeyNodeV2 CreateUnboundHotkey() => new(Keys.None)
     {

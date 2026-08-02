@@ -33,10 +33,11 @@ public sealed class TrackedOrderStore
 
         var state = JsonSerializer.Deserialize<TrackedOrderState>(File.ReadAllText(path), JsonOptions)
             ?? throw new InvalidDataException("Tracked order state was empty.");
-        var migrated = state.SchemaVersion is 1 or 2 or 3;
+        var migrated = state.SchemaVersion is 1 or 2 or 3 or 4;
         if (migrated)
         {
             TrackedOrderLifecycle.MigrateLegacyAssetProgress(state);
+            TrackedOrderLifecycle.MigrateLegacyAssetAmounts(state);
             state.SchemaVersion = TrackedOrderState.CurrentSchemaVersion;
         }
         Validate(state, league);
@@ -78,7 +79,13 @@ public sealed class TrackedOrderStore
             state.WantedAssetCollected,
             state.OfferedReturnCollected,
             state.WantedAssetStashed,
-            state.OfferedReturnStashed
+            state.OfferedReturnStashed,
+            state.SettledWantedAmount,
+            state.PendingWantedBatchAmount,
+            state.SettledReturnAmount,
+            state.PendingReturnBatchAmount,
+            state.OfferedMaxStackSize,
+            state.WantedMaxStackSize
         };
         File.AppendAllText(
             Path.Combine(_directory, $"execution-audit-{Sanitize(state.League)}.jsonl"),
