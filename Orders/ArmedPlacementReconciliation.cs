@@ -14,15 +14,28 @@ public sealed record ArmedReconciliation(
     string Detail);
 
 /// <summary>
-/// Reconciles an <see cref="TrackedOrderStatus.Armed"/> placement whose click already happened but
-/// whose outcome was never bound to a real order. The placement controller only observes for three
-/// seconds; a reload, an interruption, or a rejected persistence leaves the durable state armed and
-/// otherwise unrecoverable, because armed states carry no creation date or placed ratio and so never
-/// match the durable-identity lifecycle. This is observation only and never authorizes a click.
+/// Reconciles a placement whose click already happened but whose outcome was never bound to a real
+/// order. The placement controller only observes briefly; a reload, interruption, or rejected match
+/// can leave either an armed state or a placement-only ambiguous state without the durable identity
+/// required by the normal lifecycle. This is observation only and never authorizes a click.
 /// </summary>
 public static class ArmedPlacementReconciliation
 {
     public const int ObservationGraceSeconds = 15;
+
+    public static bool CanReconcile(TrackedOrderState tracked) =>
+        tracked.Status == TrackedOrderStatus.Armed ||
+        tracked.Status == TrackedOrderStatus.Ambiguous &&
+        tracked.ClickedAtUtc is not null &&
+        tracked.OrderCreationDateUtc is null &&
+        tracked.PlacedOfferedRatioPart is null &&
+        tracked.PlacedWantedRatioPart is null &&
+        tracked.LedgerCommittedAtUtc is null &&
+        tracked.CancelIntent is null &&
+        tracked.CollectionAssetIntent is null &&
+        tracked.StashTransferIntent is null &&
+        tracked.SettledWantedAmount == 0 && tracked.PendingWantedBatchAmount == 0 &&
+        tracked.SettledReturnAmount == 0 && tracked.PendingReturnBatchAmount == 0;
 
     public static ArmedReconciliation Evaluate(
         TrackedOrderState armed,
@@ -31,7 +44,7 @@ public static class ArmedPlacementReconciliation
     {
         ArgumentNullException.ThrowIfNull(armed);
         ArgumentNullException.ThrowIfNull(orders);
-        if (armed.Status != TrackedOrderStatus.Armed || armed.ClickedAtUtc is not { } clickedAtUtc ||
+        if (!CanReconcile(armed) || armed.ClickedAtUtc is not { } clickedAtUtc ||
             armed.OfferedHash == 0 || armed.WantedHash == 0 ||
             armed.OfferedAmount <= 0 || armed.WantedAmount <= 0)
         {
@@ -63,13 +76,14 @@ public static class ArmedPlacementReconciliation
         }
 
         var order = candidates[0];
-        if (order.OfferedHash != armed.OfferedHash || order.WantedHash != armed.WantedHash ||
+        if (armed.PlayerOrderId is > 0 && order.PlayerOrderId != armed.PlayerOrderId ||
+            order.OfferedHash != armed.OfferedHash || order.WantedHash != armed.WantedHash ||
             !string.Equals(order.OfferedMetadata, armed.OfferedMetadata, StringComparison.Ordinal) ||
             !string.Equals(order.WantedMetadata, armed.WantedMetadata, StringComparison.Ordinal) ||
             order.OriginalOfferedAmount != armed.OfferedAmount ||
             !PlacementOrderMatcher.RatiosEquivalent(
                 order.OfferedRatioPart, order.WantedRatioPart, armed.OfferedAmount, armed.WantedAmount) ||
-            order.CreationDate < clickedAtUtc.AddSeconds(-1) || order.CreationDate > observedAtUtc.AddSeconds(1))
+            !PlacementOrderMatcher.CreationDateIsPlausible(order.CreationDate, clickedAtUtc, observedAtUtc))
         {
             return Ambiguous("The single new order did not match the armed pair, amount, ratio, or click time.");
         }

@@ -67,6 +67,16 @@ public sealed record PlacementObservation(
 
 public static class PlacementOrderMatcher
 {
+    private static readonly TimeSpan CreationTimestampBacktrackTolerance = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan CreationTimestampForwardTolerance = TimeSpan.FromSeconds(1);
+
+    public static bool CreationDateIsPlausible(
+        DateTimeOffset creationDate,
+        DateTimeOffset clickedAtUtc,
+        DateTimeOffset observedAtUtc) =>
+        creationDate >= clickedAtUtc - CreationTimestampBacktrackTolerance &&
+        creationDate <= observedAtUtc + CreationTimestampForwardTolerance;
+
     public static PlacementObservation Evaluate(
         IReadOnlyCollection<int> baselineIds,
         IReadOnlyCollection<PlacedOrderSnapshot> current,
@@ -111,8 +121,7 @@ public static class PlacementOrderMatcher
                 "The single new order did not have exact nonzero currency hashes.");
         }
 
-        var creationPlausible = order.CreationDate >= clickedAtUtc.AddSeconds(-1) &&
-            order.CreationDate <= observedAtUtc.AddSeconds(1);
+        var creationPlausible = CreationDateIsPlausible(order.CreationDate, clickedAtUtc, observedAtUtc);
         var economicsMatch = string.Equals(order.OfferedMetadata, leg.Edge.From.Metadata, StringComparison.Ordinal) &&
             string.Equals(order.WantedMetadata, leg.Edge.To.Metadata, StringComparison.Ordinal) &&
             order.OriginalOfferedAmount == leg.InputSpent &&
@@ -126,10 +135,21 @@ public static class PlacementOrderMatcher
             return new PlacementObservation(PlacementObservationKind.Ambiguous, order,
                 "Completed order reported terminal amounts its placed ratio cannot prove.");
         }
-        if (!creationPlausible || !economicsMatch || order.IsCanceled)
+        if (!creationPlausible)
         {
             return new PlacementObservation(PlacementObservationKind.Ambiguous, order,
-                "The single new order did not match timestamp, pair, amount, ratio, or non-canceled status.");
+                $"The single new order creation time {order.CreationDate:O} was not plausible for click " +
+                $"{clickedAtUtc:O} and observation {observedAtUtc:O}.");
+        }
+        if (!economicsMatch)
+        {
+            return new PlacementObservation(PlacementObservationKind.Ambiguous, order,
+                "The single new order did not match the exact pair, amount, ratio, or terminal amounts.");
+        }
+        if (order.IsCanceled)
+        {
+            return new PlacementObservation(PlacementObservationKind.Ambiguous, order,
+                "The single new order was already canceled during placement verification.");
         }
 
         if (!order.IsCompleted)

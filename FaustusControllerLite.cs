@@ -2141,7 +2141,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void PollTrackedOrderLifecycle()
     {
-        if (_trackedOrderState?.Status is not TrackedOrderStatus.Armed and not TrackedOrderStatus.Pending and
+        if (_trackedOrderState is null) return;
+        var placementNeedsReconciliation = _trackedOrderState is { } tracked &&
+            ArmedPlacementReconciliation.CanReconcile(tracked);
+        if (!placementNeedsReconciliation &&
+            _trackedOrderState?.Status is not TrackedOrderStatus.Pending and
                 not TrackedOrderStatus.TimedOut and not TrackedOrderStatus.CancelArmed and
                 not TrackedOrderStatus.CancelClicked ||
             DateTimeOffset.UtcNow < _nextLifecyclePollAtUtc || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
@@ -2170,7 +2174,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         var observedAt = DateTimeOffset.UtcNow;
-        if (_trackedOrderState.Status == TrackedOrderStatus.Armed)
+        if (placementNeedsReconciliation)
         {
             ReconcileArmedPlacement(orders, observedAt);
             return;
