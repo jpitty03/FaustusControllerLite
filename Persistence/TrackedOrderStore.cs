@@ -33,9 +33,11 @@ public sealed class TrackedOrderStore
 
         var state = JsonSerializer.Deserialize<TrackedOrderState>(File.ReadAllText(path), JsonOptions)
             ?? throw new InvalidDataException("Tracked order state was empty.");
-        var migrated = state.SchemaVersion is 1 or 2 or 3 or 4;
+        var migrated = state.SchemaVersion is 1 or 2 or 3 or 4 or 5;
         if (migrated)
         {
+            if (state.StashTransferIntent is { } legacyStashIntent)
+                legacyStashIntent.StashCustodyMode = StashCustodyMode.VisibleCurrencyStashExact;
             TrackedOrderLifecycle.MigrateLegacyAssetProgress(state);
             TrackedOrderLifecycle.MigrateLegacyAssetAmounts(state);
             state.SchemaVersion = TrackedOrderState.CurrentSchemaVersion;
@@ -92,6 +94,21 @@ public sealed class TrackedOrderStore
             JsonSerializer.Serialize(audit, AuditJsonOptions) + Environment.NewLine);
     }
 
+    /// <summary>
+    /// Moves the legacy standalone tracked-order file aside for a forced reset. It is never deleted,
+    /// because a standalone record is exactly the evidence that blocked the safe reset.
+    /// </summary>
+    public IReadOnlyList<string> QuarantineState(string league, DateTimeOffset at)
+    {
+        var path = StatePath(league);
+        var quarantined = new List<string>();
+        foreach (var candidate in new[] { path, path + ".tmp" })
+        {
+            if (FileQuarantine.TryMoveAside(candidate, at, out var target)) quarantined.Add(target);
+        }
+        return quarantined;
+    }
+
     private string StatePath(string league) =>
         Path.Combine(_directory, $"tracked-order-{Sanitize(league)}.json");
 
@@ -139,18 +156,21 @@ public sealed class TrackedOrderStore
         {
             throw new InvalidDataException("Tracked lifecycle state lacked durable identity.");
         }
-        if (state.Status == TrackedOrderStatus.StashTransferArmed &&
-            (state.StashTransferIntent is null || state.StashTransferIntent.Amount <= 0 ||
-             string.IsNullOrWhiteSpace(state.StashTransferIntent.NonTargetInventoryFingerprint) ||
+        if (state.StashTransferIntent is { } stashIntent &&
+            (state.Status is not TrackedOrderStatus.StashTransferArmed and not TrackedOrderStatus.Ambiguous ||
+             !IsValidStashTransferIntent(stashIntent) ||
              state.TerminalRemainingOfferedAmount is not { } stashRemaining ||
              state.TerminalReceivedWantedAmount is not { } stashReceived ||
              !TrackedOrderLifecycle.CreateSettlementAssets(state, stashRemaining, stashReceived)
-                 .Any(asset => asset.Metadata == state.StashTransferIntent.Metadata &&
-                     asset.Amount == state.StashTransferIntent.Amount &&
-                     state.StashTransferIntent.InventoryAmountBefore == asset.Amount)))
+                  .Any(asset => asset.Metadata == stashIntent.Metadata &&
+                      asset.Amount == stashIntent.Amount && stashIntent.InventoryAmountBefore == asset.Amount)))
         {
             throw new InvalidDataException("Tracked stash-transfer intent was invalid.");
         }
+        if (state.Status == TrackedOrderStatus.StashTransferArmed && state.StashTransferIntent is null)
+            throw new InvalidDataException("Tracked stash-transfer intent was missing.");
+        if (state.StashTransferIntent is not null && state.CollectionAssetIntent is not null)
+            throw new InvalidDataException("Collection and stash-transfer intents cannot coexist.");
         if (state.Status is TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous &&
             state.CollectionAssetIntent is not null &&
             (state.CollectionAssetIntent is null || state.CollectionAssetIntent.IntentId == Guid.Empty ||
@@ -182,6 +202,26 @@ public sealed class TrackedOrderStore
              state.TerminalReceivedWantedAmount > state.WantedAmount || state.LedgerCommittedAtUtc is null))
         {
             throw new InvalidDataException("Tracked terminal evidence was incomplete.");
+        }
+    }
+
+    private static bool IsValidStashTransferIntent(StashTransferIntentState intent)
+    {
+        if (!StashCustodyPolicy.TryResolve(intent.Metadata, out var expectedMode) ||
+            intent.StashCustodyMode != expectedMode || intent.Amount <= 0 ||
+            intent.InventoryAmountBefore != intent.Amount || intent.VisibleStashAmountBefore < 0 ||
+            string.IsNullOrWhiteSpace(intent.NonTargetInventoryFingerprint) || intent.AreaInstanceId == 0 ||
+            intent.ArmedAtUtc == default)
+        {
+            return false;
+        }
+        try
+        {
+            return intent.AggregateOwnedBefore >= checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore);
+        }
+        catch (OverflowException)
+        {
+            return false;
         }
     }
 

@@ -146,11 +146,62 @@ public static class InventoryTransferEvidence
         InventoryTransferSnapshot before,
         InventoryTransferSnapshot after,
         string metadata,
-        long amount) =>
-        before.TargetInventoryAmount == amount &&
-        after.TargetInventoryAmount == 0 &&
-        after.TargetVisibleStashAmount == checked(before.TargetVisibleStashAmount + amount) &&
-        before.NonTarget(metadata).SequenceEqual(after.NonTarget(metadata));
+        long amount,
+        StashCustodyMode custodyMode)
+    {
+        if (before.TargetInventoryAmount != amount || after.TargetInventoryAmount != 0 ||
+            !before.NonTarget(metadata).SequenceEqual(after.NonTarget(metadata)))
+        {
+            return false;
+        }
+        try
+        {
+            return custodyMode switch
+            {
+                StashCustodyMode.VisibleCurrencyStashExact =>
+                    after.TargetVisibleStashAmount == checked(before.TargetVisibleStashAmount + amount),
+                StashCustodyMode.AffinityAggregate =>
+                    after.TargetVisibleStashAmount == before.TargetVisibleStashAmount,
+                _ => false,
+            };
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
+    public static bool TransferCompletedExactly(
+        InventoryTransferSnapshot before,
+        InventoryTransferSnapshot after,
+        string metadata,
+        long amount) => TransferCompletedExactly(
+            before, after, metadata, amount, StashCustodyMode.VisibleCurrencyStashExact);
+
+    public static bool TryAuthenticateMaxStackSize(
+        int staticMaxStackSize,
+        IEnumerable<int> liveMaxStackSizes,
+        out int authenticatedMaxStackSize,
+        out string failure)
+    {
+        authenticatedMaxStackSize = 0;
+        var live = liveMaxStackSizes.ToArray();
+        if (live.Any(size => size <= 0) || live.Distinct().Take(2).Count() > 1)
+        {
+            failure = "Visible target maximum stack sizes were unreadable or inconsistent.";
+            return false;
+        }
+        var staticSize = staticMaxStackSize > 0 ? staticMaxStackSize : 0;
+        var liveSize = live.FirstOrDefault();
+        if (staticSize > 0 && liveSize > 0 && staticSize != liveSize)
+        {
+            failure = $"Static maximum stack size {staticSize} conflicted with live size {liveSize}.";
+            return false;
+        }
+        authenticatedMaxStackSize = liveSize > 0 ? liveSize : staticSize;
+        failure = string.Empty;
+        return true;
+    }
 
     public static string NonTargetFingerprint(InventoryTransferSnapshot snapshot, string metadata)
     {
@@ -171,7 +222,8 @@ public static class InventoryTransferEvidence
         long observedOwned,
         int currentAreaInstanceId)
     {
-        if (intent.Metadata != canonicalMetadata || intent.Amount != canonicalAmount ||
+        if (!StashCustodyPolicy.TryResolve(canonicalMetadata, out var canonicalMode) ||
+            intent.StashCustodyMode != canonicalMode || intent.Metadata != canonicalMetadata || intent.Amount != canonicalAmount ||
             intent.InventoryAmountBefore != canonicalAmount || intent.AggregateOwnedBefore != observedOwned ||
             intent.AreaInstanceId != currentAreaInstanceId ||
             NonTargetFingerprint(current, canonicalMetadata) != intent.NonTargetInventoryFingerprint)
@@ -183,10 +235,21 @@ public static class InventoryTransferEvidence
         {
             return RecoveryKind.PreTransfer;
         }
-        if (current.TargetInventoryAmount == 0 &&
-            current.TargetVisibleStashAmount == checked(intent.VisibleStashAmountBefore + intent.Amount))
+        try
         {
-            return RecoveryKind.PostTransfer;
+            var postStashAmount = intent.StashCustodyMode switch
+            {
+                StashCustodyMode.VisibleCurrencyStashExact =>
+                    checked(intent.VisibleStashAmountBefore + intent.Amount),
+                StashCustodyMode.AffinityAggregate => intent.VisibleStashAmountBefore,
+                _ => -1,
+            };
+            if (current.TargetInventoryAmount == 0 && current.TargetVisibleStashAmount == postStashAmount)
+                return RecoveryKind.PostTransfer;
+        }
+        catch (OverflowException)
+        {
+            return RecoveryKind.Ambiguous;
         }
         return RecoveryKind.Ambiguous;
     }
@@ -205,6 +268,8 @@ public sealed class InventoryStashTransferController
     private string _metadata = string.Empty;
     private long _amount;
     private long _aggregateOwnedBefore;
+    private StashCustodyMode _custodyMode;
+    private int _staticMaxStackSize;
     private string _league = string.Empty;
     private int _areaInstanceId;
     private Vector2 _moveStart;
@@ -237,9 +302,33 @@ public sealed class InventoryStashTransferController
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
     {
+        if (!StashCustodyPolicy.TryResolve(metadata, out var custodyMode))
+        {
+            failure = "Settlement asset has no supported stash custody policy.";
+            return false;
+        }
+        return Start(gameController, tracked, permissions, conflictingControllerEnabled, cursorSpeed,
+            metadata, amount, aggregateOwnedBefore, custodyMode, 0, persist, out failure);
+    }
+
+    public bool Start(
+        GameController gameController,
+        TrackedOrderState tracked,
+        StashTransferInputPermissions permissions,
+        bool conflictingControllerEnabled,
+        int cursorSpeed,
+        string metadata,
+        long amount,
+        long aggregateOwnedBefore,
+        StashCustodyMode custodyMode,
+        int staticMaxStackSize,
+        Func<TrackedOrderState, string, bool> persist,
+        out string failure)
+    {
         ArgumentNullException.ThrowIfNull(tracked);
         ArgumentNullException.ThrowIfNull(persist);
-        if (IsRunning || tracked.Status != TrackedOrderStatus.Collected || !permissions.Ready ||
+        if (!StashCustodyPolicy.TryResolve(metadata, out var canonicalMode) || canonicalMode != custodyMode ||
+            IsRunning || tracked.Status != TrackedOrderStatus.Collected || !permissions.Ready ||
             conflictingControllerEnabled || amount <= 0 || aggregateOwnedBefore < amount ||
             !(metadata == tracked.WantedMetadata && amount == tracked.PendingWantedBatchAmount ||
               metadata == tracked.OfferedMetadata && amount == tracked.PendingReturnBatchAmount))
@@ -248,7 +337,7 @@ public sealed class InventoryStashTransferController
             return false;
         }
 
-        if (!TryReadSnapshot(gameController, metadata, out var snapshot, out failure) ||
+        if (!TryReadSnapshot(gameController, metadata, staticMaxStackSize, out var snapshot, out failure) ||
             !InventoryTransferEvidence.TrySelectExactTarget(
                 snapshot, metadata, amount, out var target, out failure) || target is null)
         {
@@ -262,6 +351,8 @@ public sealed class InventoryStashTransferController
         _metadata = metadata;
         _amount = amount;
         _aggregateOwnedBefore = aggregateOwnedBefore;
+        _custodyMode = custodyMode;
+        _staticMaxStackSize = staticMaxStackSize;
         _league = gameController.Game.IngameState.ServerData.League;
         _areaInstanceId = gameController.Game.IngameState.ServerData.InstanceId;
         _clickAttempted = false;
@@ -329,6 +420,13 @@ public sealed class InventoryStashTransferController
     public static bool TryReadSnapshot(
         GameController gameController,
         string targetMetadata,
+        out InventoryTransferSnapshot snapshot,
+        out string failure) => TryReadSnapshot(gameController, targetMetadata, 0, out snapshot, out failure);
+
+    public static bool TryReadSnapshot(
+        GameController gameController,
+        string targetMetadata,
+        int staticMaxStackSize,
         out InventoryTransferSnapshot snapshot,
         out string failure)
     {
@@ -400,7 +498,7 @@ public sealed class InventoryStashTransferController
             }
 
             long stashTarget = 0;
-            var maxStackSize = 0;
+            var liveMaxStackSizes = new List<int>();
             foreach (var item in visibleStash.VisibleInventoryItems.Where(item => item?.Item?.Path == targetMetadata))
             {
                 if (item?.Item?.IsValid != true || !item.Item.TryGetComponent<Stack>(out var stack) || stack.Size <= 0)
@@ -409,25 +507,27 @@ public sealed class InventoryStashTransferController
                     return false;
                 }
                 var currentMax = stack.Info.MaxStackSize;
-                if (currentMax <= 0 || maxStackSize != 0 && maxStackSize != currentMax)
+                if (currentMax <= 0)
                 {
                     failure = "Visible Currency Stash target maximum stack size was unreadable or inconsistent.";
                     return false;
                 }
-                maxStackSize = currentMax;
+                liveMaxStackSizes.Add(currentMax);
                 stashTarget = checked(stashTarget + stack.Size);
             }
 
             foreach (var item in inventory.VisibleInventoryItems.Where(item => item?.Item?.Path == targetMetadata))
             {
-                if (item?.Item?.TryGetComponent<Stack>(out var stack) != true || stack.Info.MaxStackSize <= 0 ||
-                    maxStackSize != 0 && maxStackSize != stack.Info.MaxStackSize)
+                if (item?.Item?.TryGetComponent<Stack>(out var stack) != true || stack.Info.MaxStackSize <= 0)
                 {
                     failure = "Player inventory target maximum stack size was unreadable or inconsistent.";
                     return false;
                 }
-                maxStackSize = stack.Info.MaxStackSize;
+                liveMaxStackSizes.Add(stack.Info.MaxStackSize);
             }
+            if (!InventoryTransferEvidence.TryAuthenticateMaxStackSize(
+                staticMaxStackSize, liveMaxStackSizes, out var maxStackSize, out failure))
+                return false;
             var inventoryTarget = evidence.Where(item => item.Metadata == targetMetadata)
                 .Aggregate(0L, (total, item) => checked(total + item.Amount));
             snapshot = new InventoryTransferSnapshot(evidence.OrderBy(item => item.EntityAddress).ToArray(),
@@ -510,9 +610,12 @@ public sealed class InventoryStashTransferController
 
         var armed = TrackedOrderCollectionController.CloneTracked(
             _tracked!, TrackedOrderStatus.StashTransferArmed,
-            $"Persisted intent to sweep exactly {_amount} {_metadata} from inventory to visible Currency Stash.");
+            _custodyMode == StashCustodyMode.AffinityAggregate
+                ? $"Persisted intent to move exactly {_amount} {_metadata} through configured stash affinity."
+                : $"Persisted intent to sweep exactly {_amount} {_metadata} from inventory to visible Currency Stash.");
         armed.StashTransferIntent = new StashTransferIntentState
         {
+            StashCustodyMode = _custodyMode,
             Metadata = _metadata,
             Amount = _amount,
             InventoryAmountBefore = _baseline!.TargetInventoryAmount,
@@ -578,15 +681,19 @@ public sealed class InventoryStashTransferController
 
         _deadline = DateTimeOffset.UtcNow + TransferTimeout;
         State = InventoryStashTransferState.WaitingForTransfer;
-        Status = "Ctrl+Shift-right-clicked once; waiting for exact inventory and Currency Stash totals.";
+        Status = _custodyMode == StashCustodyMode.AffinityAggregate
+            ? "Ctrl+Shift-right-clicked once; waiting for exact affinity movement evidence."
+            : "Ctrl+Shift-right-clicked once; waiting for exact inventory and Currency Stash totals.";
     }
 
     private void VerifyTransfer(GameController gameController)
     {
         if (VerifyPostState(gameController, out var failure))
         {
-            BeginRelease(InventoryStashTransferState.TransferEvidence,
-                $"Verified inventory {_amount}->0 and visible Currency Stash +{_amount}; non-target inventory unchanged.");
+            var proof = _custodyMode == StashCustodyMode.AffinityAggregate
+                ? $"Verified inventory {_amount}->0 with visible Currency Stash unchanged; non-target inventory unchanged."
+                : $"Verified inventory {_amount}->0 and visible Currency Stash +{_amount}; non-target inventory unchanged.";
+            BeginRelease(InventoryStashTransferState.TransferEvidence, proof);
             return;
         }
 
@@ -602,8 +709,8 @@ public sealed class InventoryStashTransferController
     {
         failure = string.Empty;
         if (gameController.Game.IngameState.ServerData.InstanceId == _areaInstanceId &&
-            TryReadSnapshot(gameController, _metadata, out var current, out failure) &&
-            InventoryTransferEvidence.TransferCompletedExactly(_baseline!, current, _metadata, _amount))
+            TryReadSnapshot(gameController, _metadata, _staticMaxStackSize, out var current, out failure) &&
+            InventoryTransferEvidence.TransferCompletedExactly(_baseline!, current, _metadata, _amount, _custodyMode))
         {
             failure = string.Empty;
             return true;
@@ -615,7 +722,7 @@ public sealed class InventoryStashTransferController
     private bool TryResolveUnchangedTarget(GameController gameController, out Vector2 target, out string failure)
     {
         target = default;
-        if (!TryReadSnapshot(gameController, _metadata, out var current, out failure) ||
+        if (!TryReadSnapshot(gameController, _metadata, _staticMaxStackSize, out var current, out failure) ||
             !_baseline!.Items.SequenceEqual(current.Items) ||
             _baseline.TargetVisibleStashAmount != current.TargetVisibleStashAmount)
         {

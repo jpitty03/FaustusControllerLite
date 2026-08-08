@@ -88,13 +88,14 @@ public static class ContinuousWorkflowLoop
             reason = "a tracked order is unresolved";
             return true;
         }
-        if (bankroll.ReservedChaos != 0 || bankroll.ReservedDivine != 0 || bankroll.ReservedTarget != 0)
+        if (bankroll.ReservedChaos != 0 || bankroll.ReservedDivine != 0 ||
+            bankroll.NonCoreBalances.Values.Any(balance => balance.Reserved != 0))
         {
             reason = "reserved principal has not been released";
             return true;
         }
         if (bankroll.CompletedUncollectedChaos != 0 || bankroll.CompletedUncollectedDivine != 0 ||
-            bankroll.CompletedUncollectedTarget != 0)
+            bankroll.NonCoreBalances.Values.Any(balance => balance.CompletedUncollected != 0))
         {
             reason = "settled proceeds remain uncollected";
             return true;

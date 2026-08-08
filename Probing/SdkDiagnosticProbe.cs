@@ -32,6 +32,21 @@ public static class SdkDiagnosticProbe
             Describe(report, "InventoryPanel", ui.InventoryPanel);
         });
 
+        Section("Supported targets", () =>
+        {
+            if (catalogue is null)
+            {
+                report.AppendLine("  catalogue unavailable");
+                return;
+            }
+            foreach (var target in catalogue.SupportedTargets
+                         .OrderBy(target => target.Name, StringComparer.Ordinal)
+                         .ThenBy(target => target.Metadata, StringComparer.Ordinal))
+            {
+                report.AppendLine($"  {FormatSupportedTarget(target)}");
+            }
+        });
+
         Section("Cursor and UI hover", () =>
         {
             var cursor = ExileCore.Input.MousePositionNum;
@@ -96,6 +111,7 @@ public static class SdkDiagnosticProbe
                     $"    [{index}] ui=0x{item?.Address:X} entity=0x{entity?.Address:X} " +
                     $"valid={entity?.IsValid} visible={item?.IsVisible} path='{path}' " +
                     $"stack={(stackReadable ? amount : "unreadable")} " +
+                    $"liveMaxStack={(stackReadable ? stack!.Info.MaxStackSize : "unreadable")} " +
                     $"rect={Rectangle(rect)} clearOfExchange={rect.Left >= exchangeRight}");
             }
             foreach (var total in totals.OrderBy(pair => pair.Key, StringComparer.Ordinal))
@@ -250,9 +266,14 @@ public static class SdkDiagnosticProbe
                 var catalogueMatch = catalogue is not null &&
                     !string.IsNullOrWhiteSpace(metadata) &&
                     catalogue.TryGetByMetadata(metadata, out _);
+                CurrencyTargetDescriptor? targetDescriptor = null;
+                var supportedTarget = catalogue is not null &&
+                    !string.IsNullOrWhiteSpace(metadata) &&
+                    catalogue.TryGetTargetByMetadata(metadata, out targetDescriptor);
                 report.AppendLine(
                     $"    name='{name}' metadata='{metadata}' owned={option.Owned} " +
-                    $"visible={option.IsVisible} rect={Rectangle(rectangle)} catalogue={catalogueMatch}");
+                    $"visible={option.IsVisible} rect={Rectangle(rectangle)} catalogue={catalogueMatch} " +
+                    $"supportedTarget={supportedTarget} kind={(targetDescriptor?.Kind.ToString() ?? "n/a")}");
             }
         });
 
@@ -334,7 +355,13 @@ public static class SdkDiagnosticProbe
 
     private static string Item(ExileCore.PoEMemory.Models.BaseItemType? item) => item is null
         ? "null"
-        : $"'{item.BaseName}' ({item.Metadata}, hash={item.Hash})";
+        : $"'{item.BaseName}' ({item.Metadata}, hash={item.Hash}, class='{item.ClassName}', " +
+          $"staticMaxStack={(item.CurrencyInfo?.MaxStackSize is > 0 ? item.CurrencyInfo.MaxStackSize : "unknown")})";
+
+    public static string FormatSupportedTarget(CurrencyTargetDescriptor target) =>
+        $"name='{target.Name}' label='{target.SelectorLabel}' kind={target.Kind} metadata='{target.Metadata}' " +
+        $"hash={target.Hash} class='{target.ClassName}' staticMaxStack=" +
+        (target.MaxStackSize > 0 ? target.MaxStackSize : "unknown");
 
     private static string Rectangle(SharpDX.RectangleF rectangle) =>
         $"({rectangle.X:F0},{rectangle.Y:F0} {rectangle.Width:F0}x{rectangle.Height:F0})";

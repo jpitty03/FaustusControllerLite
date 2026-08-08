@@ -127,6 +127,16 @@ public sealed class FaustusControllerLiteSettings : ISettings
     [JsonIgnore]
     public ButtonNode ApplyArmedFreshStateReset { get; set; } = new();
 
+    // Manual override for when the safe reset refuses: unreadable state, or custody the plugin can
+    // no longer resolve. It abandons accounting and quarantines evidence; it never moves an item.
+    [Category("Fresh State Reset")]
+    [JsonIgnore]
+    public ButtonNode ArmForcedFreshStateReset { get; set; } = new();
+
+    [Category("Fresh State Reset")]
+    [JsonIgnore]
+    public ButtonNode ApplyArmedForcedFreshStateReset { get; set; } = new();
+
     private static HotkeyNodeV2 CreateUnboundHotkey() => new(Keys.None)
     {
         IgnoreFocusedInput = true

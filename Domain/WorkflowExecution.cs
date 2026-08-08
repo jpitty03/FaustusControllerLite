@@ -146,6 +146,8 @@ public static class WorkflowCoordinator
             TrackedOrderStatus.CollectionArmed => WorkflowDirectiveKind.ManualReconciliationRequired,
             TrackedOrderStatus.Collected => WorkflowDirectiveKind.AuthorizeStashTransfer,
             TrackedOrderStatus.StashTransferArmed => WorkflowDirectiveKind.RecoverStashTransferWithoutRetry,
+            TrackedOrderStatus.Ambiguous when tracked.StashTransferIntent is not null =>
+                WorkflowDirectiveKind.RecoverStashTransferWithoutRetry,
             TrackedOrderStatus.Ambiguous when tracked.CollectionAssetIntent is not null =>
                 WorkflowDirectiveKind.RecoverSettlementCollectionWithoutRetry,
             TrackedOrderStatus.Armed or TrackedOrderStatus.Ambiguous => WorkflowDirectiveKind.ManualReconciliationRequired,

@@ -112,7 +112,6 @@ public static class FaustusRoutePlanner
         var paths = new[]
         {
             new[] { request.Chaos, request.Target, request.Chaos },
-            new[] { request.Chaos, request.Divine, request.Chaos },
             new[] { request.Chaos, request.Divine, request.Target, request.Chaos },
             new[] { request.Chaos, request.Target, request.Divine, request.Chaos },
             new[] { request.Divine, request.Target, request.Chaos },

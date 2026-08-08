@@ -17,9 +17,37 @@ public enum TrackedOrderStatus
     CanceledUncollected,
 }
 
+public enum StashCustodyMode
+{
+    VisibleCurrencyStashExact = 1,
+    AffinityAggregate = 2,
+}
+
+public static class StashCustodyPolicy
+{
+    public const string CurrencyPrefix = "Metadata/Items/Currency/";
+    public const string ScarabPrefix = "Metadata/Items/Scarabs/";
+
+    public static bool TryResolve(string metadata, out StashCustodyMode mode)
+    {
+        if (metadata.StartsWith(CurrencyPrefix, StringComparison.Ordinal))
+        {
+            mode = StashCustodyMode.VisibleCurrencyStashExact;
+            return true;
+        }
+        if (metadata.StartsWith(ScarabPrefix, StringComparison.Ordinal))
+        {
+            mode = StashCustodyMode.AffinityAggregate;
+            return true;
+        }
+        mode = default;
+        return false;
+    }
+}
+
 public sealed class TrackedOrderState
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public string League { get; set; } = string.Empty;
@@ -104,6 +132,7 @@ public sealed class CancelIntentState
 
 public sealed class StashTransferIntentState
 {
+    public StashCustodyMode StashCustodyMode { get; set; }
     public string Metadata { get; set; } = string.Empty;
     public long Amount { get; set; }
     public long InventoryAmountBefore { get; set; }

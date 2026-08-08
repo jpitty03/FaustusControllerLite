@@ -1,4 +1,4 @@
-using ExileCore;
+﻿using ExileCore;
 using FaustusControllerLite.Input;
 using FaustusControllerLite.Probing;
 using System.Globalization;
@@ -67,8 +67,17 @@ public sealed record PlacementObservation(
 
 public static class PlacementOrderMatcher
 {
-    private static readonly TimeSpan CreationTimestampBacktrackTolerance = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan CreationTimestampForwardTolerance = TimeSpan.FromSeconds(1);
+    /// <summary>
+    /// The order's creation date is stamped by the trade server, but the click and observation times
+    /// come from the local clock, so this comparison is unavoidably a clock-skew comparison. The SDK
+    /// also truncates the stamp to whole seconds, which alone costs up to a second in either
+    /// direction. These tolerances therefore only bound gross staleness; they are not an identity
+    /// proof. Identity is proved exactly and independently by baseline-plus-one unique order ID,
+    /// nonzero currency hashes, exact metadata, exact original offered amount, and whole-lot ratio
+    /// equivalence, none of which a wrong clock can satisfy by accident.
+    /// </summary>
+    private static readonly TimeSpan CreationTimestampBacktrackTolerance = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan CreationTimestampForwardTolerance = TimeSpan.FromSeconds(5);
 
     public static bool CreationDateIsPlausible(
         DateTimeOffset creationDate,

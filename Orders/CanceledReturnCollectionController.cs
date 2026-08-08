@@ -33,6 +33,7 @@ public sealed class CanceledReturnCollectionController
     private SettlementAsset? _asset;
     private bool _rowShouldDisappear;
     private long _sideRemainingBefore;
+    private int _staticMaxStackSize;
     private TrackedOrderStatus _terminalStatus;
     private PickerCalibration? _calibration;
     private Vector2 _target;
@@ -80,11 +81,12 @@ public sealed class CanceledReturnCollectionController
         var wantedSide = remainingWanted > 0;
         var sideRemaining = wantedSide ? remainingWanted : remainingReturn;
         var sideMetadata = wantedSide ? tracked.WantedMetadata : tracked.OfferedMetadata;
+        var persistedMaxStackSize = wantedSide ? tracked.WantedMaxStackSize : tracked.OfferedMaxStackSize;
         if (!TryResolveTarget(gameController, tracked,
                 new SettlementAsset(sideMetadata, sideRemaining, wantedSide), calibration,
                 out var target, out var orders, out failure) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, sideMetadata, out var inventory, out failure))
+                gameController, sideMetadata, persistedMaxStackSize, out var inventory, out failure))
         {
             return false;
         }
@@ -93,7 +95,6 @@ public sealed class CanceledReturnCollectionController
             failure = "Terminal asset collection requires zero pre-existing target currency in inventory for exact custody.";
             return false;
         }
-        var persistedMaxStackSize = wantedSide ? tracked.WantedMaxStackSize : tracked.OfferedMaxStackSize;
         var capacitySnapshot = inventory with
         {
             TargetMaxStackSize = inventory.TargetMaxStackSize > 0
@@ -108,7 +109,7 @@ public sealed class CanceledReturnCollectionController
         if (inventory.TargetMaxStackSize <= 0 && persistedMaxStackSize <= 0 && sideRemaining > capacity)
         {
             failure = $"First acquisition exceeds the {capacity}-unit capacity provable without an existing " +
-                "Currency Stash stack for this asset.";
+                "trusted maximum-stack evidence for this asset.";
             return false;
         }
         var batch = Math.Min(capacity, sideRemaining);
@@ -125,6 +126,7 @@ public sealed class CanceledReturnCollectionController
         _aggregateOwnedBefore = aggregateOwnedBefore;
         _asset = asset;
         _sideRemainingBefore = sideRemaining;
+        _staticMaxStackSize = persistedMaxStackSize;
         _rowShouldDisappear = remainingWanted + remainingReturn - batch == 0;
         _terminalStatus = tracked.Status;
         _calibration = calibration;
@@ -307,7 +309,7 @@ public sealed class CanceledReturnCollectionController
             Vector2.Distance(fresh, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, asset.Metadata, out var inventory, out failure) ||
+                gameController, asset.Metadata, _staticMaxStackSize, out var inventory, out failure) ||
             !_inventoryBefore!.Items.SequenceEqual(inventory.Items) ||
             _inventoryBefore.TargetVisibleStashAmount != inventory.TargetVisibleStashAmount)
         {
@@ -342,7 +344,7 @@ public sealed class CanceledReturnCollectionController
             Vector2.Distance(fresh, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, asset.Metadata, out inventory, out failure) ||
+                gameController, asset.Metadata, _staticMaxStackSize, out inventory, out failure) ||
             !_inventoryBefore.Items.SequenceEqual(inventory.Items) ||
             _inventoryBefore.TargetVisibleStashAmount != inventory.TargetVisibleStashAmount)
         {
@@ -402,7 +404,7 @@ public sealed class CanceledReturnCollectionController
         var unrelated = orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(_tracked!, order));
         if (rowEvidence && TrackedOrderLifecycle.OrderSetFingerprint(unrelated) == _unrelatedFingerprint &&
             InventoryStashTransferController.TryReadSnapshot(
-                gameController, _asset!.Metadata, out var inventory, out failure) &&
+                gameController, _asset!.Metadata, _staticMaxStackSize, out var inventory, out failure) &&
             inventory.TargetInventoryAmount == checked(_inventoryBefore!.TargetInventoryAmount + _asset.Amount) &&
             inventory.TargetVisibleStashAmount == _inventoryBefore.TargetVisibleStashAmount &&
             InventoryTransferEvidence.NonTargetFingerprint(inventory, _asset.Metadata) ==
@@ -470,7 +472,8 @@ public sealed class CanceledReturnCollectionController
             !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order));
         if (!rowEvidence || TrackedOrderLifecycle.OrderSetFingerprint(unrelated) != intent.UnrelatedOrdersFingerprint ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, intent.Metadata, out var inventory, out failure) ||
+                gameController, intent.Metadata, PersistedMaxStackSize(tracked, intent.WantedSlot),
+                out var inventory, out failure) ||
             inventory.TargetInventoryAmount != checked(intent.InventoryAmountBefore + intent.Amount) ||
             inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore ||
             InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
@@ -526,7 +529,8 @@ public sealed class CanceledReturnCollectionController
             TrackedOrderLifecycle.OrderSetFingerprint(unrelated) != intent.UnrelatedOrdersFingerprint ||
             !TerminalSlotHasIcon(gameController, tracked, asset, calibration, out failure) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, intent.Metadata, out var inventory, out failure) ||
+                gameController, intent.Metadata, PersistedMaxStackSize(tracked, intent.WantedSlot),
+                out var inventory, out failure) ||
             inventory.TargetInventoryAmount != intent.InventoryAmountBefore ||
             inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore ||
             InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
@@ -540,6 +544,9 @@ public sealed class CanceledReturnCollectionController
         failure = string.Empty;
         return true;
     }
+
+    private static int PersistedMaxStackSize(TrackedOrderState tracked, bool wantedSlot) =>
+        wantedSlot ? tracked.WantedMaxStackSize : tracked.OfferedMaxStackSize;
 
     private static bool ClickedSlotIconCleared(
         GameController gameController,

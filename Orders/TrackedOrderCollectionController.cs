@@ -155,7 +155,8 @@ public sealed class TrackedOrderCollectionController
 
         if (!TryResolveTarget(gameController, tracked, calibration, out var target, out var orders, out failure) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, tracked.WantedMetadata, out var inventory, out failure))
+                gameController, tracked.WantedMetadata, tracked.WantedMaxStackSize,
+                out var inventory, out failure))
         {
             return false;
         }
@@ -490,7 +491,8 @@ public sealed class TrackedOrderCollectionController
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
             !SnapshotsEqual(_baselineOrders.Values, orders) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, tracked.WantedMetadata, out var inventory, out failure) ||
+                gameController, tracked.WantedMetadata, tracked.WantedMaxStackSize,
+                out var inventory, out failure) ||
             !_inventoryBefore!.Items.SequenceEqual(inventory.Items) ||
             _inventoryBefore.TargetVisibleStashAmount != inventory.TargetVisibleStashAmount)
         {
@@ -528,7 +530,8 @@ public sealed class TrackedOrderCollectionController
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
             !SnapshotsEqual(_baselineOrders.Values, orders) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                gameController, _tracked.WantedMetadata, out inventory, out failure) ||
+                gameController, _tracked.WantedMetadata, _tracked.WantedMaxStackSize,
+                out inventory, out failure) ||
             !_inventoryBefore.Items.SequenceEqual(inventory.Items) ||
             _inventoryBefore.TargetVisibleStashAmount != inventory.TargetVisibleStashAmount)
         {
@@ -681,7 +684,8 @@ public sealed class TrackedOrderCollectionController
             return false;
         }
         if (!InventoryStashTransferController.TryReadSnapshot(
-                gameController, _tracked.WantedMetadata, out var current, out failure)) return false;
+                gameController, _tracked.WantedMetadata, _tracked.WantedMaxStackSize,
+                out var current, out failure)) return false;
         if (current.TargetInventoryAmount != checked(_inventoryBefore.TargetInventoryAmount + _batchAmount) ||
             current.TargetVisibleStashAmount != _inventoryBefore.TargetVisibleStashAmount ||
             InventoryTransferEvidence.NonTargetFingerprint(current, _tracked.WantedMetadata) !=
@@ -768,6 +772,7 @@ public sealed class TrackedOrderCollectionController
         Detail = detail,
         StashTransferIntent = source.StashTransferIntent is null ? null : new StashTransferIntentState
         {
+            StashCustodyMode = source.StashTransferIntent.StashCustodyMode,
             Metadata = source.StashTransferIntent.Metadata,
             Amount = source.StashTransferIntent.Amount,
             InventoryAmountBefore = source.StashTransferIntent.InventoryAmountBefore,

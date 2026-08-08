@@ -907,6 +907,23 @@ public sealed class AutomatedProbeController
 
         if (!TryCreateStableHead(capture, out var head, out var headFailure))
         {
+            // The panel's identity fields flip client-side the moment the picker closes, but the book
+            // rows and market rate only arrive on a server round-trip. An entirely empty capture is
+            // therefore the book not having arrived yet, not an unreadable book, so it must fall
+            // through to the existing poll rather than consume the whole BookTimeout budget on the
+            // first sample. Anything partially populated still cancels immediately: that shape means
+            // the read is genuinely wrong rather than merely early. If the book never arrives,
+            // BookTimeout still adjudicates with an accurate sampling-timeout diagnosis.
+            if (capture.WantedItemStock.Count == 0 && capture.OfferedItemStock.Count == 0 &&
+                capture.MarketRateGet == 0 && capture.MarketRateGive == 0)
+            {
+                // Reset so pre-arrival state can never count toward the consecutive-sample requirement.
+                _stableSamples.Reset();
+                Status = $"Pair {_pairIndex + 1}/{_plans.Count}: awaiting first book rows from the server.";
+                _nextActionAt = now + SampleInterval;
+                return;
+            }
+
             Cancel(headFailure);
             return;
         }

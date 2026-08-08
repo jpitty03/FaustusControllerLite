@@ -23,20 +23,45 @@ public sealed class BankrollStore
         }
 
         var json = File.ReadAllText(path);
-        var root = JObject.Parse(json);
+        var root = JObject.Load(
+            new JsonTextReader(new StringReader(json)),
+            new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error });
         var schemaVersion = root.Value<int?>(nameof(BankrollState.SchemaVersion))
             ?? throw new InvalidDataException("Bankroll schema version was missing.");
         var state = JsonConvert.DeserializeObject<BankrollState>(json)
             ?? throw new InvalidDataException("Bankroll state was empty.");
-        var migrated = schemaVersion is 1 or 2 or 3 or 4;
-        var trackedMigrated = state.TrackedOrder?.SchemaVersion is 1 or 2 or 3 or 4;
+        var migrated = schemaVersion is 1 or 2 or 3 or 4 or 5;
+        var trackedMigrated = state.TrackedOrder?.SchemaVersion is 1 or 2 or 3 or 4 or 5;
         var workflowMigrated = state.Workflow?.SchemaVersion == 1;
         if (migrated)
         {
+            var targetMetadata = root.Value<string>("TargetMetadata");
+            var availableTarget = root.Value<long?>("AvailableTarget") ?? 0;
+            var reservedTarget = root.Value<long?>("ReservedTarget") ?? 0;
+            var completedTarget = root.Value<long?>("CompletedUncollectedTarget") ?? 0;
+            if (string.IsNullOrWhiteSpace(targetMetadata) &&
+                (availableTarget != 0 || reservedTarget != 0 || completedTarget != 0))
+            {
+                throw new InvalidDataException("Legacy target balances had no exact metadata identity.");
+            }
+            if (!string.IsNullOrWhiteSpace(targetMetadata))
+            {
+                if (!state.NonCoreBalances.TryAdd(targetMetadata, new NonCoreBalanceState
+                {
+                    Available = availableTarget,
+                    Reserved = reservedTarget,
+                    CompletedUncollected = completedTarget,
+                }))
+                {
+                    throw new InvalidDataException("Legacy target metadata duplicated a non-core balance entry.");
+                }
+            }
             state.SchemaVersion = BankrollState.CurrentSchemaVersion;
         }
         if (trackedMigrated && state.TrackedOrder is { } migratedTracked)
         {
+            if (migratedTracked.StashTransferIntent is { } legacyStashIntent)
+                legacyStashIntent.StashCustodyMode = StashCustodyMode.VisibleCurrencyStashExact;
             TrackedOrderLifecycle.MigrateLegacyAssetProgress(migratedTracked);
             TrackedOrderLifecycle.MigrateLegacyAssetAmounts(migratedTracked);
             migratedTracked.SchemaVersion = TrackedOrderState.CurrentSchemaVersion;
@@ -78,7 +103,7 @@ public sealed class BankrollStore
             state.AvailableChaos < 0 || state.AvailableDivine < 0 ||
             state.ReservedChaos < 0 || state.ReservedDivine < 0 ||
             state.CompletedUncollectedChaos < 0 || state.CompletedUncollectedDivine < 0 ||
-            state.AvailableTarget < 0 || state.ReservedTarget < 0 || state.CompletedUncollectedTarget < 0 ||
+            !NonCoreBalancesAreValid(state.NonCoreBalances) ||
             state.HasUnresolvedOrder != (state.TrackedOrder?.IsUnresolved == true))
         {
             throw new InvalidDataException("Bankroll state failed schema or value validation.");
@@ -121,12 +146,17 @@ public sealed class BankrollStore
         {
             throw new InvalidDataException("Resolved stashed state lacked terminal settlement evidence.");
         }
-        if (state.TrackedOrder is { Status: TrackedOrderStatus.StashTransferArmed } armed &&
-            (!IsValidStashTransferIntent(armed.StashTransferIntent) ||
+        if (state.TrackedOrder is { StashTransferIntent: not null } armed &&
+            (armed.Status is not TrackedOrderStatus.StashTransferArmed and not TrackedOrderStatus.Ambiguous ||
+             !IsValidStashTransferIntent(armed.StashTransferIntent) ||
              !IntentMatchesSettlementAsset(armed, armed.StashTransferIntent!)))
         {
             throw new InvalidDataException("Stash-transfer-armed state lacked durable recovery evidence.");
         }
+        if (state.TrackedOrder is { Status: TrackedOrderStatus.StashTransferArmed, StashTransferIntent: null })
+            throw new InvalidDataException("Stash-transfer-armed state lacked durable recovery evidence.");
+        if (state.TrackedOrder is { StashTransferIntent: not null, CollectionAssetIntent: not null })
+            throw new InvalidDataException("Collection and stash-transfer intents cannot coexist.");
         if (state.TrackedOrder is { Status: TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous,
                 CollectionAssetIntent: not null } assetCollection &&
             !IsValidCollectionAssetIntent(assetCollection.CollectionAssetIntent, assetCollection))
@@ -161,12 +191,26 @@ public sealed class BankrollStore
         return state;
     }
 
-    private static bool IsValidStashTransferIntent(StashTransferIntentState? intent) =>
-        intent is not null && !string.IsNullOrWhiteSpace(intent.Metadata) && intent.Amount > 0 &&
-        intent.InventoryAmountBefore == intent.Amount && intent.VisibleStashAmountBefore >= 0 &&
-        intent.AggregateOwnedBefore >= intent.Amount &&
-        !string.IsNullOrWhiteSpace(intent.NonTargetInventoryFingerprint) &&
-        intent.AreaInstanceId != 0 && intent.ArmedAtUtc != default;
+    private static bool IsValidStashTransferIntent(StashTransferIntentState? intent)
+    {
+        if (intent is null || !StashCustodyPolicy.TryResolve(intent.Metadata, out var expectedMode) ||
+            intent.StashCustodyMode != expectedMode || intent.Amount <= 0 ||
+            intent.InventoryAmountBefore != intent.Amount || intent.VisibleStashAmountBefore < 0 ||
+            !string.IsNullOrWhiteSpace(intent.Metadata) == false ||
+            string.IsNullOrWhiteSpace(intent.NonTargetInventoryFingerprint) ||
+            intent.AreaInstanceId == 0 || intent.ArmedAtUtc == default)
+        {
+            return false;
+        }
+        try
+        {
+            return intent.AggregateOwnedBefore >= checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
 
     private static bool RequiresLifecycleIdentity(TrackedOrderStatus status) =>
         status is TrackedOrderStatus.Pending or TrackedOrderStatus.TimedOut or
@@ -216,8 +260,7 @@ public sealed class BankrollStore
             string.IsNullOrWhiteSpace(state.League) || state.SeededChaos < 0 || state.SeededDivine < 0 ||
             state.AvailableChaos < 0 || state.AvailableDivine < 0 || state.ReservedChaos < 0 ||
             state.ReservedDivine < 0 || state.CompletedUncollectedChaos < 0 ||
-            state.CompletedUncollectedDivine < 0 || state.AvailableTarget < 0 || state.ReservedTarget < 0 ||
-            state.CompletedUncollectedTarget < 0 ||
+            state.CompletedUncollectedDivine < 0 || !NonCoreBalancesAreValid(state.NonCoreBalances) ||
             state.HasUnresolvedOrder != (state.TrackedOrder?.IsUnresolved == true))
         {
             throw new InvalidDataException("Bankroll state failed save-time schema or value validation.");
@@ -241,36 +284,27 @@ public sealed class BankrollStore
 
     private static void ValidateReservationConsistency(BankrollState state)
     {
-        if ((state.AvailableTarget > 0 || state.ReservedTarget > 0 || state.CompletedUncollectedTarget > 0) &&
-            string.IsNullOrWhiteSpace(state.TargetMetadata))
-        {
-            throw new InvalidDataException("Nonzero target buckets require exact target metadata.");
-        }
         var tracked = state.TrackedOrder;
         var reservationRequired = tracked?.IsUnresolved == true && tracked.LedgerCommittedAtUtc is null &&
             tracked.Status is TrackedOrderStatus.Armed or TrackedOrderStatus.Pending or TrackedOrderStatus.TimedOut or
                 TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked or TrackedOrderStatus.Ambiguous;
-        var expectedChaos = reservationRequired && tracked!.OfferedMetadata == "Metadata/Items/Currency/CurrencyRerollRare"
+        var expectedChaos = reservationRequired && tracked!.OfferedMetadata == BankrollState.ChaosMetadata
             ? tracked.OfferedAmount : 0;
-        var expectedDivine = reservationRequired && tracked!.OfferedMetadata == "Metadata/Items/Currency/CurrencyModValues"
+        var expectedDivine = reservationRequired && tracked!.OfferedMetadata == BankrollState.DivineMetadata
             ? tracked.OfferedAmount : 0;
-        var expectedTarget = reservationRequired && tracked!.OfferedMetadata == state.TargetMetadata
-            ? tracked.OfferedAmount : 0;
-
-        if (reservationRequired && expectedChaos == 0 && expectedDivine == 0 && expectedTarget == 0)
-        {
-            // Tests and migrated states may use aliases, but there must still be exactly one matching bucket.
-            var matchingBuckets = new[] { state.ReservedChaos, state.ReservedDivine, state.ReservedTarget }
-                .Count(amount => amount == tracked!.OfferedAmount);
-            if (matchingBuckets != 1 || state.ReservedChaos + state.ReservedDivine + state.ReservedTarget != tracked!.OfferedAmount)
-                throw new InvalidDataException("Unresolved order reservation did not exactly match one offered bucket.");
-            return;
-        }
-        if (state.ReservedChaos != expectedChaos || state.ReservedDivine != expectedDivine ||
-            state.ReservedTarget != expectedTarget)
+        if (state.ReservedChaos != expectedChaos || state.ReservedDivine != expectedDivine)
         {
             throw new InvalidDataException("Canonical reservations did not exactly match the unresolved tracked order.");
         }
+        foreach (var pair in state.NonCoreBalances)
+        {
+            var expected = reservationRequired && tracked!.OfferedMetadata == pair.Key ? tracked.OfferedAmount : 0;
+            if (pair.Value.Reserved != expected)
+                throw new InvalidDataException("Canonical non-core reservation did not match the exact unresolved order.");
+        }
+        if (reservationRequired && expectedChaos == 0 && expectedDivine == 0 &&
+            !state.NonCoreBalances.ContainsKey(tracked!.OfferedMetadata))
+            throw new InvalidDataException("Unresolved order had no exact offered-metadata reservation bucket.");
     }
 
     private static void ValidateTrackedForSave(TrackedOrderState? tracked, string league)
@@ -302,10 +336,14 @@ public sealed class BankrollStore
                  tracked.TerminalRemainingOfferedAmount!.Value,
                  tracked.TerminalReceivedWantedAmount!.Value).Count == 0))
             throw new InvalidDataException("Stashed tracked order lacked terminal settlement evidence.");
-        if (tracked.Status == TrackedOrderStatus.StashTransferArmed &&
-            (!IsValidStashTransferIntent(tracked.StashTransferIntent) ||
-             !IntentMatchesSettlementAsset(tracked, tracked.StashTransferIntent!)))
+        if (tracked.StashTransferIntent is { } stashIntent &&
+            (tracked.Status is not TrackedOrderStatus.StashTransferArmed and not TrackedOrderStatus.Ambiguous ||
+             !IsValidStashTransferIntent(stashIntent) || !IntentMatchesSettlementAsset(tracked, stashIntent)))
             throw new InvalidDataException("Stash-transfer intent failed save-time validation.");
+        if (tracked.Status == TrackedOrderStatus.StashTransferArmed && tracked.StashTransferIntent is null)
+            throw new InvalidDataException("Stash-transfer intent failed save-time validation.");
+        if (tracked.StashTransferIntent is not null && tracked.CollectionAssetIntent is not null)
+            throw new InvalidDataException("Collection and stash-transfer intents cannot coexist.");
         if ((tracked.Status is TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous) &&
             tracked.CollectionAssetIntent is not null &&
             !IsValidCollectionAssetIntent(tracked.CollectionAssetIntent, tracked))
@@ -316,6 +354,21 @@ public sealed class BankrollStore
         if ((tracked.Status is TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.CanceledUncollected) &&
             !HasCompleteTerminalEvidence(tracked))
             throw new InvalidDataException("Terminal tracked order lacked complete save-time evidence.");
+    }
+
+    private static bool NonCoreBalancesAreValid(Dictionary<string, NonCoreBalanceState>? balances)
+    {
+        if (balances is null) return false;
+        foreach (var pair in balances)
+        {
+            if (string.IsNullOrWhiteSpace(pair.Key) || pair.Key == BankrollState.ChaosMetadata ||
+                pair.Key == BankrollState.DivineMetadata || pair.Value is null ||
+                pair.Value.Available < 0 || pair.Value.Reserved < 0 || pair.Value.CompletedUncollected < 0)
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     public void AppendAudit(BankrollAuditEvent auditEvent)
@@ -334,6 +387,30 @@ public sealed class BankrollStore
             JsonConvert.SerializeObject(auditEvent, Formatting.None) + Environment.NewLine);
     }
 
+    public void AppendForcedResetAudit(ForcedResetAuditEvent auditEvent)
+    {
+        Directory.CreateDirectory(_directory);
+        File.AppendAllText(
+            GetAuditPath(auditEvent.League),
+            JsonConvert.SerializeObject(auditEvent, Formatting.None) + Environment.NewLine);
+    }
+
+    /// <summary>
+    /// Moves the canonical state file (and any interrupted temporary write) aside under timestamped
+    /// names so a forced reset never destroys evidence, even when that evidence is unparseable.
+    /// Returns the quarantine paths that were created.
+    /// </summary>
+    public IReadOnlyList<string> QuarantineState(string league, DateTimeOffset at)
+    {
+        var path = GetStatePath(league);
+        var quarantined = new List<string>();
+        foreach (var candidate in new[] { path, path + ".tmp" })
+        {
+            if (FileQuarantine.TryMoveAside(candidate, at, out var target)) quarantined.Add(target);
+        }
+        return quarantined;
+    }
+
     private string GetStatePath(string league) => Path.Combine(_directory, $"bankroll-{Sanitize(league)}.json");
     private string GetAuditPath(string league) => Path.Combine(_directory, $"execution-audit-{Sanitize(league)}.jsonl");
 
@@ -342,6 +419,42 @@ public sealed class BankrollStore
         var invalid = Path.GetInvalidFileNameChars();
         return new string(value.Select(character => invalid.Contains(character) ? '_' : character).ToArray());
     }
+}
+
+/// <summary>Renames state files aside instead of deleting them.</summary>
+public static class FileQuarantine
+{
+    public static bool TryMoveAside(string path, DateTimeOffset at, out string quarantinePath)
+    {
+        quarantinePath = string.Empty;
+        if (!File.Exists(path)) return false;
+        var target = ForcedFreshStateReset.QuarantinePath(path, at);
+        for (var attempt = 1; File.Exists(target); attempt++)
+        {
+            target = ForcedFreshStateReset.QuarantinePath(path, at, attempt);
+        }
+        File.Move(path, target);
+        quarantinePath = target;
+        return true;
+    }
+}
+
+public sealed record ForcedResetAuditEvent(
+    int SchemaVersion,
+    string EventType,
+    string League,
+    DateTimeOffset OccurredAtUtc,
+    string DiscardedCustody,
+    string QuarantinedPaths)
+{
+    public static ForcedResetAuditEvent Create(
+        string league, DateTimeOffset occurredAtUtc, string discardedCustody, IEnumerable<string> quarantinedPaths) =>
+        new(1,
+            "ForcedFreshStateReset",
+            league,
+            occurredAtUtc,
+            discardedCustody,
+            string.Join(" | ", quarantinedPaths));
 }
 
 public sealed record BankrollAuditEvent(

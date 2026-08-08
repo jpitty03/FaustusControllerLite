@@ -33,6 +33,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private BankrollState _bankroll = BankrollState.Uninitialized;
     private bool _freshStateResetArmed;
     private DateTimeOffset _freshStateResetArmExpiresAtUtc;
+    private bool _forcedResetArmed;
+    private DateTimeOffset _forcedResetArmExpiresAtUtc;
+    private string _forcedResetDiscardSummary = string.Empty;
     private DateTimeOffset _nextCatalogueAttemptUtc;
     private Guid _manualProbeSessionId = Guid.NewGuid();
     private string _latestRatePath = string.Empty;
@@ -136,6 +139,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _pickerCalibrationPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "picker-calibration.json");
         Settings.ArmFreshStateReset.OnPressed += ArmFreshStateReset;
         Settings.ApplyArmedFreshStateReset.OnPressed += ApplyArmedFreshStateReset;
+        Settings.ArmForcedFreshStateReset.OnPressed += ArmForcedFreshStateReset;
+        Settings.ApplyArmedForcedFreshStateReset.OnPressed += ApplyArmedForcedFreshStateReset;
         try
         {
             _rateStore.Load(_latestRatePath);
@@ -165,6 +170,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _freshStateResetArmed = false;
             _operationStatus = "Fresh-state reset arm expired without changing any durable state.";
+        }
+
+        if (_forcedResetArmed && DateTimeOffset.UtcNow > _forcedResetArmExpiresAtUtc)
+        {
+            _forcedResetArmed = false;
+            _operationStatus = "Forced fresh-state reset arm expired without changing any durable state.";
         }
 
         if (_catalogue == null && DateTimeOffset.UtcNow >= _nextCatalogueAttemptUtc)
@@ -549,6 +560,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         DrawStatus($"Tracked order: {_trackedOrder}", ref y, SharpDX.Color.Gray);
         DrawStatus($"Last candidate path: {_lastCandidate}", ref y, SharpDX.Color.Gray);
         DrawStatus($"Fresh-state reset armed: {(_freshStateResetArmed ? "YES (apply within 10 seconds)" : "no")}", ref y, _freshStateResetArmed ? SharpDX.Color.OrangeRed : SharpDX.Color.Gray);
+        if (_forcedResetArmed)
+        {
+            DrawStatus("FORCED reset armed (apply within 15 seconds). It abandons this accounting:",
+                ref y, SharpDX.Color.Red);
+            DrawStatus($"  {_forcedResetDiscardSummary}", ref y, SharpDX.Color.Red);
+        }
 
         void DrawStatus(string text, ref float currentY, SharpDX.Color color)
         {
@@ -569,10 +586,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
             var loadedCatalogue = catalogue!;
             _catalogue = loadedCatalogue;
-            Settings.TargetCurrency.Values = loadedCatalogue.Items.Select(item => item.Name).ToList();
-            ResolvePersistedTarget();
-            _catalogueStatus = $"ready ({loadedCatalogue.Items.Count} currencies)";
-            _lastFailure = "None";
+            Settings.TargetCurrency.Values = loadedCatalogue.SupportedTargets.Select(item => item.SelectorLabel).ToList();
+            var targetResolved = ResolvePersistedTarget();
+            _catalogueStatus = $"ready ({loadedCatalogue.SupportedTargets.Count} supported targets)";
+            if (targetResolved) _lastFailure = "None";
         }
         catch (Exception exception)
         {
@@ -581,66 +598,57 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
-    private void ResolvePersistedTarget()
+    private bool ResolvePersistedTarget()
     {
         if (_catalogue == null)
         {
-            return;
+            return false;
         }
 
-        CurrencyIdentity? target = null;
         if (!string.IsNullOrWhiteSpace(Settings.TargetCurrencyMetadata))
         {
-            _catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out target);
+            if (!_catalogue.TryGetTargetByMetadata(Settings.TargetCurrencyMetadata, out var persisted) || persisted is null)
+            {
+                var unavailableLabel = $"Unavailable [{Settings.TargetCurrencyMetadata}]";
+                Settings.TargetCurrency.Value = unavailableLabel;
+                _observedTargetLabel = unavailableLabel;
+                _lastFailure = $"Persisted target metadata is unsupported or unavailable: {Settings.TargetCurrencyMetadata}.";
+                return false;
+            }
+            ApplyTargetSelection(persisted);
+            return true;
         }
 
-        if (target == null)
+        if (!_catalogue.TryGetUniqueTargetByName(Settings.TargetCurrencyDisplayName, out var legacy) || legacy is null)
         {
-            _catalogue.TryGetUniqueByName(Settings.TargetCurrencyDisplayName, out target);
+            _observedTargetLabel = Settings.TargetCurrency.Value;
+            _lastFailure = "Legacy target name was not uniquely present among supported targets.";
+            return false;
         }
-
-        if (target == null)
-        {
-            _catalogue.TryGetUniqueByName("Orb of Alteration", out target);
-        }
-
-        if (target == null)
-        {
-            _lastFailure = "Orb of Alteration was not uniquely present in the exchange catalogue.";
-            return;
-        }
-
-        Settings.TargetCurrency.Value = target.Name;
-        _observedTargetLabel = target.Name;
-        Settings.TargetCurrencyDisplayName = target.Name;
-        Settings.TargetCurrencyMetadata = target.Metadata;
-        _observedTargetLabel = target.Name;
+        ApplyTargetSelection(legacy);
+        return true;
     }
 
     private void PersistTargetSelection()
     {
-        if (_fullWorkflowAuthorized)
+        if (_catalogue == null ||
+            !_catalogue.TryGetTargetByLabel(Settings.TargetCurrency.Value, out var target) || target is null)
         {
-            StopFullWorkflowLocal("Target currency changed; local workflow authorization was revoked.");
+            Settings.TargetCurrency.Value = _observedTargetLabel;
+            _lastFailure = "Target selection was not an exact supported catalogue label; prior selection restored.";
+            return;
         }
-        if (IsPlacementFlowActive())
+        if (_fullWorkflowAuthorized || _startingNewWorkflow || _bankroll.Workflow?.IsActive == true ||
+            _bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true ||
+            _bankrollLoadBlocked || _trackedOrderLoadBlocked || IsAnyInputOperationActive())
         {
-            AbortPlacementFlow("Target currency changed during placement preparation.");
-        }
-        if (IsCollectionFlowActive())
-        {
-            AbortCollectionFlow("Target currency changed during tracked-order collection.");
-        }
-
-        if (_catalogue == null || !_catalogue.TryGetByLabel(Settings.TargetCurrency.Value, out var target) || target == null)
-        {
+            Settings.TargetCurrency.Value = _observedTargetLabel;
+            _lastFailure = "Target change rejected while workflow, tracked recovery, or input operation is active.";
             return;
         }
 
-        Settings.TargetCurrencyDisplayName = target.Name;
-        Settings.TargetCurrencyMetadata = target.Metadata;
+        ApplyTargetSelection(target);
         _operationStatus = $"Selected target {target.Name}; exact metadata stored.";
-        _observedTargetLabel = target.Name;
         _manualProbeSessionId = Guid.NewGuid();
         _selectedCandidate = null;
         if (_automatedProbe.IsRunning)
@@ -652,6 +660,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _singleLegStaging.Cancel("Target currency changed.");
         }
         _lastCandidate = "None; target changed, so a new three-market session is required.";
+    }
+
+    private void ApplyTargetSelection(CurrencyTargetDescriptor target)
+    {
+        Settings.TargetCurrency.Value = target.SelectorLabel;
+        Settings.TargetCurrencyDisplayName = target.Name;
+        Settings.TargetCurrencyMetadata = target.Metadata;
+        _observedTargetLabel = target.SelectorLabel;
     }
 
     private void CaptureCurrentPair()
@@ -840,7 +856,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_catalogue is null ||
             !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
             !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
-            !_catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out var target) || target is null)
+            !_catalogue.TryGetTargetByMetadata(Settings.TargetCurrencyMetadata, out var targetDescriptor) || targetDescriptor is null)
         {
             _lastFailure = "Automated probing requires a ready catalogue and exact Chaos, Divine, and target identities.";
             return;
@@ -851,7 +867,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 chaos,
                 divine,
-                target,
+                targetDescriptor.Identity,
                 _pickerCalibration,
                 ProbeInputPermissions.From(Settings),
                 IsFullFaustusControllerEnabled(),
@@ -1071,7 +1087,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_catalogue is null ||
             !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
             !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
-            !_catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out var target) || target is null)
+            !_catalogue.TryGetTargetByMetadata(Settings.TargetCurrencyMetadata, out var targetDescriptor) || targetDescriptor is null)
         {
             failure = "Workflow quote matrix identities were unavailable.";
             return false;
@@ -1083,7 +1099,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             GameController.Game.IngameState.ServerData.InstanceId,
             chaos,
             divine,
-            target,
+            targetDescriptor.Identity,
             DateTimeOffset.UtcNow,
             TimeSpan.FromSeconds(Settings.MaximumQuoteAgeSeconds.Value),
             out matrix,
@@ -1093,13 +1109,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private bool TryGetWorkflowSpendCap(WorkflowExecutionState workflow, out long spendCap, out string failure)
     {
         var metadata = workflow.Legs[workflow.CurrentLegIndex].FromMetadata;
-        var ledger = metadata == GetCatalogueMetadata("Chaos Orb")
-            ? _bankroll.AvailableChaos
-            : metadata == GetCatalogueMetadata("Divine Orb")
-                ? _bankroll.AvailableDivine
-                : metadata == _bankroll.TargetMetadata
-                    ? _bankroll.AvailableTarget
-                    : -1;
+        var ledger = metadata == GetCatalogueMetadata("Chaos Orb") ||
+            metadata == GetCatalogueMetadata("Divine Orb") || _bankroll.NonCoreBalances.ContainsKey(metadata)
+                ? _bankroll.GetAvailable(metadata)
+                : -1;
         var now = DateTimeOffset.UtcNow;
         var area = GameController.Game.IngameState.ServerData.InstanceId;
         if (ledger < 0 || !_liveOwnedByMetadata.TryGetValue(metadata, out var ownership) ||
@@ -1127,7 +1140,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         foreach (var currency in metadata)
         {
             if (!InventoryStashTransferController.TryReadSnapshot(
-                    GameController, currency, out var current, out failure))
+                    GameController, currency, GetStaticMaxStackSize(currency), out var current, out failure))
                 return false;
             if (current.TargetInventoryAmount != 0)
             {
@@ -1161,7 +1174,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 if (maximumSettlement > capacity)
                 {
                     failure = $"Workflow can require {maximumSettlement} {currency}, exceeding the {capacity}-unit " +
-                        "first-acquisition capacity provable without an existing visible Currency Stash stack.";
+                        "first-acquisition capacity provable without trusted maximum-stack evidence.";
                     return false;
                 }
             }
@@ -1175,6 +1188,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ? currency.Metadata
             : string.Empty;
 
+    private int GetStaticMaxStackSize(string metadata) =>
+        _catalogue?.TryGetDescriptorByMetadata(metadata, out var descriptor) == true && descriptor is not null
+            ? descriptor.MaxStackSize
+            : 0;
+
     private bool WorkflowUsesCurrentCurrencies(WorkflowExecutionState workflow)
     {
         var allowed = new HashSet<string>(StringComparer.Ordinal)
@@ -1184,7 +1202,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             Settings.TargetCurrencyMetadata,
         };
         return !allowed.Contains(string.Empty) && workflow.Legs.All(leg =>
-            allowed.Contains(leg.FromMetadata) && allowed.Contains(leg.ToMetadata));
+                allowed.Contains(leg.FromMetadata) && allowed.Contains(leg.ToMetadata)) &&
+            workflow.Legs.Any(leg => leg.FromMetadata == Settings.TargetCurrencyMetadata ||
+                leg.ToMetadata == Settings.TargetCurrencyMetadata);
     }
 
     private RouteLegResult? GetCurrentPlacementLeg() =>
@@ -1556,7 +1576,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             if (WorkflowCoordinator.CanReplaceBeforeFirstPlacement(
                     _bankroll.Workflow, _trackedOrderState) &&
-                _bankroll.ReservedChaos == 0 && _bankroll.ReservedDivine == 0 && _bankroll.ReservedTarget == 0 &&
+                _bankroll.ReservedChaos == 0 && _bankroll.ReservedDivine == 0 &&
+                _bankroll.NonCoreBalances.Values.All(balance => balance.Reserved == 0) &&
                 !_bankroll.HasUnresolvedOrder)
             {
                 _startingNewWorkflow = true;
@@ -1867,13 +1888,24 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 TrackedStatus = _trackedOrderState?.Status.ToString(),
                 _bankroll.AvailableChaos,
                 _bankroll.AvailableDivine,
-                _bankroll.AvailableTarget,
+                SelectedTargetMetadata = Settings.TargetCurrencyMetadata,
+                SelectedTargetAvailable = _bankroll.GetAvailable(Settings.TargetCurrencyMetadata),
+                SelectedTargetReserved = _bankroll.GetReserved(Settings.TargetCurrencyMetadata),
+                SelectedTargetCompletedUncollected = _bankroll.GetCompletedUncollected(Settings.TargetCurrencyMetadata),
+                NonCoreBalances = _bankroll.NonCoreBalances
+                    .Where(pair => pair.Value.Available != 0 || pair.Value.Reserved != 0 ||
+                        pair.Value.CompletedUncollected != 0)
+                    .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                    .ToDictionary(pair => pair.Key, pair => new
+                    {
+                        pair.Value.Available,
+                        pair.Value.Reserved,
+                        pair.Value.CompletedUncollected,
+                    }, StringComparer.Ordinal),
                 _bankroll.ReservedChaos,
                 _bankroll.ReservedDivine,
-                _bankroll.ReservedTarget,
                 _bankroll.CompletedUncollectedChaos,
                 _bankroll.CompletedUncollectedDivine,
-                _bankroll.CompletedUncollectedTarget,
                 _bankroll.HasUnresolvedOrder,
             };
             File.AppendAllText(
@@ -1906,9 +1938,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         if (!InventoryStashTransferController.TryReadSnapshot(
-                GameController, stagedLeg.Edge.From.Metadata, out var offeredInventory, out preparationFailure) ||
+                GameController, stagedLeg.Edge.From.Metadata,
+                GetStaticMaxStackSize(stagedLeg.Edge.From.Metadata), out var offeredInventory, out preparationFailure) ||
             !InventoryStashTransferController.TryReadSnapshot(
-                GameController, stagedLeg.Edge.To.Metadata, out var wantedInventory, out preparationFailure))
+                GameController, stagedLeg.Edge.To.Metadata,
+                GetStaticMaxStackSize(stagedLeg.Edge.To.Metadata), out var wantedInventory, out preparationFailure))
         {
             _lastFailure = $"Placement stack-size evidence was unavailable: {preparationFailure}";
             _placementPreparation = PlacementPreparationState.Idle;
@@ -1971,7 +2005,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (snapshot.TargetMaxStackSize <= 0 && settlementAmount > capacity)
         {
             failure = $"Settlement amount {settlementAmount} exceeds the {capacity}-unit first-acquisition " +
-                "capacity provable without an existing visible Currency Stash stack.";
+                "capacity provable without trusted maximum-stack evidence.";
             return false;
         }
         failure = string.Empty;
@@ -2703,9 +2737,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = conflict;
             return;
         }
+        var workflow = _bankroll.Workflow;
+        var workflowLeg = workflow?.Phase == WorkflowExecutionPhase.ReadyForLeg &&
+            workflow.CurrentLegIndex >= 0 && workflow.CurrentLegIndex < workflow.Legs.Count &&
+            workflow.CurrentAttemptId is null
+                ? workflow.Legs[workflow.CurrentLegIndex]
+                : null;
         if (IsAnyInputOperationActive() || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
             !_bankroll.IsInitialized || _bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true ||
-            _bankroll.Workflow?.IsActive == true || _bankrollStore is null || _catalogue is null)
+            workflow?.IsActive == true && workflowLeg is null || _bankrollStore is null || _catalogue is null)
         {
             _lastFailure = "Pending adoption requires initialized resolved bankroll and no active operation.";
             return;
@@ -2714,10 +2754,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var failure = string.Empty;
         if (!GameController.Window.IsForeground() || !ui.CurrencyExchangePanel.IsVisible ||
             ui.CurrencyExchangePanel.CurrencyPicker.IsVisible || ui.PopUpWindow.IsVisible ||
-            !SingleLegPlacementController.TryReadOrders(GameController, out var orders, out failure) ||
-            !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
-            !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
-            !_catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out var target) || target is null)
+            !SingleLegPlacementController.TryReadOrders(GameController, out var orders, out failure))
         {
             _lastFailure = string.IsNullOrEmpty(failure)
                 ? "Pending adoption requires foreground readable exchange and exact catalogue identities."
@@ -2725,21 +2762,34 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
-        var candidates = orders.Where(order => order.PlayerOrderId > 0 && order.OfferedHash != 0 && order.WantedHash == target.Hash &&
-            order.WantedMetadata == target.Metadata &&
-            (order.OfferedMetadata == chaos.Metadata && order.OfferedHash == chaos.Hash ||
-             order.OfferedMetadata == divine.Metadata && order.OfferedHash == divine.Hash) &&
-            order.OfferedRatioPart > 0 && order.WantedRatioPart > 0 &&
-            order.OriginalOfferedAmount > 0 && order.OriginalOfferedAmount % order.OfferedRatioPart == 0).ToArray();
+        CurrencyIdentity? chaos = null;
+        CurrencyIdentity? divine = null;
+        CurrencyIdentity? target = null;
+        CurrencyTargetDescriptor? targetDescriptor = null;
+        if (workflowLeg is null &&
+            (!_catalogue.TryGetUniqueByName("Chaos Orb", out chaos) || chaos is null ||
+             !_catalogue.TryGetUniqueByName("Divine Orb", out divine) || divine is null ||
+             !_catalogue.TryGetTargetByMetadata(
+                 Settings.TargetCurrencyMetadata, out targetDescriptor) || targetDescriptor is null))
+        {
+            _lastFailure = "Pending adoption requires exact catalogue identities.";
+            return;
+        }
+        target = workflowLeg is null ? targetDescriptor!.Identity : null;
+        var candidates = orders.Where(MatchesAdoptableOrder).ToArray();
         if (candidates.Length != 1)
         {
-            _lastFailure = $"Lifecycle adoption requires exactly one matching core-to-target order; found {candidates.Length}.";
+            _lastFailure = workflowLeg is null
+                ? $"Lifecycle adoption requires exactly one matching core-to-target order; found {candidates.Length}."
+                : $"Lifecycle adoption requires exactly one order matching workflow leg {workflowLeg.Index + 1}; found {candidates.Length}.";
             return;
         }
 
         var order = candidates[0];
         var wanted = (BigInteger)(order.OriginalOfferedAmount / order.OfferedRatioPart) * order.WantedRatioPart;
-        if (wanted <= 0 || wanted > long.MaxValue)
+        if (wanted <= 0 || wanted > long.MaxValue ||
+            workflowLeg is not null && (order.OriginalOfferedAmount != workflowLeg.InputSpent ||
+                wanted != workflowLeg.Output))
         {
             _lastFailure = "Pending adoption planned wanted amount overflowed or was nonpositive.";
             return;
@@ -2759,13 +2809,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             WantedAmount = (long)wanted,
             GoldCost = order.GoldCost,
             AttemptId = Guid.NewGuid(),
-            ProbeSessionId = Guid.NewGuid(),
-            CandidateSignature = $"{order.OfferedMetadata}>{order.WantedMetadata}>{order.OfferedMetadata}",
+            ProbeSessionId = workflow?.CurrentProbeSessionId ?? Guid.NewGuid(),
+            CandidateSignature = workflow?.PlanFingerprint ??
+                $"{order.OfferedMetadata}>{order.WantedMetadata}>{order.OfferedMetadata}",
             OfferedHash = order.OfferedHash,
             WantedHash = order.WantedHash,
             BaselineOrderIds = orders.Where(candidate => candidate.PlayerOrderId != order.PlayerOrderId)
                 .Select(candidate => candidate.PlayerOrderId).Order().ToList(),
-            Detail = "Explicit read-only adoption of one unique existing order for M7 lifecycle validation.",
+            Detail = workflowLeg is null
+                ? "Explicit read-only adoption of one unique existing order for lifecycle validation."
+                : $"Explicit read-only adoption of exact persisted workflow leg {workflowLeg.Index + 1}.",
             OrderCreationDateUtc = order.CreationDate,
             PlacedOfferedRatioPart = order.OfferedRatioPart,
             PlacedWantedRatioPart = order.WantedRatioPart,
@@ -2822,6 +2875,20 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 }
                 tracked.LedgerCommittedAtUtc = now;
             }
+            if (next.Workflow is { } nextWorkflow && workflowLeg is not null)
+            {
+                var armed = TrackedOrderCollectionController.CloneTracked(
+                    tracked, TrackedOrderStatus.Armed, tracked.Detail);
+                if (!WorkflowCoordinator.TryApplyTrackedState(
+                        nextWorkflow, armed, now, out var boundWorkflow, out var workflowFailure) ||
+                    !WorkflowCoordinator.TryApplyTrackedState(
+                        boundWorkflow, tracked, now, out var adoptedWorkflow, out workflowFailure))
+                {
+                    _lastFailure = $"Adopted order could not bind the exact persisted workflow leg: {workflowFailure}";
+                    return;
+                }
+                next.Workflow = adoptedWorkflow;
+            }
             next.TrackedOrder = tracked;
             next.HasUnresolvedOrder = true;
             next.UpdatedAtUtc = now;
@@ -2847,6 +2914,27 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         catch (Exception exception)
         {
             _lastFailure = $"Pending adoption persistence failed: {exception.Message}";
+        }
+
+        bool MatchesAdoptableOrder(PlacedOrderSnapshot order)
+        {
+            if (order.PlayerOrderId <= 0 || order.OfferedHash == 0 || order.WantedHash == 0 ||
+                order.OfferedRatioPart <= 0 || order.WantedRatioPart <= 0 ||
+                order.OriginalOfferedAmount <= 0 || order.OriginalOfferedAmount % order.OfferedRatioPart != 0)
+            {
+                return false;
+            }
+            if (workflowLeg is not null)
+            {
+                return order.OfferedMetadata == workflowLeg.FromMetadata && order.OfferedHash == workflowLeg.FromHash &&
+                    order.WantedMetadata == workflowLeg.ToMetadata && order.WantedHash == workflowLeg.ToHash &&
+                    order.OriginalOfferedAmount == workflowLeg.InputSpent &&
+                    new Rational(order.WantedRatioPart, order.OfferedRatioPart) ==
+                        new Rational(workflowLeg.RateNumerator, workflowLeg.RateDenominator);
+            }
+            return order.WantedMetadata == target!.Metadata && order.WantedHash == target.Hash &&
+                (order.OfferedMetadata == chaos!.Metadata && order.OfferedHash == chaos.Hash ||
+                 order.OfferedMetadata == divine!.Metadata && order.OfferedHash == divine.Hash);
         }
     }
 
@@ -2901,7 +2989,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
         if (_bankrollLoadBlocked || _trackedOrderLoadBlocked ||
-            _trackedOrderState?.Status is not TrackedOrderStatus.Collected and not TrackedOrderStatus.StashTransferArmed ||
+            _trackedOrderState?.Status is not TrackedOrderStatus.Collected and not TrackedOrderStatus.StashTransferArmed and
+                not TrackedOrderStatus.Ambiguous ||
+            _trackedOrderState.Status == TrackedOrderStatus.Ambiguous &&
+                _trackedOrderState.StashTransferIntent is null ||
             !_bankroll.HasUnresolvedOrder)
         {
             _lastFailure = "Stash transfer requires canonical Collected or recoverable StashTransferArmed state marked unresolved.";
@@ -2936,7 +3027,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
-        StartCollectionOwnershipRead(_trackedOrderState.Status == TrackedOrderStatus.StashTransferArmed
+        StartCollectionOwnershipRead(_trackedOrderState.Status != TrackedOrderStatus.Collected
             ? CollectionFlowState.ReadingStashRecovery
             : CollectionFlowState.ReadingStashBaseline, _stashTransferMetadata);
     }
@@ -3004,7 +3095,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _collectionOwnedBaseline = owned;
                 if (!InventoryStashTransferController.TryReadSnapshot(
-                        GameController, _trackedOrderState!.WantedMetadata, out var inventory, out failure) ||
+                        GameController, _trackedOrderState!.WantedMetadata,
+                        GetStaticMaxStackSize(_trackedOrderState.WantedMetadata), out var inventory, out failure) ||
                     inventory.TargetInventoryAmount != 0)
                 {
                     AbortCollectionFlow(string.IsNullOrEmpty(failure)
@@ -3031,7 +3123,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 {
                     AbortCollectionFlow(
                         $"First acquisition of {_trackedOrderState.WantedMetadata} exceeds the {capacity}-unit " +
-                        "capacity provable without an existing stack; seed one visible Currency Stash stack first.");
+                        "capacity provable without trusted maximum-stack evidence.");
                     return;
                 }
                 _collectionBatchAmount = Math.Min(capacity, remainingProceeds);
@@ -3073,6 +3165,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             else if (_collectionFlow == CollectionFlowState.ReadingStashBaseline)
             {
                 _collectionOwnedBaseline = owned;
+                if (!StashCustodyPolicy.TryResolve(_stashTransferMetadata, out var custodyMode))
+                {
+                    AbortCollectionFlow("Settlement asset has no supported stash custody policy.");
+                    return;
+                }
                 if (!_inventoryStashTransfer.Start(
                         GameController,
                         _trackedOrderState!,
@@ -3082,6 +3179,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         _stashTransferMetadata,
                         _stashTransferAmount,
                         owned,
+                        custodyMode,
+                        GetStaticMaxStackSize(_stashTransferMetadata),
                         PersistTrackedOrder,
                         out failure))
                 {
@@ -3090,7 +3189,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 }
 
                 _collectionFlow = CollectionFlowState.TransferringToStash;
-                _operationStatus = $"Pre-transfer owned count {owned}; moving exact collected inventory amount to Currency Stash.";
+                _operationStatus = custodyMode == StashCustodyMode.AffinityAggregate
+                    ? $"Pre-transfer owned count {owned}; moving exact collected amount through configured stash affinity."
+                    : $"Pre-transfer owned count {owned}; moving exact collected amount to visible Currency Stash.";
             }
             else if (_collectionFlow == CollectionFlowState.ReadingStashAfter)
             {
@@ -3297,16 +3398,21 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var pendingBatch = wantedSide
             ? _trackedOrderState.PendingWantedBatchAmount
             : _trackedOrderState.PendingReturnBatchAmount;
-        if (pendingBatch <= 0 || intent.Amount != pendingBatch ||
+        if (!StashCustodyPolicy.TryResolve(intent.Metadata, out var canonicalMode) ||
+            canonicalMode != intent.StashCustodyMode || observedOwned != intent.AggregateOwnedBefore ||
+            pendingBatch <= 0 || intent.Amount != pendingBatch ||
             !wantedSide && intent.Metadata != _trackedOrderState.OfferedMetadata)
         {
             MarkStashTransferAmbiguous("Stash intent did not match the exact pending collection batch.");
             return;
         }
+        var custodyDetail = intent.StashCustodyMode == StashCustodyMode.AffinityAggregate
+            ? "left inventory through configured affinity while visible Currency Stash and aggregate ownership remained unchanged"
+            : "left inventory, increased visible Currency Stash exactly, and retained unchanged aggregate ownership";
         var stashed = TrackedOrderCollectionController.CloneTracked(
             _trackedOrderState,
             TrackedOrderStatus.Collected,
-            $"Verified {intent.Amount} {intent.Metadata} left inventory, entered visible Currency Stash, and aggregate ownership remained {observedOwned}.");
+            $"Verified {intent.Amount} {intent.Metadata} {custodyDetail} ({observedOwned}).");
         if (wantedSide)
         {
             stashed.SettledWantedAmount = checked(stashed.SettledWantedAmount + pendingBatch);
@@ -3345,7 +3451,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         _collectionFlow = CollectionFlowState.Idle;
         _operationStatus = allStashed
-            ? "Lifecycle custody complete: every collected batch is verified in Currency Stash."
+            ? "Lifecycle custody complete: every collected batch has verified stash custody."
             : $"Batch stashed; {remainingToCollect} settlement units remain to collect in further batches.";
         _lastFailure = "None";
     }
@@ -3353,13 +3459,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private void ReconcileInterruptedStashTransfer(long observedOwned)
     {
         var intent = _trackedOrderState?.StashTransferIntent;
-        if (_trackedOrderState?.Status != TrackedOrderStatus.StashTransferArmed || intent is null)
+        if (_trackedOrderState?.Status is not TrackedOrderStatus.StashTransferArmed and
+                not TrackedOrderStatus.Ambiguous || intent is null)
         {
             MarkStashTransferAmbiguous("Interrupted stash-transfer identity or aggregate ownership did not match durable intent.");
             return;
         }
         if (!InventoryStashTransferController.TryReadSnapshot(
-                GameController, intent.Metadata, out var current, out var failure))
+            GameController, intent.Metadata, GetStaticMaxStackSize(intent.Metadata), out var current, out var failure))
         {
             MarkStashTransferAmbiguous(failure);
             return;
@@ -3659,10 +3766,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         ReservedDivine = state.ReservedDivine,
         CompletedUncollectedChaos = state.CompletedUncollectedChaos,
         CompletedUncollectedDivine = state.CompletedUncollectedDivine,
-        TargetMetadata = state.TargetMetadata,
-        AvailableTarget = state.AvailableTarget,
-        ReservedTarget = state.ReservedTarget,
-        CompletedUncollectedTarget = state.CompletedUncollectedTarget,
+        NonCoreBalances = state.CloneNonCoreBalances(),
         HasUnresolvedOrder = state.HasUnresolvedOrder,
         TrackedOrder = state.TrackedOrder,
         Workflow = state.Workflow is null ? null : WorkflowCoordinator.Clone(state.Workflow),
@@ -3919,7 +4023,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_catalogue is null || !_bankroll.IsInitialized ||
             !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
             !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
-            !_catalogue.TryGetByMetadata(Settings.TargetCurrencyMetadata, out var target) || target is null)
+            !_catalogue.TryGetTargetByMetadata(Settings.TargetCurrencyMetadata, out var targetDescriptor) || targetDescriptor is null)
         {
             _lastCandidate = "Blocked: catalogue, target, or explicitly initialized bankroll is unavailable.";
             return CandidateOutcome.Blocked;
@@ -3946,7 +4050,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 area,
                 chaos,
                 divine,
-                target,
+                targetDescriptor.Identity,
                 now,
                 maximumAge,
                 out var matrix,
@@ -3961,7 +4065,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             var result = FaustusRoutePlanner.Evaluate(new RoutePlannerRequest(
                 chaos,
                 divine,
-                target,
+                targetDescriptor.Identity,
                 new CurrencyBankroll(_bankroll.AvailableChaos, chaosOwnership.Count),
                 new CurrencyBankroll(_bankroll.AvailableDivine, divineOwnership.Count),
                 matrix!.Edges,
@@ -4072,40 +4176,152 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         try
         {
-            // Create drops the resolved workflow and tracked-order records and reseeds balances;
-            // rates, calibrations, audit, and runtime evidence on disk are untouched.
-            _bankroll = BankrollState.Create(league, Settings.StartingChaos.Value, Settings.StartingDivine.Value);
-            _bankrollStore.Save(_bankroll);
-            _bankrollStore.AppendAudit(BankrollAuditEvent.Seeded(_bankroll));
+            CompleteFreshStateReset(_bankrollStore, league,
+                $"Fresh state reset for {league}: seeded balances, no workflow, no tracked order.");
             _freshStateResetArmed = false;
-            _trackedOrderState = null;
-            _trackedOrder = "None";
-            _fullWorkflowAuthorized = false;
-            _workflowAuthorization = null;
-            _workflowPreparedLeg = null;
-            _startingNewWorkflow = false;
-            _nextWorkflowScanAtUtc = null;
-            _placementPreparation = PlacementPreparationState.Idle;
-            _placementToken = null;
-            _placementRefreshAttempts = 0;
-            _collectionFlow = CollectionFlowState.Idle;
-            _collectionOwnedBaseline = 0;
-            _collectionBatchAmount = 0;
-            _collectionOwnershipMetadata = string.Empty;
-            _stashTransferMetadata = string.Empty;
-            _stashTransferAmount = 0;
-            _selectedCandidate = null;
-            _lastCandidate = "None; capture all three markets in one area/session.";
-            _liveOwnedByMetadata.Clear();
-            _manualProbeSessionId = Guid.NewGuid();
-            _lastFailure = "None";
-            _lastLoggedFailure = null;
-            _operationStatus = $"Fresh state reset for {league}: seeded balances, no workflow, no tracked order.";
         }
         catch (Exception exception)
         {
             _freshStateResetArmed = false;
             _lastFailure = $"Fresh-state reset failed: {exception.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Reseeds canonical state and drops every transient in-memory operation. Create drops the
+    /// resolved workflow and tracked-order records and reseeds balances; rates, calibrations, audit,
+    /// and runtime evidence on disk are untouched. Callers own the decision that this is safe.
+    /// </summary>
+    private void CompleteFreshStateReset(BankrollStore store, string league, string operationStatus)
+    {
+        _bankroll = BankrollState.Create(league, Settings.StartingChaos.Value, Settings.StartingDivine.Value);
+        store.Save(_bankroll);
+        store.AppendAudit(BankrollAuditEvent.Seeded(_bankroll));
+        _trackedOrderState = null;
+        _trackedOrder = "None";
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
+        _workflowPreparedLeg = null;
+        _startingNewWorkflow = false;
+        _nextWorkflowScanAtUtc = null;
+        _placementPreparation = PlacementPreparationState.Idle;
+        _placementToken = null;
+        _placementRefreshAttempts = 0;
+        _collectionFlow = CollectionFlowState.Idle;
+        _collectionOwnedBaseline = 0;
+        _collectionBatchAmount = 0;
+        _collectionOwnershipMetadata = string.Empty;
+        _stashTransferMetadata = string.Empty;
+        _stashTransferAmount = 0;
+        _selectedCandidate = null;
+        _lastCandidate = "None; capture all three markets in one area/session.";
+        _liveOwnedByMetadata.Clear();
+        _manualProbeSessionId = Guid.NewGuid();
+        _lastFailure = "None";
+        _lastLoggedFailure = null;
+        _operationStatus = operationStatus;
+    }
+
+    private string DescribeForcedResetDiscard() => ForcedFreshStateReset.DescribeDiscardedCustody(
+        _bankroll, _trackedOrderState, _bankrollLoadBlocked || _trackedOrderLoadBlocked);
+
+    /// <summary>
+    /// Arms the manual override. Unlike the safe reset this refuses nothing about canonical content:
+    /// it exists precisely for unreadable or unresolvable state. It still refuses while any input
+    /// operation is live, stops continuous trading, and publishes exactly what it will abandon.
+    /// </summary>
+    private void ArmForcedFreshStateReset()
+    {
+        if (IsAnyInputOperationActive())
+        {
+            _forcedResetArmed = false;
+            _lastFailure =
+                $"Forced reset cannot be armed while {DescribeActiveInputOperation()} is active.";
+            return;
+        }
+
+        if (_bankrollStore == null || string.IsNullOrWhiteSpace(GetCurrentLeague()))
+        {
+            _forcedResetArmed = false;
+            _lastFailure = "Forced reset blocked until the current league is readable.";
+            return;
+        }
+
+        // An idle continuous cooldown must not fire a probe between arming and applying.
+        if (_fullWorkflowAuthorized)
+        {
+            StopFullWorkflowLocal("Continuous trading stopped so a forced fresh-state reset can be armed.");
+        }
+
+        _freshStateResetArmed = false;
+        _forcedResetDiscardSummary = DescribeForcedResetDiscard();
+        _forcedResetArmed = true;
+        _forcedResetArmExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(15);
+        _operationStatus = "Forced fresh-state reset armed. Applying abandons the accounting below and " +
+            "quarantines canonical state; nothing in game is moved, so reconcile any listed custody by hand.";
+        AppendRuntimeDiagnostic("ForcedFreshStateResetArmed", _forcedResetDiscardSummary);
+    }
+
+    private void ApplyArmedForcedFreshStateReset()
+    {
+        if (IsAnyInputOperationActive())
+        {
+            _forcedResetArmed = false;
+            _lastFailure = "Forced reset cancelled because an input operation or placement preparation is active.";
+            return;
+        }
+
+        if (!_forcedResetArmed || DateTimeOffset.UtcNow > _forcedResetArmExpiresAtUtc)
+        {
+            _forcedResetArmed = false;
+            _lastFailure = "Forced reset not applied: arm it first, then apply within 15 seconds.";
+            return;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league) || _bankrollStore == null)
+        {
+            _forcedResetArmed = false;
+            _lastFailure = "Forced reset blocked until the current league is readable.";
+            return;
+        }
+
+        // The operator authorized discarding one specific set of custody. If canonical state moved
+        // after arming, that authorization no longer describes what would be abandoned.
+        var summary = DescribeForcedResetDiscard();
+        if (!string.Equals(summary, _forcedResetDiscardSummary, StringComparison.Ordinal))
+        {
+            _forcedResetArmed = false;
+            _forcedResetDiscardSummary = summary;
+            _lastFailure = "Forced reset cancelled: canonical state changed after arming. Re-arm to confirm what is discarded.";
+            return;
+        }
+
+        try
+        {
+            var appliedAtUtc = DateTimeOffset.UtcNow;
+            // Evidence is renamed, never deleted, so an unreadable or unresolved record survives.
+            var quarantined = new List<string>(_bankrollStore.QuarantineState(league, appliedAtUtc));
+            if (_trackedOrderStore != null)
+            {
+                quarantined.AddRange(_trackedOrderStore.QuarantineState(league, appliedAtUtc));
+            }
+            _bankrollStore.AppendForcedResetAudit(
+                ForcedResetAuditEvent.Create(league, appliedAtUtc, summary, quarantined));
+            CompleteFreshStateReset(_bankrollStore, league,
+                $"Forced fresh-state reset for {league}: seeded balances, no workflow, no tracked order. " +
+                $"Quarantined {quarantined.Count} state file(s); reconcile abandoned custody by hand.");
+            _bankrollLoadBlocked = false;
+            _trackedOrderLoadBlocked = false;
+            _forcedResetArmed = false;
+            AppendRuntimeDiagnostic("ForcedFreshStateResetApplied",
+                $"Abandoned: {summary} Quarantined: {string.Join(" | ", quarantined)}");
+        }
+        catch (Exception exception)
+        {
+            _forcedResetArmed = false;
+            _lastFailure = $"Forced reset failed: {exception.Message}";
+            AppendRuntimeDiagnostic("ForcedFreshStateResetFailed", _lastFailure);
         }
     }
 
@@ -4216,8 +4432,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return "not initialized; spend is zero until explicitly armed and applied";
         }
 
+        var targetAmount = _bankroll.GetAvailable(Settings.TargetCurrencyMetadata);
         return $"{_bankroll.League}: ledger {_bankroll.AvailableChaos} Chaos/{_bankroll.AvailableDivine} Divine/" +
-            $"{_bankroll.AvailableTarget} target; " +
+            $"{targetAmount} selected target ({_bankroll.NonCoreBalances.Count} retained non-core balances); " +
             $"I-have reads Chaos={DescribeOwned("Chaos Orb")}, Divine={DescribeOwned("Divine Orb")}; " +
             $"seeded {_bankroll.SeededChaos}/{_bankroll.SeededDivine}";
     }
