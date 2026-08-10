@@ -137,7 +137,7 @@ Canonical state has been manually reconciled from SDK evidence to exact order 2:
 7. Confirm order 2 disappears while every full SDK snapshot for unrelated orders remains unchanged. Additions, removals, or economics/status changes are ambiguous.
 8. Confirm Lite forces a second `I have Chaos` picker read produced after disappearance. The owned count must increase by exactly 320 from the phase-bound baseline, with at least two identical reads.
 9. Inspect schema-3 bankroll: completed-uncollected Chaos becomes 0, available Chaos becomes 320, tracked status becomes `Collected`, and `HasUnresolvedOrder=true` until stash transfer finishes.
-10. Enable the separate stash-transfer permission. Require exact collected inventory amount, a visible Currency Stash, an unobscured matching stack, and a stable non-target inventory fingerprint before one Ctrl+Shift-right-click.
+10. Enable the separate stash-transfer permission. Require exact collected inventory amount, a visible Currency Stash, an unobscured matching stack, and a stable non-target inventory fingerprint before one Ctrl+right-click.
 11. Verify target inventory becomes zero, visible Currency Stash increases by exactly the collected amount, non-target inventory is unchanged, and aggregate owned count is unchanged. Only then persist `Stashed` and clear unresolved.
 12. On any post-click failure, missing row, ownership mismatch, unrelated-order change, permission/focus loss, or release uncertainty, confirm durable `Ambiguous` state and no retry. Do not manually edit or transfer again.
 
@@ -157,7 +157,7 @@ Milestone 8 passes only when the uniquely matched reconciled order disappears, o
 
 - Full-controller test notes confirmed the exchange overlaps the left two inventory columns. Live Lite evidence measured exchange right edge X=1,793; all sixteen collected Chaos stacks began at X=1,836 or farther right, while only non-target blockers occupied covered columns.
 - The final M8 phase required a visible `CurrencyStash`, exact target metadata, sixteen readable 20-Chaos stacks totaling 320, and a complete non-target inventory fingerprint.
-- Before the sole Ctrl+Shift-right-click: player inventory Chaos=320, visible Currency Stash Chaos=2,082, aggregate owned Chaos=2,402.
+- Before the sole Ctrl+right-click: player inventory Chaos=320, visible Currency Stash Chaos=2,082, aggregate owned Chaos=2,402.
 - After transfer: player inventory Chaos=0, visible Currency Stash Chaos=2,402, aggregate owned Chaos=2,402. Non-Chaos inventory remained unchanged.
 - Canonical schema 3 / tracked schema 2 ended at `Stashed`, available Chaos=320, completed-uncollected Chaos=0, and unresolved=false.
 - Durable stash-transfer intent stores inventory/stash/ownership baselines, non-target fingerprint, amount/metadata, area, and timestamp. Reload recovery accepts only the exact pre-state or exact post-state; all other evidence becomes ambiguous.

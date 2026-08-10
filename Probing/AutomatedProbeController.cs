@@ -150,14 +150,66 @@ public sealed class AutomatedProbeController
             return false;
         }
 
-        return StartPlans(gameController,
-        [
-            new ProbeMarketPlan(divine, chaos),
-            new ProbeMarketPlan(chaos, target),
-            new ProbeMarketPlan(divine, target),
-        ], calibration, permissions, conflictingControllerEnabled, cursorSpeed, selectionOnly: false,
-            requestedSessionId: null, forceOfferedPickerOpen: false, out failure);
+        return StartMarketProbe(
+            gameController,
+            CreateThreeMarketPlans(chaos, divine, target),
+            calibration,
+            permissions,
+            conflictingControllerEnabled,
+            cursorSpeed,
+            Guid.NewGuid(),
+            out failure);
     }
+
+    public bool StartMarketProbe(
+        GameController gameController,
+        IReadOnlyList<ProbeMarketPlan> plans,
+        PickerCalibration calibration,
+        ProbeInputPermissions permissions,
+        bool conflictingControllerEnabled,
+        int cursorSpeed,
+        Guid sessionId,
+        out string failure)
+    {
+        ArgumentNullException.ThrowIfNull(plans);
+        if (sessionId == Guid.Empty || plans.Count is < 1 or > 3 ||
+            plans.Any(plan => plan.Offered.Equals(plan.Wanted)) ||
+            plans.Select(plan => new CurrencyPairKey(plan.Offered, plan.Wanted)).Distinct().Count() != plans.Count)
+        {
+            failure = "A market probe requires one to three unique, distinct pairs and a non-empty session ID.";
+            return false;
+        }
+
+        return StartPlans(
+            gameController, plans, calibration, permissions, conflictingControllerEnabled, cursorSpeed,
+            selectionOnly: false, requestedSessionId: sessionId, forceOfferedPickerOpen: false, out failure);
+    }
+
+    public static IReadOnlyList<ProbeMarketPlan> CreateThreeMarketPlans(
+        CurrencyIdentity chaos,
+        CurrencyIdentity divine,
+        CurrencyIdentity target) =>
+    [
+        new ProbeMarketPlan(divine, chaos),
+        new ProbeMarketPlan(chaos, target),
+        new ProbeMarketPlan(divine, target),
+    ];
+
+    public static IReadOnlyList<ProbeMarketPlan> CreateSweepBenchmarkPlans(
+        CurrencyIdentity chaos,
+        CurrencyIdentity divine) =>
+    [
+        new ProbeMarketPlan(divine, chaos),
+    ];
+
+    public static IReadOnlyList<ProbeMarketPlan> CreateSweepCandidatePlans(
+        CurrencyIdentity chaos,
+        CurrencyIdentity divine,
+        CurrencyIdentity target) =>
+    [
+        new ProbeMarketPlan(chaos, target),
+        new ProbeMarketPlan(divine, target),
+    ];
 
     public bool StartPairSelection(
         GameController gameController,

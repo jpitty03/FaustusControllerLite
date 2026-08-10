@@ -1,4 +1,5 @@
-using ExileCore;
+﻿using ExileCore;
+using FaustusControllerLite.Core;
 using ExileCore.PoEMemory;
 using FaustusControllerLite.Input;
 using FaustusControllerLite.Probing;
@@ -32,6 +33,13 @@ public enum SingleLegStagingState
     Cancelled,
 }
 
+public enum SingleLegQuoteValidationPolicy
+{
+    ExactCandidate,
+    PreserveCompetingLimit,
+    AggressiveImmediateLimit,
+}
+
 public sealed record StagingInputPermissions(
     bool MouseMovement,
     bool Clicking,
@@ -39,21 +47,30 @@ public sealed record StagingInputPermissions(
     bool AmountInput,
     bool Placement,
     bool FullWorkflow,
-    bool WorkflowAuthorized = false)
+    bool WorkflowAuthorized = false,
+    bool SellSweep = false,
+    bool SweepAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && QueryInput && AmountInput && !Placement && !FullWorkflow;
+    private CoordinatorOwnership Owner => new(FullWorkflow, WorkflowAuthorized, SellSweep, SweepAuthorized);
+
+    public bool Ready => MouseMovement && Clicking && QueryInput && AmountInput && !Placement && Owner.None;
     public bool ReadyForPlacementWorkflow =>
         MouseMovement && Clicking && QueryInput && AmountInput && Placement &&
-        (!FullWorkflow || WorkflowAuthorized);
+        (Owner.None || Owner.Authorized);
 
-    public static StagingInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
+    public static StagingInputPermissions From(
+        FaustusControllerLiteSettings settings,
+        bool workflowAuthorized = false,
+        bool sweepAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowQueryInput.Value,
         settings.AllowAmountInput.Value,
         settings.AllowOrderPlacement.Value,
         settings.AllowFullWorkflow.Value,
-        workflowAuthorized);
+        workflowAuthorized,
+        settings.AllowSellSweep.Value,
+        sweepAuthorized);
 }
 
 public readonly record struct StagingQuoteSample(
@@ -97,10 +114,13 @@ public sealed class SingleLegStagingController
     private SingleLegStagingState _releaseTarget;
     private string _releaseStatus = string.Empty;
     private bool _placementWorkflowArmed;
+    private SingleLegQuoteValidationPolicy _quoteValidationPolicy;
+    private string _lastQuoteSampleFailure = string.Empty;
 
     public SingleLegStagingState State { get; private set; } = SingleLegStagingState.Idle;
     public string Status { get; private set; } = "Idle; no leg is staged.";
     public string Failure { get; private set; } = string.Empty;
+    public bool FreshProbeRetryRecommended { get; private set; }
     public bool IsRunning => State is not SingleLegStagingState.Idle and
         not SingleLegStagingState.Staged and
         not SingleLegStagingState.Cancelled;
@@ -114,6 +134,7 @@ public sealed class SingleLegStagingController
         bool conflictingControllerEnabled,
         int cursorSpeed,
         bool placementWorkflowArmed,
+        SingleLegQuoteValidationPolicy quoteValidationPolicy,
         out string failure)
     {
         ArgumentNullException.ThrowIfNull(leg);
@@ -126,7 +147,13 @@ public sealed class SingleLegStagingController
         State = SingleLegStagingState.Idle;
         Status = "Idle; no leg is staged.";
         Failure = string.Empty;
+        FreshProbeRetryRecommended = false;
         _leg = null;
+
+        if (!TryValidatePolicy(leg, quoteValidationPolicy, out failure))
+        {
+            return false;
+        }
 
         if (placementWorkflowArmed ? !permissions.ReadyForPlacementWorkflow : !permissions.Ready)
         {
@@ -150,6 +177,7 @@ public sealed class SingleLegStagingController
         var server = gameController.Game.IngameState.ServerData;
         _leg = leg;
         _placementWorkflowArmed = placementWorkflowArmed;
+        _quoteValidationPolicy = quoteValidationPolicy;
         _league = server.League;
         _areaInstanceId = server.InstanceId;
         _sessionId = Guid.NewGuid();
@@ -640,6 +668,7 @@ public sealed class SingleLegStagingController
     private void BeginQuoteSampling(DateTimeOffset now, bool finalSample)
     {
         _stableSamples.Reset();
+        _lastQuoteSampleFailure = string.Empty;
         _nextActionAt = now;
         _stepDeadline = now + TimeSpan.FromSeconds(10);
         State = finalSample ? SingleLegStagingState.SamplingFinalQuote : SingleLegStagingState.SamplingInitialQuote;
@@ -654,7 +683,9 @@ public sealed class SingleLegStagingController
     {
         if (now > _stepDeadline)
         {
-            Cancel("Stable staging quote sampling timed out.");
+            CancelForFreshProbe(string.IsNullOrWhiteSpace(_lastQuoteSampleFailure)
+                ? "Stable staging quote sampling timed out."
+                : $"Stable staging quote sampling timed out: {_lastQuoteSampleFailure}");
             return;
         }
 
@@ -666,18 +697,25 @@ public sealed class SingleLegStagingController
         if (!CurrentMarketReader.TryCapture(
                 gameController, _sessionId, out var capture, out var failure, requireSelectedMarketHead: false) || capture is null)
         {
-            Cancel(failure);
+            CancelForFreshProbe(failure);
             return;
         }
 
         if (!TryCreateStagingSample(
-                _leg!, capture, out var sample, out var sampleFailure,
-                preserveCompetingLimit: _placementWorkflowArmed))
+                _leg!, capture, out var sample, out var sampleFailure, _quoteValidationPolicy))
         {
-            Cancel(sampleFailure);
+            if (ShouldRetryMissingCompetingBook(_leg!, capture, _quoteValidationPolicy))
+            {
+                _lastQuoteSampleFailure = sampleFailure;
+                Status = $"Waiting for the selected competing book to become readable: {sampleFailure}";
+                _nextActionAt = now + TimeSpan.FromMilliseconds(100);
+                return;
+            }
+            CancelForFreshProbe(sampleFailure);
             return;
         }
 
+        _lastQuoteSampleFailure = string.Empty;
         if (!_stableSamples.Observe(sample, requiredSamples))
         {
             Status = $"Stable {(finalSample ? "final" : "initial")} quote sample {_stableSamples.Count}/{requiredSamples}.";
@@ -730,19 +768,27 @@ public sealed class SingleLegStagingController
             return false;
         }
 
-        return TryValidateLiveEdge(leg, MarketCaptureNormalizer.CreateEdges(capture), out failure);
+        return TryValidateLiveEdge(
+            leg, MarketCaptureNormalizer.CreateEdges(capture), out failure, _quoteValidationPolicy);
     }
 
     public static bool TryValidateLiveEdge(
         RouteLegResult leg,
         IEnumerable<DirectedExchangeEdge> liveEdges,
-        out string failure)
+        out string failure,
+        SingleLegQuoteValidationPolicy policy = SingleLegQuoteValidationPolicy.ExactCandidate)
     {
         ArgumentNullException.ThrowIfNull(leg);
         ArgumentNullException.ThrowIfNull(liveEdges);
+        if (!TryValidatePolicy(leg, policy, out failure))
+        {
+            return false;
+        }
         var matching = liveEdges.FirstOrDefault(edge =>
             edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
-            edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate);
+            edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate &&
+            (policy != SingleLegQuoteValidationPolicy.AggressiveImmediateLimit ||
+             IdentityMatches(edge.From, leg.Edge.From) && IdentityMatches(edge.To, leg.Edge.To)));
         if (matching is null)
         {
             failure = "The live quote no longer exactly matches the candidate leg.";
@@ -750,9 +796,13 @@ public sealed class SingleLegStagingController
         }
 
         if (matching.ExecutionIntent == QuoteExecutionIntent.Immediate &&
-            matching.ImmediateInputDepth < leg.InputSpent)
+            (policy == SingleLegQuoteValidationPolicy.AggressiveImmediateLimit
+                ? matching.ImmediateInputDepth <= 0
+                : matching.ImmediateInputDepth < leg.InputSpent))
         {
-            failure = "The live immediate depth no longer covers the staged input.";
+            failure = policy == SingleLegQuoteValidationPolicy.AggressiveImmediateLimit
+                ? "The live immediate head no longer has positive readable depth."
+                : "The live immediate depth no longer covers the staged input.";
             return false;
         }
 
@@ -772,13 +822,18 @@ public sealed class SingleLegStagingController
         MarketCapture capture,
         out StagingQuoteSample sample,
         out string failure,
-        bool preserveCompetingLimit = false)
+        SingleLegQuoteValidationPolicy policy = SingleLegQuoteValidationPolicy.ExactCandidate)
     {
         ArgumentNullException.ThrowIfNull(leg);
         ArgumentNullException.ThrowIfNull(capture);
+        if (!TryValidatePolicy(leg, policy, out failure))
+        {
+            sample = default;
+            return false;
+        }
         var edges = MarketCaptureNormalizer.CreateEdges(capture);
         DirectedExchangeEdge? matching;
-        if (preserveCompetingLimit && leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing)
+        if (policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit)
         {
             matching = edges.FirstOrDefault(edge =>
                 edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
@@ -790,7 +845,7 @@ public sealed class SingleLegStagingController
                 return false;
             }
         }
-        else if (!TryValidateLiveEdge(leg, edges, out failure))
+        else if (!TryValidateLiveEdge(leg, edges, out failure, policy))
         {
             sample = default;
             return false;
@@ -799,7 +854,9 @@ public sealed class SingleLegStagingController
         {
             matching = edges.First(edge =>
                 edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
-                edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate);
+                edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate &&
+                (policy != SingleLegQuoteValidationPolicy.AggressiveImmediateLimit ||
+                 IdentityMatches(edge.From, leg.Edge.From) && IdentityMatches(edge.To, leg.Edge.To)));
         }
         var relevantRows = matching.SourceBook == QuoteBookSource.WantedItemStock
             ? capture.WantedItemStock
@@ -815,6 +872,38 @@ public sealed class SingleLegStagingController
         failure = string.Empty;
         return true;
     }
+
+    public static bool ShouldRetryMissingCompetingBook(
+        RouteLegResult leg,
+        MarketCapture capture,
+        SingleLegQuoteValidationPolicy policy) =>
+        policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit &&
+        leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing &&
+        capture.Pair.Equals(leg.Edge.Pair);
+
+    public static bool TryValidatePolicy(
+        RouteLegResult leg,
+        SingleLegQuoteValidationPolicy policy,
+        out string failure)
+    {
+        ArgumentNullException.ThrowIfNull(leg);
+        var valid = policy switch
+        {
+            SingleLegQuoteValidationPolicy.ExactCandidate => true,
+            SingleLegQuoteValidationPolicy.PreserveCompetingLimit =>
+                leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing,
+            SingleLegQuoteValidationPolicy.AggressiveImmediateLimit =>
+                leg.Edge.ExecutionIntent == QuoteExecutionIntent.Immediate,
+            _ => false,
+        };
+        failure = valid
+            ? string.Empty
+            : $"Quote-validation policy {policy} is incompatible with {leg.Edge.ExecutionIntent} intent.";
+        return valid;
+    }
+
+    private static bool IdentityMatches(CurrencyIdentity left, CurrencyIdentity right) =>
+        string.Equals(left.Metadata, right.Metadata, StringComparison.Ordinal) && left.Hash == right.Hash;
 
     public static bool IsValidAmount(long amount) => amount is > 0 and <= MaximumAmount;
 
@@ -941,6 +1030,12 @@ public sealed class SingleLegStagingController
                 yield return text;
             }
         }
+    }
+
+    private void CancelForFreshProbe(string reason)
+    {
+        FreshProbeRetryRecommended = true;
+        Cancel(reason);
     }
 
     private static bool TryReadOrderIds(GameController gameController, out HashSet<int> ids, out string failure)

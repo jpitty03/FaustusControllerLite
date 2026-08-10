@@ -13,6 +13,7 @@ public enum WorkflowPreparationResult
 {
     Accepted,
     NoCandidate,
+    RetryableUnavailable,
     Failed,
 }
 
@@ -71,7 +72,7 @@ public static class ContinuousWorkflowLoop
 
     /// <summary>Only a planner-complete no-route result may be retried after a cooldown.</summary>
     public static bool IsRetryable(WorkflowPreparationResult result) =>
-        result == WorkflowPreparationResult.NoCandidate;
+        result is WorkflowPreparationResult.NoCandidate or WorkflowPreparationResult.RetryableUnavailable;
 
     /// <summary>
     /// True when no order, reservation, or settlement amount is outstanding, so a fresh
@@ -146,7 +147,9 @@ public static class ContinuousWorkflowLoop
             return ContinuousLoopAction.StopWithoutDurableRoute;
         }
         return snapshot.Phase == WorkflowExecutionPhase.ReadyForLeg
-            ? ContinuousLoopAction.DriveActiveWorkflow
+            ? snapshot.NextScanAtUtc is { } deadline && snapshot.NowUtc < deadline
+                ? ContinuousLoopAction.Wait
+                : ContinuousLoopAction.DriveActiveWorkflow
             : ScanOrWait(snapshot);
     }
 

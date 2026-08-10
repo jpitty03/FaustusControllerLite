@@ -72,6 +72,23 @@ public readonly struct Rational : IEquatable<Rational>, IComparable<Rational>
         return new WholeLotConversion(lots, spent, output, availableInput - spent);
     }
 
+    public bool TryGetInputForExactOutput(long output, out long input)
+    {
+        if (output < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(output));
+        }
+
+        if (output % Numerator != 0)
+        {
+            input = 0;
+            return false;
+        }
+
+        input = CheckedLong((BigInteger)(output / Numerator) * Denominator);
+        return true;
+    }
+
     public long FloorMultiply(long input)
     {
         if (input < 0)

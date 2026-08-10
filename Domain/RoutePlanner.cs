@@ -70,7 +70,10 @@ public sealed record RouteCandidate(
     IReadOnlyDictionary<CurrencyIdentity, long> Remainders,
     int CompetingEdgeCount,
     long CompetingQueueAhead,
-    long? ExpectedGold)
+    long? ExpectedGold,
+    int ChaosRealizationLegIndex = -1,
+    long RestorationPrincipal = 0,
+    long PlannedRestorationSpendChaos = 0)
 {
     public string Signature => string.Join(">", Path.Select(currency => currency.Metadata));
 
@@ -114,7 +117,7 @@ public static class FaustusRoutePlanner
             new[] { request.Chaos, request.Target, request.Chaos },
             new[] { request.Chaos, request.Divine, request.Target, request.Chaos },
             new[] { request.Chaos, request.Target, request.Divine, request.Chaos },
-            new[] { request.Divine, request.Target, request.Chaos },
+            new[] { request.Divine, request.Target, request.Chaos, request.Divine },
         };
 
         var evaluations = paths.SelectMany(path => EvaluatePathVariants(request, path, edgeLookup)).ToArray();
@@ -146,6 +149,19 @@ public static class FaustusRoutePlanner
                     Reject(path, RouteRejectionReason.MissingEdge,
                         $"Missing {path[index].Metadata}->{path[index + 1].Metadata}."),
                 };
+            }
+
+            if (path[0].Equals(request.Divine) && index == path.Length - 2)
+            {
+                choices = choices.Where(edge => edge.ExecutionIntent == QuoteExecutionIntent.Immediate).ToArray();
+                if (choices.Count == 0)
+                {
+                    return new[]
+                    {
+                        Reject(path, RouteRejectionReason.NoImmediateDepth,
+                            $"Closing {path[index].Metadata}->{path[index + 1].Metadata} has no Immediate quote."),
+                    };
+                }
             }
 
             edgeChoices.Add(choices);
@@ -193,57 +209,41 @@ public static class FaustusRoutePlanner
             return Reject(path, RouteRejectionReason.ZeroBankroll, "The ledger/live-capped starting bankroll is zero.");
         }
 
-        DirectedExchangeEdge? benchmarkEdge = null;
-        if (path[0].Equals(request.Divine))
-        {
-            if (!edges.TryGetValue((request.Divine, request.Chaos), out var benchmarkChoices))
-            {
-                return Reject(path, RouteRejectionReason.MissingDivineBenchmark, "A Divine start requires a Divine->Chaos benchmark.");
-            }
-
-            benchmarkEdge = benchmarkChoices.FirstOrDefault(edge =>
-                edge.ExecutionIntent == QuoteExecutionIntent.Immediate &&
-                ValidateEdge(request, edge) == RouteRejectionReason.None);
-            if (benchmarkEdge is null)
-            {
-                var immediate = benchmarkChoices.FirstOrDefault(edge =>
-                    edge.ExecutionIntent == QuoteExecutionIntent.Immediate);
-                var validation = immediate is null ? RouteRejectionReason.None : ValidateEdge(request, immediate);
-                return Reject(path, validation == RouteRejectionReason.None
-                        ? RouteRejectionReason.MissingDivineBenchmark
-                        : validation,
-                    "The Divine->Chaos benchmark must be fresh, matching, and immediate.");
-            }
-        }
-
         try
         {
             var amount = startingBankroll;
-            if (benchmarkEdge is not null)
+            var divineStart = path[0].Equals(request.Divine);
+            var closingEdge = divineStart ? pathEdges[^1] : null;
+            if (closingEdge is not null)
             {
                 var firstEdge = pathEdges[0];
-                if (benchmarkEdge.ImmediateInputDepth < benchmarkEdge.Rate.Denominator ||
+                if (closingEdge.ExecutionIntent != QuoteExecutionIntent.Immediate ||
+                    closingEdge.ImmediateInputDepth < closingEdge.Rate.Denominator ||
                     firstEdge.ExecutionIntent == QuoteExecutionIntent.Immediate &&
                     firstEdge.ImmediateInputDepth < firstEdge.Rate.Denominator)
                 {
                     return Reject(path, RouteRejectionReason.UnderLiquid,
-                        "Divine principal cannot form one whole lot within route and benchmark depth.");
+                        "Divine principal cannot form one whole lot within opening and restoration depth.");
                 }
 
-                var inputLimit = Math.Min(amount, benchmarkEdge.ImmediateInputDepth);
+                var inputLimit = amount;
                 if (firstEdge.ExecutionIntent == QuoteExecutionIntent.Immediate)
                 {
                     inputLimit = Math.Min(inputLimit, firstEdge.ImmediateInputDepth);
                 }
 
+                var restorationLots = closingEdge.ImmediateInputDepth / closingEdge.Rate.Denominator;
+                var restorablePrincipal = checked(restorationLots * closingEdge.Rate.Numerator);
+                inputLimit = Math.Min(inputLimit, restorablePrincipal);
+
                 var commonLot = LeastCommonMultiple(
                     firstEdge.Rate.Denominator,
-                    benchmarkEdge.Rate.Denominator);
+                    closingEdge.Rate.Numerator);
                 amount = checked(inputLimit / commonLot * commonLot);
                 if (amount == 0)
                 {
                     return Reject(path, RouteRejectionReason.Underfunded,
-                        "Divine bankroll cannot form a whole lot shared by route and benchmark.");
+                        "Divine bankroll cannot form a whole lot shared by opening and restoration.");
                 }
             }
 
@@ -254,8 +254,10 @@ public static class FaustusRoutePlanner
                 AddRemainder(remainders, request.Divine, startingBankroll - amount);
             }
 
-            foreach (var edge in pathEdges)
+            var ordinaryLegCount = divineStart ? pathEdges.Count - 1 : pathEdges.Count;
+            for (var edgeIndex = 0; edgeIndex < ordinaryLegCount; edgeIndex++)
             {
+                var edge = pathEdges[edgeIndex];
                 if (amount < edge.Rate.Denominator)
                 {
                     return Reject(path, RouteRejectionReason.Underfunded,
@@ -291,33 +293,49 @@ public static class FaustusRoutePlanner
             }
 
             var principal = legs[0].InputSpent;
+            var chaosRealizationLegIndex = legs.Count - 1;
+            var realizedChaos = amount;
             long benchmark;
-            if (path[0].Equals(request.Chaos))
+            long restorationPrincipal;
+            long restorationSpend;
+            long profit;
+            if (!divineStart)
             {
                 benchmark = principal;
+                restorationPrincipal = 0;
+                restorationSpend = 0;
+                profit = checked(realizedChaos - benchmark);
             }
             else
             {
-                if (benchmarkEdge is null)
+                if (closingEdge is null || !closingEdge.Rate.TryGetInputForExactOutput(principal, out restorationSpend))
                 {
-                    return Reject(path, RouteRejectionReason.MissingDivineBenchmark,
-                        "A Divine start requires a Divine->Chaos benchmark.");
+                    return Reject(path, RouteRejectionReason.NoWholeLot,
+                        "The Divine principal is incompatible with the closing quote output lot.");
+                }
+                if (restorationSpend <= 0 || restorationSpend > closingEdge.ImmediateInputDepth)
+                {
+                    return Reject(path, RouteRejectionReason.UnderLiquid,
+                        "Immediate closing depth cannot restore the full Divine principal.");
+                }
+                if (restorationSpend > realizedChaos)
+                {
+                    return Reject(path, RouteRejectionReason.Underfunded,
+                        "Route-produced Chaos cannot restore the full Divine principal.");
                 }
 
-                var benchmarkConversion = benchmarkEdge.Rate.ConvertWholeLots(principal, benchmarkEdge.ImmediateInputDepth);
-                if (benchmarkConversion.InputSpent != principal)
-                {
-                    return Reject(path,
-                        benchmarkConversion.InputSpent == 0
-                            ? RouteRejectionReason.Underfunded
-                            : RouteRejectionReason.UnderLiquid,
-                        "The full Divine principal cannot be benchmarked immediately.");
-                }
-
-                benchmark = benchmarkConversion.Output;
+                restorationPrincipal = principal;
+                benchmark = restorationSpend;
+                profit = checked(realizedChaos - restorationSpend);
+                legs.Add(new RouteLegResult(
+                    closingEdge,
+                    realizedChaos,
+                    restorationSpend,
+                    restorationPrincipal,
+                    profit,
+                    request.ExpectedGoldPerLeg));
             }
 
-            var profit = checked(amount - benchmark);
             if (profit < request.MinimumProfitChaos)
             {
                 return Reject(path, RouteRejectionReason.ProfitBelowMinimum,
@@ -330,8 +348,8 @@ public static class FaustusRoutePlanner
             var expectedGold = request.ExpectedGoldPerLeg is null
                 ? (long?)null
                 : checked(request.ExpectedGoldPerLeg.Value * pathEdges.Count);
-            var candidate = new RouteCandidate(path, legs, principal, benchmark, amount, profit, remainders,
-                competingCount, queue, expectedGold);
+            var candidate = new RouteCandidate(path, legs, principal, benchmark, realizedChaos, profit, remainders,
+                competingCount, queue, expectedGold, chaosRealizationLegIndex, restorationPrincipal, restorationSpend);
             return new RouteEvaluation(path, candidate, RouteRejectionReason.None, string.Empty);
         }
         catch (OverflowException exception)

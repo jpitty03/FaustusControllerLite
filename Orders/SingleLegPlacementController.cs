@@ -1,4 +1,5 @@
 ﻿using ExileCore;
+using FaustusControllerLite.Core;
 using FaustusControllerLite.Input;
 using FaustusControllerLite.Probing;
 using System.Globalization;
@@ -25,16 +26,25 @@ public sealed record PlacementInputPermissions(
     bool Clicking,
     bool Placement,
     bool FullWorkflow,
-    bool WorkflowAuthorized = false)
+    bool WorkflowAuthorized = false,
+    bool SellSweep = false,
+    bool SweepAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Placement && (!FullWorkflow || WorkflowAuthorized);
+    private CoordinatorOwnership Owner => new(FullWorkflow, WorkflowAuthorized, SellSweep, SweepAuthorized);
 
-    public static PlacementInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
+    public bool Ready => MouseMovement && Clicking && Placement && (Owner.None || Owner.Authorized);
+
+    public static PlacementInputPermissions From(
+        FaustusControllerLiteSettings settings,
+        bool workflowAuthorized = false,
+        bool sweepAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderPlacement.Value,
         settings.AllowFullWorkflow.Value,
-        workflowAuthorized);
+        workflowAuthorized,
+        settings.AllowSellSweep.Value,
+        sweepAuthorized);
 }
 
 public sealed record PlacedOrderSnapshot(
@@ -226,6 +236,7 @@ public sealed class SingleLegPlacementController
     private RouteLegResult? _leg;
     private Func<TrackedOrderState, string, bool>? _persist;
     private Func<RouteLegResult, (bool IsValid, string Failure)>? _finalValidation;
+    private Func<RouteLegResult, MarketCapture, (bool IsValid, string Failure)>? _finalLiveMarketValidation;
     private string _league = string.Empty;
     private int _areaInstanceId;
     private Vector2 _moveStart;
@@ -243,6 +254,7 @@ public sealed class SingleLegPlacementController
     private int _competingOrderWaitMinutes;
     private int _offeredMaxStackSize;
     private int _wantedMaxStackSize;
+    private SingleLegQuoteValidationPolicy _quoteValidationPolicy;
     private SingleLegPlacementState _releaseTarget;
     private string _releaseStatus = string.Empty;
 
@@ -250,6 +262,7 @@ public sealed class SingleLegPlacementController
     public string Status { get; private set; } = "Idle; placement is disabled.";
     public string Failure { get; private set; } = string.Empty;
     public TrackedOrderState? Outcome { get; private set; }
+    public bool FreshProbeRetryRecommended { get; private set; }
     public bool IsRunning => State is SingleLegPlacementState.MovingToPlaceOrder or
         SingleLegPlacementState.ReadyToClick or SingleLegPlacementState.WaitingForOrder or
         SingleLegPlacementState.ReleasingInput;
@@ -266,16 +279,24 @@ public sealed class SingleLegPlacementController
         string candidateSignature,
         int offeredMaxStackSize,
         int wantedMaxStackSize,
+        SingleLegQuoteValidationPolicy quoteValidationPolicy,
         Func<RouteLegResult, (bool IsValid, string Failure)> finalValidation,
+        Func<RouteLegResult, MarketCapture, (bool IsValid, string Failure)> finalLiveMarketValidation,
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
     {
         ArgumentNullException.ThrowIfNull(stagedLeg);
         ArgumentNullException.ThrowIfNull(persist);
         ArgumentNullException.ThrowIfNull(finalValidation);
+        ArgumentNullException.ThrowIfNull(finalLiveMarketValidation);
         if (IsRunning || !permissions.Ready || conflictingControllerEnabled || competingOrderWaitMinutes < 1)
         {
             failure = "Placement is running, permissions are incomplete, full workflow is enabled, or controller exclusion failed.";
+            return false;
+        }
+
+        if (!SingleLegStagingController.TryValidatePolicy(stagedLeg, quoteValidationPolicy, out failure))
+        {
             return false;
         }
 
@@ -288,11 +309,13 @@ public sealed class SingleLegPlacementController
         _leg = stagedLeg;
         _persist = persist;
         _finalValidation = finalValidation;
+        _finalLiveMarketValidation = finalLiveMarketValidation;
         _attemptId = Guid.NewGuid();
         _probeSessionId = probeSessionId;
         _candidateSignature = candidateSignature;
         _offeredMaxStackSize = offeredMaxStackSize;
         _wantedMaxStackSize = wantedMaxStackSize;
+        _quoteValidationPolicy = quoteValidationPolicy;
         _competingOrderWaitMinutes = competingOrderWaitMinutes;
         _clickAttempted = false;
         _league = gameController.Game.IngameState.ServerData.League;
@@ -300,6 +323,7 @@ public sealed class SingleLegPlacementController
         _baselineOrderIds.Clear();
         _baselineOrderIds.UnionWith(orders.Select(order => order.PlayerOrderId));
         Outcome = null;
+        FreshProbeRetryRecommended = false;
         Failure = string.Empty;
         BeginMovement(target, cursorSpeed);
         failure = string.Empty;
@@ -504,10 +528,20 @@ public sealed class SingleLegPlacementController
         }
 
         if (!CurrentMarketReader.TryCapture(
-                gameController, Guid.NewGuid(), out var capture, out failure, requireSelectedMarketHead: false) || capture is null ||
-            !LiveQuoteAllowsPlacement(_leg!, capture, out failure))
+                gameController, _probeSessionId, out var capture, out failure, requireSelectedMarketHead: false) || capture is null ||
+            !LiveQuoteAllowsPlacement(_leg!, capture, _quoteValidationPolicy, out failure))
         {
+            FreshProbeRetryRecommended =
+                _quoteValidationPolicy == SingleLegQuoteValidationPolicy.AggressiveImmediateLimit;
             FinishAmbiguousOrCancel($"Final live quote rejected placement: {failure}", clicked: false);
+            return;
+        }
+
+        var finalLiveGate = _finalLiveMarketValidation!(_leg!, capture);
+        if (!finalLiveGate.IsValid)
+        {
+            FreshProbeRetryRecommended = true;
+            FinishAmbiguousOrCancel($"Final live market validation failed: {finalLiveGate.Failure}", clicked: false);
             return;
         }
 
@@ -559,11 +593,31 @@ public sealed class SingleLegPlacementController
         MarketCapture capture,
         out string failure)
     {
+        var policy = leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing
+            ? SingleLegQuoteValidationPolicy.PreserveCompetingLimit
+            : SingleLegQuoteValidationPolicy.ExactCandidate;
+        return LiveQuoteAllowsPlacement(leg, capture, policy, out failure);
+    }
+
+    public static bool LiveQuoteAllowsPlacement(
+        RouteLegResult leg,
+        MarketCapture capture,
+        SingleLegQuoteValidationPolicy policy,
+        out string failure)
+    {
         ArgumentNullException.ThrowIfNull(leg);
         ArgumentNullException.ThrowIfNull(capture);
+        if (!SingleLegStagingController.TryValidatePolicy(leg, policy, out failure))
+        {
+            return false;
+        }
         failure = string.Empty;
-        if (leg.Edge.ExecutionIntent == QuoteExecutionIntent.Immediate)
-            return SingleLegStagingController.TryCreateStagingSample(leg, capture, out _, out failure);
+        if (policy is SingleLegQuoteValidationPolicy.ExactCandidate or
+            SingleLegQuoteValidationPolicy.AggressiveImmediateLimit)
+        {
+            return SingleLegStagingController.TryCreateStagingSample(
+                leg, capture, out _, out failure, policy);
+        }
 
         if (capture.OfferedCurrency.Metadata != leg.Edge.From.Metadata ||
             capture.WantedCurrency.Metadata != leg.Edge.To.Metadata ||
@@ -599,7 +653,7 @@ public sealed class SingleLegPlacementController
             tracked.PlacedOfferedRatioPart = match.OfferedRatioPart;
             tracked.PlacedWantedRatioPart = match.WantedRatioPart;
             tracked.WaitStartedAtUtc = _clickedAtUtc;
-            tracked.WaitUntilUtc = _clickedAtUtc.AddMinutes(_competingOrderWaitMinutes);
+            tracked.WaitUntilUtc = CalculateWaitUntilUtc(_clickedAtUtc, _competingOrderWaitMinutes);
             tracked.LastObservedAtUtc = DateTimeOffset.UtcNow;
             tracked.LastRemainingOfferedAmount = match.RemainingOfferedAmount;
             tracked.LastReceivedWantedAmount = match.ReceivedWantedAmount;
@@ -649,6 +703,16 @@ public sealed class SingleLegPlacementController
         {
             FinishAmbiguousOrCancel("No matching new order appeared within three seconds.", clicked: true);
         }
+    }
+
+    public static DateTimeOffset CalculateWaitUntilUtc(DateTimeOffset clickedAtUtc, int waitMinutes)
+    {
+        if (waitMinutes < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(waitMinutes));
+        }
+
+        return clickedAtUtc.AddMinutes(waitMinutes);
     }
 
     private TrackedOrderState CreateTrackedState(TrackedOrderStatus status, int? playerOrderId, string detail) => new()

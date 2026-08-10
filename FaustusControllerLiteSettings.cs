@@ -1,8 +1,10 @@
 using ExileCore.Shared.Interfaces;
 using ExileCore.Shared.Nodes;
 using ExileCore.Shared.Attributes;
+using FaustusControllerLite.Domain;
 using Newtonsoft.Json;
 using System.ComponentModel;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace FaustusControllerLite;
@@ -10,6 +12,17 @@ namespace FaustusControllerLite;
 public sealed class FaustusControllerLiteSettings : ISettings
 {
     public ToggleNode Enable { get; set; } = new(false);
+
+    /// <summary>
+    /// Selects which of the two mutually exclusive automation features owns the hotkeys.
+    /// Exactly one is ever active at a time; the other's actions refuse and send no input.
+    /// </summary>
+    [Category("Feature")]
+    public ListNode ActiveFeature { get; set; } = new()
+    {
+        Value = FeatureModeGate.ArbitrageLabel,
+        Values = FeatureModeGate.Labels.ToList(),
+    };
 
     [Category("Market")]
     public ListNode TargetCurrency { get; set; } = new() { Value = "Orb of Alteration" };
@@ -34,6 +47,44 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Strategy")]
     public RangeNode<int> ContinuousWorkflowRetrySeconds { get; set; } = new(10, 2, 90);
+
+    /// <summary>
+    /// Which stash family the sell sweep liquidates. This also fixes the home tab the leftovers are
+    /// returned to, so it is read once per sweep and never inferred from whatever tab is visible.
+    /// </summary>
+    [Category("Strategy")]
+    public ListNode SellSweepKind { get; set; } = new()
+    {
+        Value = SellSweepKinds.ScarabLabel,
+        Values = SellSweepKinds.Labels.ToList(),
+    };
+
+    /// <summary>
+    /// Selects resting competing orders for value or aggressive immediate-head limits for speed.
+    /// The value is captured when a sweep is planned and cannot change that active sweep.
+    /// </summary>
+    [Category("Strategy")]
+    public ListNode SellSweepExecutionStrategy { get; set; } = new()
+    {
+        Value = SellSweepExecutionModes.MostCurrencyLabel,
+        Values = SellSweepExecutionModes.Labels.ToList(),
+    };
+
+    /// <summary>
+    /// A holding worth less than this at the best usable rate is skipped rather than sold. Zero is
+    /// allowed and means "sell anything that has a usable quote".
+    /// </summary>
+    [Category("Strategy")]
+    public RangeNode<int> MinimumSaleChaos { get; set; } = new(10, 0, 1_000_000);
+
+    /// <summary>
+    /// Reverses the sweep queue so the smallest stack is swept first. The default (largest first)
+    /// is the operating order - an interruption then costs the least remaining value - but a first
+    /// live test wants the cheapest possible mistake, so the order is an operator choice rather
+    /// than a constant. Ordering only; it never changes which holdings are eligible.
+    /// </summary>
+    [Category("Strategy")]
+    public ToggleNode SellSweepSmallestStackFirst { get; set; } = new(false);
 
     [Category("Probing")]
     public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
@@ -73,6 +124,13 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Permissions")]
     public ToggleNode AllowFullWorkflow { get; set; } = new(false);
+
+    /// <summary>
+    /// Authorizes the sell sweep loop. This is on top of - never instead of - the individual
+    /// placement, collection, cancellation and stash-transfer permissions each step still checks.
+    /// </summary>
+    [Category("Permissions")]
+    public ToggleNode AllowSellSweep { get; set; } = new(false);
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 ProbeMarketsHotkey { get; set; } = CreateUnboundHotkey();
@@ -118,6 +176,9 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 FullWorkflowHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 SellSweepHotkey { get; set; } = CreateUnboundHotkey();
 
     [Category("Fresh State Reset")]
     [JsonIgnore]

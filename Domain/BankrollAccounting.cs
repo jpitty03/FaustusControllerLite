@@ -76,6 +76,67 @@ public static class BankrollAccounting
         return true;
     }
 
+    /// <summary>
+    /// Credits stash currency the sweep has just counted with its own eyes, so that the normal
+    /// arming path can reserve it. Without this a swept stack can never be reserved: the bankroll
+    /// seeds chaos and divine only, and <see cref="TryReserve"/> refuses metadata it has never
+    /// seen. The credit is a statement that the stack exists, so the caller must supply a
+    /// same-frame scan, and only the amount it is about to offer.
+    /// </summary>
+    /// <remarks>
+    /// Core currency is refused deliberately. Chaos and divine are seeded and reconciled by the
+    /// operator, and letting a stash read top them up would silently inflate the bankroll the
+    /// arbitrage feature spends.
+    /// </remarks>
+    public static bool TryCreditSweptCustody(
+        BankrollState state,
+        string metadata,
+        long amount,
+        string chaosMetadata,
+        string divineMetadata)
+    {
+        if (amount <= 0 ||
+            string.IsNullOrWhiteSpace(metadata) ||
+            metadata == chaosMetadata ||
+            metadata == divineMetadata)
+        {
+            return false;
+        }
+
+        var shadow = Copy(state);
+        AddAvailable(shadow, metadata, amount, chaosMetadata, divineMetadata);
+        CopyAccounting(shadow, state);
+        return true;
+    }
+
+    /// <summary>
+    /// Reverses a credit that was never reserved, so a refused arm cannot leave phantom available
+    /// balance behind. Refuses unless the full credited amount is still sitting in available -
+    /// if it has already moved, the reversal is not ours to make.
+    /// </summary>
+    public static bool TryReverseSweptCustody(
+        BankrollState state,
+        string metadata,
+        long amount,
+        string chaosMetadata,
+        string divineMetadata)
+    {
+        if (amount <= 0 ||
+            string.IsNullOrWhiteSpace(metadata) ||
+            metadata == chaosMetadata ||
+            metadata == divineMetadata ||
+            !TryReadAvailable(state, metadata, chaosMetadata, divineMetadata, out var available) ||
+            available < amount)
+        {
+            return false;
+        }
+
+        var shadow = Copy(state);
+        AddAvailable(shadow, metadata, -amount, chaosMetadata, divineMetadata);
+        CopyAccounting(shadow, state);
+        return true;
+    }
+
     public static bool TryCompleteUncollected(
         BankrollState state,
         string offeredMetadata,

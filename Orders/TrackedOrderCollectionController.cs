@@ -1,4 +1,5 @@
-using ExileCore;
+﻿using ExileCore;
+using FaustusControllerLite.Core;
 using ExileCore.PoEMemory;
 using FaustusControllerLite.Input;
 using System.Numerics;
@@ -29,13 +30,20 @@ public sealed record CollectionInputPermissions(
     bool StashTransfer,
     bool Placement,
     bool FullWorkflow,
-    bool WorkflowAuthorized = false)
+    bool WorkflowAuthorized = false,
+    bool SellSweep = false,
+    bool SweepAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Collection &&
-        (!FullWorkflow && !Cancellation && !StashTransfer && !Placement ||
-         FullWorkflow && WorkflowAuthorized && Cancellation && StashTransfer && Placement);
+    private CoordinatorOwnership Owner => new(FullWorkflow, WorkflowAuthorized, SellSweep, SweepAuthorized);
 
-    public static CollectionInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
+    public bool Ready => MouseMovement && Clicking && Collection &&
+        (Owner.None && !Cancellation && !StashTransfer && !Placement ||
+         Owner.Authorized && Cancellation && StashTransfer && Placement);
+
+    public static CollectionInputPermissions From(
+        FaustusControllerLiteSettings settings,
+        bool workflowAuthorized = false,
+        bool sweepAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderCollection.Value,
@@ -43,7 +51,9 @@ public sealed record CollectionInputPermissions(
         settings.AllowStashTransfer.Value,
         settings.AllowOrderPlacement.Value,
         settings.AllowFullWorkflow.Value,
-        workflowAuthorized);
+        workflowAuthorized,
+        settings.AllowSellSweep.Value,
+        sweepAuthorized);
 }
 
 public static class CollectionOrderMatcher

@@ -10,7 +10,8 @@ public sealed record PermissionSnapshot(
     bool Cancellation,
     bool Collection,
     bool StashTransfer,
-    bool FullWorkflow)
+    bool FullWorkflow,
+    bool SellSweep)
 {
     public static PermissionSnapshot From(FaustusControllerLiteSettings settings) => new(
         settings.AllowAutomatedProbing.Value,
@@ -22,11 +23,20 @@ public sealed record PermissionSnapshot(
         settings.AllowOrderCancellation.Value,
         settings.AllowOrderCollection.Value,
         settings.AllowStashTransfer.Value,
-        settings.AllowFullWorkflow.Value);
+        settings.AllowFullWorkflow.Value,
+        settings.AllowSellSweep.Value);
 
     public bool AllDisabled => !Probing && !MouseMovement && !Clicking && !QueryInput && !AmountInput &&
-        !Placement && !Cancellation && !Collection && !StashTransfer && !FullWorkflow;
+        !Placement && !Cancellation && !Collection && !StashTransfer && !FullWorkflow && !SellSweep;
 
     public bool ReadyForFullWorkflow => Probing && MouseMovement && Clicking && QueryInput && AmountInput &&
-        Placement && Cancellation && Collection && StashTransfer && FullWorkflow;
+        Placement && Cancellation && Collection && StashTransfer && FullWorkflow && !SellSweep;
+
+    /// <summary>
+    /// The sweep drives placement, collection, cancellation and stash transfer, so it needs every
+    /// permission the full workflow needs except <c>FullWorkflow</c> itself - that one authorizes
+    /// the arbitrage loop, which is a different feature and stays independently gated.
+    /// </summary>
+    public bool ReadyForSellSweep => Probing && MouseMovement && Clicking && QueryInput && AmountInput &&
+        Placement && Cancellation && Collection && StashTransfer && SellSweep && !FullWorkflow;
 }

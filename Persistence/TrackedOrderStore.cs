@@ -66,6 +66,9 @@ public sealed class TrackedOrderStore
             EventType = eventType,
             state.League,
             state.Status,
+            state.AttemptId,
+            state.ProbeSessionId,
+            state.CandidateSignature,
             state.PlayerOrderId,
             state.UpdatedAtUtc,
             state.ClickedAtUtc,
@@ -207,8 +210,8 @@ public sealed class TrackedOrderStore
 
     private static bool IsValidStashTransferIntent(StashTransferIntentState intent)
     {
-        if (!StashCustodyPolicy.TryResolve(intent.Metadata, out var expectedMode) ||
-            intent.StashCustodyMode != expectedMode || intent.Amount <= 0 ||
+        if (!StashCustodyPolicy.IsResolvableCustody(intent.Metadata, intent.StashCustodyMode) ||
+            intent.Amount <= 0 ||
             intent.InventoryAmountBefore != intent.Amount || intent.VisibleStashAmountBefore < 0 ||
             string.IsNullOrWhiteSpace(intent.NonTargetInventoryFingerprint) || intent.AreaInstanceId == 0 ||
             intent.ArmedAtUtc == default)

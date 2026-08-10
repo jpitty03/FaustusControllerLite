@@ -38,6 +38,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private string _forcedResetDiscardSummary = string.Empty;
     private DateTimeOffset _nextCatalogueAttemptUtc;
     private Guid _manualProbeSessionId = Guid.NewGuid();
+    private SellSweepState? _sellSweep;
+    private bool _sweepProbeInFlight;
+    private string _sweepProbeMetadata = string.Empty;
+    private SweepProbePurpose _sweepProbePurpose;
+    private MarketCapture? _sweepBenchmarkCapture;
+    private RouteLegResult? _sweepPreparedLeg;
+    private SellSweepPlacementToken? _sweepPlacementToken;
+    private SweepExecutionState _sweepExecution;
+    private string _sellSweepStatus = "Idle; no sell sweep planned.";
     private string _latestRatePath = string.Empty;
     private string _diagnosticPath = string.Empty;
     private string _pickerCalibrationPath = string.Empty;
@@ -50,6 +59,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private string _lastFailure = "None";
     private string _lastCandidate = "None; capture all three markets in one area/session.";
     private string _trackedOrder = "None";
+    private FeatureMode _activeFeature = FeatureMode.Arbitrage;
+    private string _observedFeatureLabel = FeatureModeGate.ArbitrageLabel;
     private TrackedOrderState? _trackedOrderState;
     private bool _trackedOrderLoadBlocked;
     private bool _bankrollLoadBlocked;
@@ -67,6 +78,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private string _stashTransferMetadata = string.Empty;
     private long _stashTransferAmount;
     private bool _fullWorkflowAuthorized;
+    // Sell-sweep authorization is deliberately a separate latch from _fullWorkflowAuthorized:
+    // CoordinatorOwnership refuses two authorized coordinators, so only one may ever be true.
+    private bool _sweepAuthorized;
     private bool _startingNewWorkflow;
     private DateTimeOffset? _nextWorkflowScanAtUtc;
     private PermissionSnapshot? _workflowAuthorization;
@@ -89,6 +103,20 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         ReadingCanceledReturnBaseline,
         CollectingCanceledReturn,
         ReadingCanceledReturnAfter,
+    }
+
+    private enum SweepExecutionState
+    {
+        Idle,
+        Staging,
+        Placing,
+    }
+
+    private enum SweepProbePurpose
+    {
+        None,
+        Benchmark,
+        Candidate,
     }
 
     private sealed record PlacementPreparationToken(
@@ -137,6 +165,22 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _latestRatePath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "latest-rates.json");
         _diagnosticPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "sdk-diagnostic.txt");
         _pickerCalibrationPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "picker-calibration.json");
+        Settings.ActiveFeature.Values = FeatureModeGate.Labels.ToList();
+        Settings.SellSweepExecutionStrategy.Values = SellSweepExecutionModes.Labels.ToList();
+        if (SellSweepExecutionModes.TryParse(
+                Settings.SellSweepExecutionStrategy.Value, out var persistedSellSweepExecutionMode))
+        {
+            Settings.SellSweepExecutionStrategy.Value =
+                SellSweepExecutionModes.ToLabel(persistedSellSweepExecutionMode);
+        }
+        // Adopt the persisted mode without gating: the saved mode is the one that produced whatever
+        // unresolved state is about to load, so refusing it here would strand that state.
+        if (FeatureModeGate.TryParse(Settings.ActiveFeature.Value, out var persistedFeature))
+        {
+            _activeFeature = persistedFeature;
+        }
+        _observedFeatureLabel = FeatureModeGate.ToLabel(_activeFeature);
+        Settings.ActiveFeature.Value = _observedFeatureLabel;
         Settings.ArmFreshStateReset.OnPressed += ArmFreshStateReset;
         Settings.ApplyArmedFreshStateReset.OnPressed += ApplyArmedFreshStateReset;
         Settings.ArmForcedFreshStateReset.OnPressed += ArmForcedFreshStateReset;
@@ -190,6 +234,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             PersistTargetSelection();
         }
 
+        ObserveFeatureSelection();
         ObservePickerOwnership();
         ObservePickerCalibration();
         PollTrackedOrderLifecycle();
@@ -307,7 +352,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
         }
 
-        if (Settings.ExecuteSingleLegHotkey.PressedOnce())
+        if (Settings.ExecuteSingleLegHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             if (IsPlacementFlowActive())
             {
@@ -324,36 +369,41 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
 
-        if (Settings.PlaceStagedLegHotkey.PressedOnce())
+        if (Settings.PlaceStagedLegHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             HandlePlaceStagedLegHotkey();
         }
-        if (Settings.CollectTrackedOrderHotkey.PressedOnce())
+        if (Settings.CollectTrackedOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             HandleCollectTrackedOrderHotkey();
         }
-        if (Settings.StashCollectedCurrencyHotkey.PressedOnce())
+        if (Settings.StashCollectedCurrencyHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             HandleStashCollectedCurrencyHotkey();
         }
-        if (Settings.CancelTimedOutOrderHotkey.PressedOnce())
+        if (Settings.CancelTimedOutOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             HandleCancelTimedOutOrderHotkey();
         }
-        if (Settings.AdoptPendingOrderHotkey.PressedOnce())
+        if (Settings.AdoptPendingOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             AdoptUniquePendingOrderForLifecycle();
         }
 
-        if (Settings.FullWorkflowHotkey.PressedOnce())
+        if (Settings.FullWorkflowHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
         {
             HandleFullWorkflowHotkey();
         }
+        if (Settings.SellSweepHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.SellSweep))
+        {
+            HandleSellSweepHotkey();
+        }
         ValidateWorkflowAuthorizationBeforeInput();
+        ValidateSweepAuthorizationBeforeInput();
         if (IsCollectionFlowActive() &&
             (!(IsStashTransferFlow()
-                ? StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready
-                : CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready) ||
+                ? StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized).Ready
+                : CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized).Ready) ||
              !Settings.AllowQueryInput.Value))
         {
             AbortCollectionFlow("Collection/query permission changed during tracked-order collection.");
@@ -385,7 +435,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _singleLegStaging.Tick(
             GameController,
             _pickerCalibration,
-            StagingInputPermissions.From(Settings, _fullWorkflowAuthorized),
+            StagingInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value,
             Settings.StableRateSampleCount.Value);
@@ -393,7 +443,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _singleLegPlacement.Tick(
             GameController,
             _pickerCalibration,
-            PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized),
+            PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value);
         SynchronizeSingleLegPlacementStatus();
@@ -412,29 +462,30 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _trackedCollection.Tick(
             GameController,
             _pickerCalibration,
-            CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
+            CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled());
         SynchronizeTrackedCollection();
         _inventoryStashTransfer.Tick(
             GameController,
-            StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized),
+            StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled());
         SynchronizeInventoryStashTransfer();
         _trackedCancellation.Tick(
             GameController,
             _pickerCalibration,
-            CancellationInputPermissions.From(Settings, _fullWorkflowAuthorized),
+            CancellationInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value);
         SynchronizeTrackedCancellation();
         _canceledReturnCollection.Tick(
             GameController,
             _pickerCalibration,
-            CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
+            CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled(),
             Settings.CursorTweenSpeed.Value);
         SynchronizeCanceledReturnCollection();
         DriveFullWorkflow();
+        TickSellSweep();
         AppendFailureDiagnosticIfNeeded();
 
         return base.Tick();
@@ -443,6 +494,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     public override void OnUnload()
     {
         _fullWorkflowAuthorized = false;
+        _sweepAuthorized = false;
+        ClearSweepPreparation();
+        _sellSweep = null;
         _startingNewWorkflow = false;
         _nextWorkflowScanAtUtc = null;
         _automatedProbe.Cancel("Plugin unloading during probing.");
@@ -460,6 +514,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     public override void OnPluginDestroyForHotReload()
     {
         _fullWorkflowAuthorized = false;
+        _sweepAuthorized = false;
+        ClearSweepPreparation();
+        _sellSweep = null;
         _startingNewWorkflow = false;
         _nextWorkflowScanAtUtc = null;
         _automatedProbe.Cancel("Plugin hot reload during probing.");
@@ -477,6 +534,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     public override void AreaChange(AreaInstance area)
     {
         var wasAuthorized = _fullWorkflowAuthorized;
+        var sweep = _sellSweep;
+        _sweepAuthorized = false;
         _automatedProbe.Cancel("Area changed.");
         _placementLegRefresh.Cancel("Area changed.");
         _singleLegStaging.Invalidate("Area changed.");
@@ -494,11 +553,22 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _nextWorkflowScanAtUtc = null;
         _placementPreparation = PlacementPreparationState.Idle;
         _placementToken = null;
+        ClearSweepPreparation();
         _lastObservedStagingState = _singleLegStaging.State;
         _calibrationObservation = null;
         _manualProbeSessionId = Guid.NewGuid();
         _liveOwnedByMetadata.Clear();
         _selectedCandidate = null;
+        if (sweep is { IsActive: true })
+        {
+            _sellSweep = sweep.Phase == SellSweepPhase.OrderLive ||
+                _trackedOrderState?.IsUnresolved == true
+                ? SellSweepCoordinator.MarkAmbiguous(
+                    sweep, "Area changed while the sweep still owned unresolved order custody.", DateTimeOffset.UtcNow)
+                : SellSweepCoordinator.Stop(
+                    sweep, "Area changed before placement; the sweep must be planned again.", DateTimeOffset.UtcNow);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        }
         LoadBankrollForCurrentLeague();
         LoadTrackedOrderForCurrentLeague();
         _operationStatus = "Area changed; manual probe session reset and cached rates retained.";
@@ -526,6 +596,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var x = 100f;
         var y = 100f;
         DrawStatus("FaustusControllerLite - Milestone 9 full workflow", ref y, SharpDX.Color.Cyan);
+        DrawStatus($"Active feature: {_observedFeatureLabel} (the other feature's hotkeys refuse)", ref y, SharpDX.Color.Yellow);
         DrawStatus($"Exchange panel: {(panelVisible ? "visible" : "closed")}", ref y, SharpDX.Color.White);
         DrawStatus($"Catalogue: {_catalogueStatus}", ref y, _catalogue == null ? SharpDX.Color.Orange : SharpDX.Color.LimeGreen);
         DrawStatus($"Target: {Settings.TargetCurrencyDisplayName} | {Settings.TargetCurrencyMetadata}", ref y, SharpDX.Color.White);
@@ -553,6 +624,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _trackedCancellation.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
         DrawStatus($"Canceled return: {_canceledReturnCollection.State} | {_canceledReturnCollection.Status}", ref y,
             _canceledReturnCollection.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
+        DrawStatus($"Sell sweep: {_sellSweepStatus}", ref y,
+            _sellSweep?.IsActive == true ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
         DrawStatus($"Workflow: {DescribeWorkflow()}", ref y,
             _bankroll.Workflow?.IsActive == true ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
         DrawStatus($"Continuous trading: {DescribeContinuousScan()}", ref y,
@@ -662,6 +735,66 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _lastCandidate = "None; target changed, so a new three-market session is required.";
     }
 
+    /// <summary>
+    /// Captures the unresolved state that must not be orphaned by a feature switch. Read fresh on
+    /// every evaluation because a switch is only safe against the state that exists right now.
+    /// </summary>
+    private FeatureModeBlockers CaptureFeatureModeBlockers() => new(
+        BankrollHasUnresolvedOrder: _bankroll.HasUnresolvedOrder,
+        TrackedOrderUnresolved: _trackedOrderState?.IsUnresolved == true,
+        WorkflowActive: _bankroll.Workflow?.IsActive == true,
+        FullWorkflowAuthorized: _fullWorkflowAuthorized,
+        StartingNewWorkflow: _startingNewWorkflow,
+        PersistenceLoadBlocked: _bankrollLoadBlocked || _trackedOrderLoadBlocked,
+        InputOperationActive: IsAnyInputOperationActive(),
+        SellSweepUnresolved: _sellSweep?.IsActive == true);
+
+    /// <summary>
+    /// Reconciles the Active Feature selector with the committed mode. A refused switch snaps the
+    /// selector back so the menu never shows a feature that is not the one actually gating input.
+    /// </summary>
+    private void ObserveFeatureSelection()
+    {
+        if (string.Equals(_observedFeatureLabel, Settings.ActiveFeature.Value, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (!FeatureModeGate.TryParse(Settings.ActiveFeature.Value, out var requested))
+        {
+            Settings.ActiveFeature.Value = _observedFeatureLabel;
+            _lastFailure = "Active Feature selection was not an exact feature label; prior selection restored.";
+            return;
+        }
+
+        if (!FeatureModeGate.TrySwitch(_activeFeature, requested, CaptureFeatureModeBlockers(), out var refusal))
+        {
+            Settings.ActiveFeature.Value = _observedFeatureLabel;
+            _lastFailure = refusal;
+            return;
+        }
+
+        _activeFeature = requested;
+        _observedFeatureLabel = FeatureModeGate.ToLabel(requested);
+        Settings.ActiveFeature.Value = _observedFeatureLabel;
+        _operationStatus = $"Active feature is {_observedFeatureLabel}; the other feature's actions are disabled.";
+    }
+
+    /// <summary>
+    /// Gate for every feature-scoped hotkey. Returns true when the action must not run, having
+    /// already recorded why. Shared actions pass under either mode.
+    /// </summary>
+    private bool RefusesFeatureScope(FeatureActionScope scope)
+    {
+        if (FeatureModeGate.IsAllowed(_activeFeature, scope))
+        {
+            return false;
+        }
+
+        _lastFailure = FeatureModeGate.DescribeRefusal(_activeFeature, scope);
+        return true;
+    }
+
     private void ApplyTargetSelection(CurrencyTargetDescriptor target)
     {
         Settings.TargetCurrency.Value = target.SelectorLabel;
@@ -706,7 +839,20 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         try
         {
-            var diagnostic = SdkDiagnosticProbe.Read(GameController, _catalogue);
+            if (!SellSweepExecutionModes.TryParse(
+                    Settings.SellSweepExecutionStrategy.Value, out var executionMode))
+            {
+                throw new InvalidOperationException(
+                    $"The sell-sweep strategy '{Settings.SellSweepExecutionStrategy.Value}' is unsupported.");
+            }
+            var diagnostic = SdkDiagnosticProbe.Read(
+                GameController,
+                _catalogue,
+                _rateStore.Captures,
+                _manualProbeSessionId,
+                minimumSaleChaos: Settings.MinimumSaleChaos.Value,
+                maximumQuoteAge: TimeSpan.FromSeconds(Settings.MaximumQuoteAgeSeconds.Value),
+                executionMode: executionMode);
             var directory = Path.GetDirectoryName(_diagnosticPath)!;
             Directory.CreateDirectory(directory);
             var temporaryPath = _diagnosticPath + ".tmp";
@@ -719,6 +865,270 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _lastFailure = $"SDK diagnostic failed: {exception.Message}";
         }
+    }
+
+    /// <summary>
+    /// One press plans a sweep; a second press stops it between candidates. Planning is a pure
+    /// read - it scans the visible stash tab and builds an ordered plan. Nothing is placed here:
+    /// pricing and placement stay behind the sweep's own
+    /// directives and the same permission gates the arbitrage workflow uses.
+    /// </summary>
+    private void HandleSellSweepHotkey()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_sellSweep is { Phase: SellSweepPhase.OrderLive })
+        {
+            // Stopping here would strand a live order behind an inactive sweep, and the feature
+            // gate would then refuse the arbitrage controls that could resolve it.
+            _lastFailure =
+                "The sweep has an order live; let it settle (or cancel and collect it) before stopping the sweep.";
+            return;
+        }
+
+        if (_sellSweep is { IsActive: true } active)
+        {
+            _sweepAuthorized = false;
+            if (_sweepExecution != SweepExecutionState.Idle || _singleLegStaging.IsRunning ||
+                _singleLegPlacement.IsRunning || _automatedProbe.IsRunning)
+            {
+                _singleLegStaging.Cancel("Operator stopped the sweep before placement.");
+                _singleLegPlacement.Cancel("Operator stopped the sweep before placement.");
+                _automatedProbe.Cancel("Operator stopped the sweep probe.");
+            }
+            ClearSweepPreparation();
+            _sweepBenchmarkCapture = null;
+            _sellSweep = SellSweepCoordinator.Stop(active, "Operator stopped the sweep.", now);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            _operationStatus = "Sell sweep stopped by operator.";
+            return;
+        }
+
+        if (_sellSweep is { Phase: SellSweepPhase.Ambiguous })
+        {
+            _lastFailure =
+                "The previous sweep ended ambiguous; reconcile the order by hand and use the forced " +
+                "fresh state reset before planning another sweep.";
+            return;
+        }
+
+        var permissions = PermissionSnapshot.From(Settings);
+        if (_activeFeature != FeatureMode.SellSweep || !permissions.ReadyForSellSweep ||
+            !new CoordinatorOwnership(
+                permissions.FullWorkflow, _fullWorkflowAuthorized,
+                permissions.SellSweep, true).Authorized)
+        {
+            _lastFailure = DescribeSellSweepAuthorizationRefusal(permissions);
+            return;
+        }
+
+        if (!TryBuildSellSweepPlan(now, out var planned, out var failure))
+        {
+            _lastFailure = failure;
+            _operationStatus = "Sell sweep refused; see the failure line.";
+            return;
+        }
+
+        ClearSweepPreparation();
+        _sweepBenchmarkCapture = null;
+        _sellSweep = planned;
+        _sellSweepStatus = DescribeSellSweep(planned!);
+        _lastFailure = "None";
+        _operationStatus = planned!.Phase == SellSweepPhase.Completed
+            ? "Sell sweep planned nothing to sell."
+            : $"Sell sweep planned {planned.Candidates.Count} candidate(s) in " +
+                $"{SellSweepExecutionModes.ToLabel(planned.ExecutionMode)} mode; " +
+                $"{(Settings.SellSweepSmallestStackFirst.Value ? "smallest" : "largest")} stack first.";
+    }
+
+    /// <summary>
+    /// Builds the plan from one stash read and the persisted captures. Every refusal names the
+    /// exact precondition that failed, because a sweep that plans against a stale or wrong-tab read
+    /// would place real orders against holdings that are not there.
+    /// </summary>
+    private bool TryBuildSellSweepPlan(
+        DateTimeOffset now,
+        out SellSweepState? sweep,
+        out string failure)
+    {
+        sweep = null;
+        var permissions = PermissionSnapshot.From(Settings);
+        if (_activeFeature != FeatureMode.SellSweep || !permissions.ReadyForSellSweep ||
+            _fullWorkflowAuthorized || IsAnyInputOperationActive() ||
+            _bankrollLoadBlocked || _trackedOrderLoadBlocked || !_bankroll.IsInitialized ||
+            !_pickerCalibration.IsComplete || !_pickerCalibration.IsPlacementComplete ||
+            !_pickerCalibration.IsCollectionComplete || !_pickerCalibration.IsCancellationComplete ||
+            !_pickerCalibration.IsReturnCollectionComplete || IsFullFaustusControllerEnabled())
+        {
+            failure = !permissions.ReadyForSellSweep || _activeFeature != FeatureMode.SellSweep ||
+                _fullWorkflowAuthorized
+                ? DescribeSellSweepAuthorizationRefusal(permissions)
+                : "A sweep requires initialized readable state, no active input, complete calibration, and no full-controller conflict.";
+            return false;
+        }
+        if (!SellSweepKinds.TryParse(Settings.SellSweepKind.Value, out var kind))
+        {
+            failure = $"The sell-kind selector '{Settings.SellSweepKind.Value}' names no supported family.";
+            return false;
+        }
+        if (!SellSweepExecutionModes.TryParse(
+                Settings.SellSweepExecutionStrategy.Value, out var executionMode))
+        {
+            failure = $"The sell-sweep strategy selector '{Settings.SellSweepExecutionStrategy.Value}' " +
+                "names no supported execution mode.";
+            return false;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            failure = "The current league is unavailable; a sweep is recorded per league.";
+            return false;
+        }
+
+        if (_catalogue is null ||
+            !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
+            !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null)
+        {
+            failure = "A sweep needs a loaded catalogue with exact Chaos and Divine identities.";
+            return false;
+        }
+
+        if (_trackedOrderState?.IsUnresolved == true)
+        {
+            failure = "An order is still unresolved; resolve it before planning a sweep.";
+            return false;
+        }
+
+        if (!SingleLegPlacementController.TryReadOrders(GameController, out var orders, out var ordersFailure))
+        {
+            failure = $"Exchange orders are unreadable: {ordersFailure}";
+            return false;
+        }
+
+        var liveOrders = ExchangeOrderCapacity.CountLive(orders);
+        if (liveOrders > 0)
+        {
+            failure = $"{liveOrders} order(s) are already live; a sweep plans against an empty order book.";
+            return false;
+        }
+
+        var scan = StashTabReader.Read(GameController);
+        if (!scan.Readable)
+        {
+            failure = $"Stash scan is unreadable: {scan.FailureReason}";
+            return false;
+        }
+
+        if (!scan.Visible)
+        {
+            failure = "The stash tab is not visible; open the tab the sweep sells from.";
+            return false;
+        }
+
+        var homeTabType = SellSweepKinds.HomeTabType(kind);
+        var visibleTabType = scan.TabType.ToString();
+        if (!string.Equals(visibleTabType, homeTabType, StringComparison.Ordinal))
+        {
+            failure = $"The visible tab is {visibleTabType}; a {Settings.SellSweepKind.Value} sweep reads {homeTabType}.";
+            return false;
+        }
+
+        var minimumSaleChaos = Settings.MinimumSaleChaos.Value;
+
+        // A just-in-time sweep does not price here. Quotes are per-candidate and are captured by
+        // the sweep own probe immediately before that candidate placement, so plan time only has
+        // to decide *what* is sellable and in what order.
+        var holdings = new List<SellSweepHolding>();
+        foreach (var holding in scan.Holdings.OrderBy(entry => entry.Metadata, StringComparer.Ordinal))
+        {
+            if (!_catalogue.TryGetTargetByMetadata(holding.Metadata, out var target) || target is null ||
+                target.Kind != kind)
+            {
+                continue;
+            }
+
+            // Chaos and Divine are the proceeds this sweep sells into; selling them into
+            // themselves is not a trade.
+            if (target.Identity.Equals(chaos) || target.Identity.Equals(divine))
+            {
+                continue;
+            }
+
+            holdings.Add(new SellSweepHolding(holding.Metadata, target.Identity.Name, holding.Amount));
+        }
+
+        if (holdings.Count == 0)
+        {
+            failure = $"The visible {homeTabType} holds nothing this catalogue recognises as {Settings.SellSweepKind.Value}.";
+            return false;
+        }
+
+        try
+        {
+            sweep = SellSweepPlanner.BuildQueue(
+                league,
+                _manualProbeSessionId,
+                minimumSaleChaos,
+                holdings,
+                now,
+                Settings.SellSweepSmallestStackFirst.Value,
+                executionMode);
+        }
+        catch (Exception exception)
+        {
+            failure = $"Sweep planning failed: {exception.Message}";
+            return false;
+        }
+
+        failure = string.Empty;
+        return true;
+    }
+
+    private string DescribeSellSweepAuthorizationRefusal(PermissionSnapshot permissions)
+    {
+        if (_activeFeature != FeatureMode.SellSweep)
+        {
+            return "Set Active feature to Sell Sweep before starting a sweep.";
+        }
+        if (permissions.FullWorkflow)
+        {
+            return "Disable Allow full workflow. Allow full workflow and Allow sell sweep are mutually exclusive coordinator permissions; leave the other required Allow settings enabled.";
+        }
+        if (_fullWorkflowAuthorized)
+        {
+            return "Stop the currently authorized full workflow before starting a sell sweep.";
+        }
+
+        var missing = new[]
+        {
+            (permissions.Probing, "automated probing"),
+            (permissions.MouseMovement, "verified mouse movement"),
+            (permissions.Clicking, "verified clicks"),
+            (permissions.QueryInput, "query input"),
+            (permissions.AmountInput, "amount input"),
+            (permissions.Placement, "order placement"),
+            (permissions.Cancellation, "order cancellation"),
+            (permissions.Collection, "order collection"),
+            (permissions.StashTransfer, "stash transfer"),
+            (permissions.SellSweep, "sell sweep"),
+        }.Where(permission => !permission.Item1).Select(permission => permission.Item2).ToArray();
+        return missing.Length == 0
+            ? "Sell sweep could not acquire exclusive coordinator ownership."
+            : $"Enable the missing sell-sweep permissions: {string.Join(", ", missing)}.";
+    }
+
+    private static string DescribeSellSweep(SellSweepState sweep)
+    {
+        var current = sweep.Current;
+        var sold = sweep.Candidates.Count(
+            candidate => candidate.Outcome == SellSweepCandidateOutcome.Sold);
+        var position = current is null
+            ? "no candidate"
+            : $"{current.Name} x{current.HoldingAtScan} (~{current.PlannedProceedsChaos}c)";
+        return $"{sweep.Phase} [{SellSweepExecutionModes.ToLabel(sweep.ExecutionMode)} / " +
+            $"{SellSweepExecutionModes.ToExecutionIntent(sweep.ExecutionMode)}]: {position}; " +
+            $"{sold}/{sweep.Candidates.Count} sold, " +
+            $"{sweep.RealizedProceedsChaos}c realized. {sweep.Detail}";
     }
 
     private void ArmPickerCalibration()
@@ -831,65 +1241,110 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void StartAutomatedProbe()
     {
+        if (!TryStartAutomatedProbeFor(Settings.TargetCurrencyMetadata, out var failure))
+        {
+            _lastFailure = failure;
+        }
+    }
+
+    /// <summary>
+    /// Starts the three-market probe against an explicit target rather than the settings-selected
+    /// one, so the sweep can price each candidate as it reaches it. This is the seam that makes a
+    /// sweep possible at all: the probe publishes its own session id, and the edges it captures are
+    /// therefore the only ones that can pass the session gate in <c>SellCandidate</c>.
+    /// </summary>
+    private bool TryStartAutomatedProbeFor(string targetMetadata, out string failure)
+        => TryStartAutomatedProbeFor(
+            targetMetadata, SweepProbePurpose.None, requestedSessionId: null, out failure);
+
+    private bool TryStartAutomatedProbeFor(
+        string targetMetadata,
+        SweepProbePurpose sweepPurpose,
+        Guid? requestedSessionId,
+        out string failure)
+    {
         if (_trackedCancellation.IsRunning)
         {
-            _lastFailure = "Automated probing is blocked while cancellation is active.";
-            return;
+            failure = "Automated probing is blocked while cancellation is active.";
+            return false;
         }
         if (IsCollectionFlowActive())
         {
-            _lastFailure = "Automated probing is blocked while tracked-order collection is active.";
-            return;
+            failure = "Automated probing is blocked while tracked-order collection is active.";
+            return false;
         }
         if (TryGetHotkeyConflict(out var hotkeyConflict))
         {
-            _lastFailure = hotkeyConflict;
-            return;
+            failure = hotkeyConflict;
+            return false;
         }
 
         if (!_latestRateCacheAvailable)
         {
-            _lastFailure = "Automated probing is blocked because the latest-rate cache failed to load.";
-            return;
+            failure = "Automated probing is blocked because the latest-rate cache failed to load.";
+            return false;
         }
 
         if (_catalogue is null ||
             !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
             !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
-            !_catalogue.TryGetTargetByMetadata(Settings.TargetCurrencyMetadata, out var targetDescriptor) || targetDescriptor is null)
+            !_catalogue.TryGetTargetByMetadata(targetMetadata, out var targetDescriptor) || targetDescriptor is null)
         {
-            _lastFailure = "Automated probing requires a ready catalogue and exact Chaos, Divine, and target identities.";
-            return;
+            failure = "Automated probing requires a ready catalogue and exact Chaos, Divine, and target identities.";
+            return false;
         }
 
         _calibrationObservation = null;
-        if (!_automatedProbe.Start(
+        var plans = sweepPurpose switch
+        {
+            SweepProbePurpose.Benchmark => AutomatedProbeController.CreateSweepBenchmarkPlans(chaos, divine),
+            SweepProbePurpose.Candidate => AutomatedProbeController.CreateSweepCandidatePlans(
+                chaos, divine, targetDescriptor.Identity),
+            _ => AutomatedProbeController.CreateThreeMarketPlans(chaos, divine, targetDescriptor.Identity),
+        };
+        var sessionId = requestedSessionId ?? Guid.NewGuid();
+        if (!_automatedProbe.StartMarketProbe(
                 GameController,
-                chaos,
-                divine,
-                targetDescriptor.Identity,
+                plans,
                 _pickerCalibration,
                 ProbeInputPermissions.From(Settings),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
-                out var failure))
+                sessionId,
+                out var startFailure))
         {
-            _lastFailure = failure;
+            failure = startFailure;
             _operationStatus = "Automated probe did not start; no input was sent.";
-            return;
+            return false;
         }
 
-        _operationStatus = "Automated three-market probe started; press the probe hotkey again to cancel.";
+        _operationStatus = sweepPurpose switch
+        {
+            SweepProbePurpose.Benchmark => "Sweep-wide Divine/Chaos benchmark probe started.",
+            SweepProbePurpose.Candidate =>
+                $"Two-market sweep probe started for {targetDescriptor.Identity.Name}/Chaos and Divine.",
+            _ => $"Automated three-market probe started for {targetDescriptor.Identity.Name}.",
+        };
         _manualProbeSessionId = _automatedProbe.SessionId;
         _selectedCandidate = null;
-        _lastCandidate = "None; a new automated probe session invalidated the prior candidate.";
+        _lastCandidate = sweepPurpose == SweepProbePurpose.None
+            ? "None; a new automated probe session invalidated the prior candidate."
+            : $"Sweep {sweepPurpose.ToString().ToLowerInvariant()} probe is running under the retained sweep session.";
         _lastFailure = "None";
+        failure = string.Empty;
+        return true;
     }
 
     private void SynchronizeAutomatedProbeStatus()
     {
         if (_automatedProbe.State == AutomatedProbeState.Completed)
         {
+            if (_sweepProbePurpose != SweepProbePurpose.None)
+            {
+                SynchronizeCompletedSweepProbe();
+                return;
+            }
+
             var captures = _automatedProbe.CompletedCaptures.ToArray();
             var restageForPlacement = false;
             try
@@ -898,11 +1353,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _manualProbeSessionId = captures[0].SessionId;
                 _operationStatus = $"Atomically published automated probe session {_manualProbeSessionId:D}; three canonical pairs replaced.";
                 _lastFailure = "None";
-                var outcome = CalculateCandidate();
-                restageForPlacement = _placementPreparation == PlacementPreparationState.Probing;
-                if (restageForPlacement && _fullWorkflowAuthorized)
+                CandidateOutcome? outcome = _activeFeature == FeatureMode.Arbitrage
+                    ? CalculateCandidate()
+                    : null;
+                if (_activeFeature == FeatureMode.SellSweep)
                 {
-                    var preparation = PrepareWorkflowAfterFullProbe(outcome);
+                    _selectedCandidate = null;
+                    _lastCandidate = $"Sweep probe session {_manualProbeSessionId:D} published for {_sweepProbeMetadata}.";
+                }
+                restageForPlacement = _placementPreparation == PlacementPreparationState.Probing;
+                if (restageForPlacement && _fullWorkflowAuthorized && outcome is { } candidateOutcome)
+                {
+                    var preparation = PrepareWorkflowAfterFullProbe(candidateOutcome);
                     if (preparation != WorkflowPreparationResult.Accepted)
                     {
                         restageForPlacement = false;
@@ -911,7 +1373,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         _workflowPreparedLeg = null;
                         if (ContinuousWorkflowLoop.IsRetryable(preparation))
                         {
-                            ScheduleContinuousScanRetry();
+                            if (preparation == WorkflowPreparationResult.NoCandidate)
+                                ScheduleContinuousScanRetry();
+                            else
+                                ScheduleActiveWorkflowRetry();
                         }
                         else
                         {
@@ -946,6 +1411,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 AutomatedProbeState.ReleasingInput &&
             !string.IsNullOrWhiteSpace(_automatedProbe.Failure))
         {
+            if (_sweepProbePurpose != SweepProbePurpose.None &&
+                _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
+            {
+                HandleSweepProbeFailure(_automatedProbe.Failure);
+                _automatedProbe.AcknowledgeCompletion();
+                return;
+            }
+
             _lastFailure = _automatedProbe.Failure;
             _operationStatus = _automatedProbe.Status;
             if (_placementPreparation == PlacementPreparationState.Probing)
@@ -964,6 +1437,568 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _automatedProbe.AcknowledgeCompletion();
             }
         }
+    }
+
+    private void SynchronizeCompletedSweepProbe()
+    {
+        var purpose = _sweepProbePurpose;
+        try
+        {
+            if (_sellSweep is not { IsActive: true } sweep || sweep.Current is not { } candidate ||
+                _catalogue is null ||
+                !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
+                !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
+                !_catalogue.TryGetTargetByMetadata(candidate.Metadata, out var target) || target is null)
+            {
+                throw new InvalidOperationException("The active sweep or exact probe identities disappeared.");
+            }
+
+            var captures = _automatedProbe.CompletedCaptures.ToArray();
+            var expectedPairs = purpose == SweepProbePurpose.Benchmark
+                ? AutomatedProbeController.CreateSweepBenchmarkPlans(chaos, divine)
+                : AutomatedProbeController.CreateSweepCandidatePlans(chaos, divine, target.Identity);
+            var requiredPairs = expectedPairs
+                .Select(plan => new CurrencyPairKey(plan.Offered, plan.Wanted))
+                .ToHashSet();
+            var areaInstanceId = GameController.Game.IngameState.ServerData.InstanceId;
+            if (captures.Length != expectedPairs.Count ||
+                captures.Select(capture => capture.Pair).ToHashSet().SetEquals(requiredPairs) == false ||
+                captures.Any(capture => capture.SessionId != sweep.OriginProbeSessionId ||
+                    !string.Equals(capture.League, sweep.League, StringComparison.Ordinal) ||
+                    capture.AreaInstanceId != areaInstanceId))
+            {
+                throw new InvalidDataException(
+                    $"Sweep {purpose} probe did not publish the exact expected pairs in its fixed session, league, and area.");
+            }
+
+            _manualProbeSessionId = sweep.OriginProbeSessionId;
+            if (purpose == SweepProbePurpose.Benchmark)
+            {
+                _sweepBenchmarkCapture = captures[0];
+                _sweepProbeInFlight = false;
+                _sweepProbeMetadata = string.Empty;
+                _sweepProbePurpose = SweepProbePurpose.None;
+                _operationStatus =
+                    $"Captured sweep-wide Divine/Chaos benchmark for session {sweep.OriginProbeSessionId:D}.";
+                _lastFailure = "None";
+                return;
+            }
+
+            if (_sweepBenchmarkCapture is not { } benchmark ||
+                benchmark.SessionId != sweep.OriginProbeSessionId ||
+                !string.Equals(benchmark.League, sweep.League, StringComparison.Ordinal) ||
+                benchmark.AreaInstanceId != areaInstanceId)
+            {
+                throw new InvalidDataException("The sweep-wide Divine/Chaos benchmark is missing or left this area.");
+            }
+
+            _rateStore.StoreBatchAtomically(_latestRatePath, [benchmark, .. captures]);
+            _sweepProbePurpose = SweepProbePurpose.None;
+            _operationStatus =
+                $"Published the retained Divine/Chaos benchmark plus two fresh markets for {candidate.Name}.";
+            _lastFailure = "None";
+        }
+        catch (Exception exception)
+        {
+            HandleSweepProbeFailure($"Sweep {purpose} probe publication failed: {exception.Message}");
+        }
+        finally
+        {
+            _automatedProbe.AcknowledgeCompletion();
+        }
+    }
+
+    private void HandleSweepProbeFailure(string failure)
+    {
+        var purpose = _sweepProbePurpose;
+        var sweep = _sellSweep;
+        ClearSweepPreparation();
+        if (sweep is not { IsActive: true })
+        {
+            _lastFailure = failure;
+            return;
+        }
+
+        if (purpose == SweepProbePurpose.Benchmark)
+        {
+            _sweepBenchmarkCapture = null;
+            _sellSweep = SellSweepCoordinator.Stop(sweep, failure, DateTimeOffset.UtcNow);
+        }
+        else
+        {
+            _sellSweep = SellSweepCoordinator.Advance(
+                sweep, SellSweepCandidateOutcome.Failed, 0, failure, DateTimeOffset.UtcNow);
+        }
+        _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        _lastFailure = failure;
+        _operationStatus = failure;
+    }
+
+
+    private void ValidateSweepAuthorizationBeforeInput()
+    {
+        if (_sellSweep is not { IsActive: true } sweep)
+        {
+            _sweepAuthorized = false;
+            return;
+        }
+
+        var permissions = PermissionSnapshot.From(Settings);
+        var owner = new CoordinatorOwnership(
+            permissions.FullWorkflow, _fullWorkflowAuthorized,
+            permissions.SellSweep, true);
+        var server = GameController.Game.IngameState.ServerData;
+        var fullControllerConflict = IsFullFaustusControllerEnabled();
+        var valid = _activeFeature == FeatureMode.SellSweep && permissions.ReadyForSellSweep &&
+            owner.Authorized && !_fullWorkflowAuthorized && !fullControllerConflict &&
+            string.Equals(server.League, sweep.League, StringComparison.Ordinal) &&
+            sweep.OriginProbeSessionId == _manualProbeSessionId;
+        if (valid)
+        {
+            _sweepAuthorized = true;
+            return;
+        }
+
+        _sweepAuthorized = false;
+        var revoked = new List<string>();
+        if (_activeFeature != FeatureMode.SellSweep) revoked.Add("active feature changed");
+        if (!permissions.ReadyForSellSweep) revoked.Add(DescribeSellSweepAuthorizationRefusal(permissions));
+        if (!owner.Authorized) revoked.Add("exclusive sweep ownership was lost");
+        if (_fullWorkflowAuthorized) revoked.Add("full workflow became authorized");
+        if (fullControllerConflict) revoked.Add("the full FaustusController is enabled");
+        if (!string.Equals(server.League, sweep.League, StringComparison.Ordinal))
+            revoked.Add($"league changed from '{sweep.League}' to '{server.League}'");
+        if (sweep.OriginProbeSessionId != _manualProbeSessionId)
+            revoked.Add($"probe session changed from {sweep.OriginProbeSessionId:D} to {_manualProbeSessionId:D}");
+        var reason = $"Sell-sweep authorization changed before an input controller tick: " +
+            $"{string.Join("; ", revoked)}. Automatic input stopped.";
+        var durable = sweep.Phase == SellSweepPhase.OrderLive ||
+            _trackedOrderState?.IsUnresolved == true && sweep.CurrentAttemptId == _trackedOrderState.AttemptId;
+        _automatedProbe.Cancel(reason);
+        _singleLegStaging.Cancel(reason);
+        _singleLegPlacement.Cancel(reason);
+        ClearSweepPreparation();
+        _sellSweep = durable
+            ? SellSweepCoordinator.MarkAmbiguous(sweep, reason, DateTimeOffset.UtcNow)
+            : SellSweepCoordinator.Stop(sweep, reason, DateTimeOffset.UtcNow);
+        _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        _lastFailure = reason;
+    }
+
+    /// <summary>
+    /// Every frame the sweep asks
+    /// <see cref="SellSweepCoordinator.Decide"/> what the sweep is allowed to do next and performs
+    /// exactly that one step. The single-live-order rule therefore lives in one place, and this
+    /// method can never place while an order is outstanding because the coordinator will not name
+    /// that directive.
+    /// </summary>
+    private void TickSellSweep()
+    {
+        if (_sellSweep is not { IsActive: true } sweep)
+        {
+            _sweepAuthorized = false;
+            _sweepProbeInFlight = false;
+            _sweepBenchmarkCapture = null;
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var directive = SellSweepCoordinator.Decide(sweep, _trackedOrderState);
+        switch (directive)
+        {
+            case SellSweepDirectiveKind.RescanAndPlanCurrentCandidate:
+                DriveSweepPricing(sweep, now);
+                break;
+            case SellSweepDirectiveKind.PlaceCurrentCandidate:
+                PlaceCurrentSweepCandidate(sweep, now);
+                break;
+            case SellSweepDirectiveKind.ObserveCurrentOrder:
+                _sellSweepStatus = $"{DescribeSellSweep(sweep)} | observing the matching live order; no input sent.";
+                break;
+            case SellSweepDirectiveKind.AuthorizeCancellation:
+                if (_trackedCancellation.IsRunning)
+                {
+                    _sellSweepStatus = $"{DescribeSellSweep(sweep)} | {_trackedCancellation.Status}";
+                    break;
+                }
+                DispatchSweepOperation(sweep, directive, HandleCancelTimedOutOrderHotkey, now);
+                break;
+            case SellSweepDirectiveKind.RecoverCancellationWithoutRetry:
+                _sellSweepStatus = $"{DescribeSellSweep(sweep)} | observing durable cancellation recovery; no cancellation click is retried.";
+                break;
+            case SellSweepDirectiveKind.AuthorizeSettlementCollection:
+            case SellSweepDirectiveKind.RecoverSettlementCollectionWithoutRetry:
+                if (IsCollectionFlowActive())
+                {
+                    _sellSweepStatus = $"{DescribeSellSweep(sweep)} | {_operationStatus}";
+                    break;
+                }
+                DispatchSweepOperation(sweep, directive, HandleCollectTrackedOrderHotkey, now);
+                break;
+            case SellSweepDirectiveKind.AuthorizeStashReturn:
+            case SellSweepDirectiveKind.RecoverStashReturnWithoutRetry:
+                if (IsCollectionFlowActive())
+                {
+                    _sellSweepStatus = $"{DescribeSellSweep(sweep)} | {_operationStatus}";
+                    break;
+                }
+                DispatchSweepOperation(sweep, directive, HandleStashCollectedCurrencyHotkey, now);
+                break;
+            case SellSweepDirectiveKind.AdvanceToNextCandidate:
+                AdvanceSweepCandidate(sweep, now);
+                break;
+            case SellSweepDirectiveKind.ManualReconciliationRequired:
+                MarkSweepAmbiguous(sweep,
+                    $"Sweep/tracked attempt mismatch or unresolved state requires manual reconciliation " +
+                    $"(sweep={sweep.CurrentAttemptId?.ToString("D") ?? "none"}, tracked={_trackedOrderState?.AttemptId.ToString("D") ?? "none"}).",
+                    now);
+                break;
+            case SellSweepDirectiveKind.None:
+            default:
+                MarkSweepAmbiguous(sweep, $"Unexpected active sell-sweep directive '{directive}'.", now);
+                break;
+        }
+    }
+
+    private void PlaceCurrentSweepCandidate(SellSweepState sweep, DateTimeOffset now)
+    {
+        if (_sweepExecution != SweepExecutionState.Idle || _singleLegStaging.IsRunning ||
+            _singleLegPlacement.IsRunning)
+        {
+            _sellSweepStatus = $"{DescribeSellSweep(sweep)} | {_operationStatus}";
+            return;
+        }
+        if (IsAnyInputOperationActive() || IsCollectionFlowActive() || _trackedCancellation.IsRunning ||
+            _bankrollLoadBlocked || _trackedOrderLoadBlocked || !_bankroll.IsInitialized ||
+            _bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true ||
+            !_pickerCalibration.IsComplete || !_pickerCalibration.IsPlacementComplete)
+        {
+            StopSweepBeforePlacement(sweep, "Sweep placement preconditions were unavailable.", now);
+            return;
+        }
+        if (_sweepPreparedLeg is not { } leg || _sweepPlacementToken is not { } token)
+        {
+            StopSweepBeforePlacement(sweep, "Sweep placement preparation was unavailable.", now);
+            return;
+        }
+        if (!SellSweepPlacement.TryValidatePrepared(
+                sweep, token, leg, _manualProbeSessionId, GetCurrentLeague(),
+                GameController.Game.IngameState.ServerData.InstanceId, now, out var failure))
+        {
+            StopSweepBeforePlacement(sweep, failure, now);
+            return;
+        }
+        if (!SingleLegPlacementController.TryReadOrders(GameController, out var orders, out failure))
+        {
+            StopSweepBeforePlacement(sweep, failure, now);
+            return;
+        }
+        if (orders.Count != 0 || ExchangeOrderCapacity.IsAtCapacity(ExchangeOrderCapacity.CountLive(orders)))
+        {
+            StopSweepBeforePlacement(sweep,
+                $"Sweep placement requires an empty exchange order list; found {orders.Count}.", now);
+            return;
+        }
+
+        var scan = StashTabReader.Read(GameController);
+        if (!SellSweepPlacement.TryValidateCustody(sweep, token, scan, out failure))
+        {
+            StopSweepBeforePlacement(sweep, failure, now);
+            return;
+        }
+
+        if (!_singleLegStaging.Start(
+                GameController,
+                leg,
+                _pickerCalibration,
+                StagingInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
+                IsFullFaustusControllerEnabled(),
+                Settings.CursorTweenSpeed.Value,
+                placementWorkflowArmed: true,
+                sweep.ExecutionMode == SellSweepExecutionMode.FastestFillMarketRate
+                    ? SingleLegQuoteValidationPolicy.AggressiveImmediateLimit
+                    : SingleLegQuoteValidationPolicy.PreserveCompetingLimit,
+                out failure))
+        {
+            StopSweepBeforePlacement(sweep, failure, now);
+            return;
+        }
+
+        _sweepExecution = SweepExecutionState.Staging;
+        _operationStatus = $"Sweep staging {leg.InputSpent} {leg.Edge.From.Name} for {leg.Output} {leg.Edge.To.Name}.";
+        _lastFailure = "None";
+    }
+
+    private void DispatchSweepOperation(
+        SellSweepState sweep,
+        SellSweepDirectiveKind directive,
+        Action operation,
+        DateTimeOffset now)
+    {
+        if (IsAnyInputOperationActive())
+        {
+            _sellSweepStatus = $"{DescribeSellSweep(sweep)} | waiting for {_operationStatus}";
+            return;
+        }
+
+        var beforeStatus = _trackedOrderState?.Status;
+        operation();
+        if (IsAnyInputOperationActive() || _trackedOrderState?.Status != beforeStatus)
+        {
+            _sellSweepStatus = $"{DescribeSellSweep(sweep)} | dispatched {directive} once.";
+            return;
+        }
+
+        MarkSweepAmbiguous(sweep,
+            $"Sweep directive {directive} was refused: {_lastFailure}", now);
+    }
+
+    private void AdvanceSweepCandidate(SellSweepState sweep, DateTimeOffset now)
+    {
+        if (_trackedOrderState is null || IsAnyInputOperationActive())
+        {
+            MarkSweepAmbiguous(sweep,
+                "The matching stashed attempt was not idle and ready to advance.", now);
+            return;
+        }
+        if (!SellSweepCoordinator.TryCalculateRealizedProceedsChaos(
+                sweep, _trackedOrderState, out var realized, out var failure))
+        {
+            MarkSweepAmbiguous(sweep, failure, now);
+            return;
+        }
+
+        var received = _trackedOrderState.TerminalReceivedWantedAmount ?? 0;
+        var detail = received == 0
+            ? "Order canceled with zero fill; all offered custody was returned and stashed."
+            : $"Stashed actual terminal proceeds of {received} {_trackedOrderState.WantedMetadata}, valued at {realized} Chaos.";
+        _sellSweep = SellSweepCoordinator.Advance(
+            sweep, SellSweepCandidateOutcome.Sold, realized, detail, now);
+        ClearSweepPreparation();
+        if (!_sellSweep.IsActive)
+        {
+            _sweepBenchmarkCapture = null;
+        }
+        _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        _lastFailure = "None";
+    }
+
+    private void StopSweepBeforePlacement(SellSweepState sweep, string reason, DateTimeOffset now)
+    {
+        _sweepAuthorized = false;
+        _singleLegStaging.Cancel(reason);
+        _singleLegPlacement.Cancel(reason);
+        ClearSweepPreparation();
+        _sweepBenchmarkCapture = null;
+        _sellSweep = SellSweepCoordinator.Stop(sweep, reason, now);
+        _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        _lastFailure = reason;
+    }
+
+    private void MarkSweepAmbiguous(SellSweepState sweep, string reason, DateTimeOffset now)
+    {
+        _sweepAuthorized = false;
+        ClearSweepPreparation();
+        _sweepBenchmarkCapture = null;
+        _sellSweep = SellSweepCoordinator.MarkAmbiguous(sweep, reason, now);
+        _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        _lastFailure = reason;
+    }
+
+    private void ClearSweepPreparation()
+    {
+        _sweepProbeInFlight = false;
+        _sweepProbeMetadata = string.Empty;
+        _sweepProbePurpose = SweepProbePurpose.None;
+        _sweepPreparedLeg = null;
+        _sweepPlacementToken = null;
+        _sweepExecution = SweepExecutionState.Idle;
+    }
+
+    /// <summary>
+    /// Captures Divine/Chaos once for the sweep, then prices each candidate from two fresh target
+    /// markets under that fixed session. Plan time deliberately captured no quote.
+    /// </summary>
+    private void DriveSweepPricing(SellSweepState sweep, DateTimeOffset now)
+    {
+        var candidate = sweep.Current;
+        if (candidate is null)
+        {
+            return;
+        }
+
+        if (_sweepProbeInFlight)
+        {
+            if (_automatedProbe.State != AutomatedProbeState.Idle)
+            {
+                _sellSweepStatus = $"Pricing {candidate.Name}: {_automatedProbe.Status}";
+                return;
+            }
+
+            // The probe has finished and SynchronizeAutomatedProbeStatus has already published (or
+            // failed to publish) its captures this frame, so the store now holds whatever the run
+            // produced. Evaluating against it is the honest test of whether the probe worked.
+            _sweepProbeInFlight = false;
+            if (!string.Equals(_sweepProbeMetadata, candidate.Metadata, StringComparison.Ordinal))
+            {
+                _sellSweepStatus =
+                    $"Discarded a probe for {_sweepProbeMetadata}; the sweep has moved to {candidate.Name}.";
+                return;
+            }
+
+            PriceSweepCandidate(sweep, candidate, now);
+            return;
+        }
+
+        if (_automatedProbe.State != AutomatedProbeState.Idle)
+        {
+            _sellSweepStatus = $"Waiting for an unrelated probe to finish before pricing {candidate.Name}.";
+            return;
+        }
+
+        if (_sweepBenchmarkCapture is null)
+        {
+            if (!TryStartAutomatedProbeFor(
+                    candidate.Metadata, SweepProbePurpose.Benchmark,
+                    sweep.OriginProbeSessionId, out var benchmarkFailure))
+            {
+                _sellSweep = SellSweepCoordinator.Stop(
+                    sweep, $"Could not establish the sweep-wide Divine/Chaos benchmark: {benchmarkFailure}", now);
+                _sellSweepStatus = DescribeSellSweep(_sellSweep);
+                return;
+            }
+
+            _sweepProbeInFlight = true;
+            _sweepProbePurpose = SweepProbePurpose.Benchmark;
+            _sweepProbeMetadata = string.Empty;
+            _sellSweepStatus = "Probing Divine>Chaos once for the whole sell sweep.";
+            return;
+        }
+
+        if (!TryStartAutomatedProbeFor(
+                candidate.Metadata, SweepProbePurpose.Candidate,
+                sweep.OriginProbeSessionId, out var failure))
+        {
+            _sellSweep = SellSweepCoordinator.Stop(sweep, $"Could not probe {candidate.Name}: {failure}", now);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            return;
+        }
+
+        _sweepProbeInFlight = true;
+        _sweepProbePurpose = SweepProbePurpose.Candidate;
+        _sweepProbeMetadata = candidate.Metadata;
+        _sellSweepStatus =
+            $"Using the retained Divine/Chaos benchmark; probing Chaos>{candidate.Name} and Divine>{candidate.Name}.";
+    }
+
+    /// <summary>
+    /// Turns the freshly published captures into a verdict for one candidate. A rejection is not a
+    /// failure of the sweep: the candidate is skipped with its reason recorded and the queue moves
+    /// on, which is exactly the behaviour asked for when a stack cannot clear the minimum.
+    /// </summary>
+    private void PriceSweepCandidate(SellSweepState sweep, SellSweepCandidate candidate, DateTimeOffset now)
+    {
+        if (_catalogue is null ||
+            !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
+            !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
+            !_catalogue.TryGetTargetByMetadata(candidate.Metadata, out var target) || target is null)
+        {
+            _sellSweep = SellSweepCoordinator.Stop(
+                sweep,
+                $"The catalogue no longer resolves Chaos, Divine and {candidate.Name} exactly.",
+                now);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            return;
+        }
+
+        var edges = new List<DirectedExchangeEdge>();
+        foreach (var capture in _rateStore.Captures)
+        {
+            try
+            {
+                edges.AddRange(MarketCaptureNormalizer.CreateEdges(capture));
+            }
+            catch (Exception)
+            {
+                // A single unusable capture must not blind the other two markets.
+            }
+        }
+
+        SellCandidateResult result;
+        try
+        {
+            result = FaustusSellPlanner.Evaluate(new SellCandidateRequest(
+                chaos,
+                divine,
+                target.Identity,
+                candidate.HoldingAtScan,
+                edges,
+                now,
+                TimeSpan.MaxValue,
+                sweep.OriginProbeSessionId.ToString("D"),
+                GameController.Game.IngameState.ServerData.InstanceId
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture),
+                sweep.MinimumSaleChaos,
+                sweep.ExecutionMode));
+        }
+        catch (Exception exception)
+        {
+            ClearSweepPreparation();
+            _sellSweep = SellSweepCoordinator.Advance(
+                sweep,
+                SellSweepCandidateOutcome.Failed,
+                0,
+                $"Pricing {candidate.Name} threw {exception.GetType().Name}: {exception.Message}",
+                now);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            return;
+        }
+
+        if (result.Best is not { } best)
+        {
+            ClearSweepPreparation();
+            _sellSweep = SellSweepCoordinator.Advance(
+                sweep,
+                SellSweepCandidateOutcome.Skipped,
+                0,
+                $"{candidate.Name} x{candidate.HoldingAtScan}: {result.RejectionReason} ({result.Detail})",
+                now);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            return;
+        }
+
+        _sellSweep = SellSweepCoordinator.MarkPrepared(sweep, best, sweep.OriginProbeSessionId, now);
+        _sweepPreparedLeg = new RouteLegResult(
+            best.Edge,
+            candidate.HoldingAtScan,
+            best.InputSpent,
+            best.Output,
+            best.InputRemainder,
+            ExpectedGold: null);
+        _sweepPlacementToken = new SellSweepPlacementToken(
+            sweep.SweepId,
+            sweep.CurrentIndex,
+            candidate.Metadata,
+            sweep.OriginProbeSessionId,
+            sweep.League,
+            GameController.Game.IngameState.ServerData.InstanceId,
+            best.Signature,
+            best.Edge.From,
+            best.Edge.To,
+            best.Edge.ExecutionIntent,
+            best.Edge.Rate,
+            best.Edge.SourceBook,
+            candidate.HoldingAtScan,
+            best.InputSpent,
+            best.Output,
+            best.InputRemainder,
+            best.Proceeds,
+            best.ProceedsToChaosRate,
+            now.AddSeconds(30));
+        _sellSweepStatus =
+            $"{candidate.Name} x{candidate.HoldingAtScan} priced at {best.ProceedsChaos}c via " +
+            $"{best.Edge.ExecutionIntent} {best.Edge.From.Name}>{best.Edge.To.Name} " +
+            $"({best.Lots} lot(s), {best.InputRemainder} left over).";
     }
 
     private WorkflowPreparationResult PrepareWorkflowAfterFullProbe(CandidateOutcome outcome)
@@ -1016,10 +2051,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
         }
 
-        // Later-leg revalidation is never no-trade scanning: a failed replan stops and requires reauthorization.
-        return TryRefreshWorkflowPlan(out _lastFailure)
-            ? WorkflowPreparationResult.Accepted
-            : WorkflowPreparationResult.Failed;
+        return TryRefreshWorkflowPlan(out _lastFailure) switch
+        {
+            WorkflowRefreshResult.Refreshed => WorkflowPreparationResult.Accepted,
+            WorkflowRefreshResult.RetryableUnavailable => WorkflowPreparationResult.RetryableUnavailable,
+            _ => WorkflowPreparationResult.Failed,
+        };
     }
 
     private void ScheduleContinuousScanRetry()
@@ -1033,35 +2070,49 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _operationStatus = $"No accepted route this scan ({_lastCandidate}); reprobing in {seconds}s.";
     }
 
-    private bool TryRefreshWorkflowPlan(out string failure)
+    private void ScheduleActiveWorkflowRetry()
+    {
+        var seconds = ContinuousWorkflowLoop.ResolveRetrySeconds(
+            Settings.ContinuousWorkflowRetrySeconds.Value,
+            Random.Shared.Next(ContinuousWorkflowLoop.MinimumJitterSeconds, ContinuousWorkflowLoop.MaximumJitterSeconds + 1));
+        _nextWorkflowScanAtUtc = DateTimeOffset.UtcNow.AddSeconds(seconds);
+        _startingNewWorkflow = false;
+        _workflowPreparedLeg = null;
+        _lastFailure = "None";
+        _operationStatus = $"Exact principal restoration is unavailable; reprobing the active workflow in {seconds}s.";
+    }
+
+    private WorkflowRefreshResult TryRefreshWorkflowPlan(out string failure)
     {
         var workflow = _bankroll.Workflow;
         if (workflow?.Phase != WorkflowExecutionPhase.ReadyForLeg || _bankrollStore is null)
         {
             failure = "Canonical workflow is not ready for a fresh leg plan.";
-            return false;
+            return WorkflowRefreshResult.Failed;
         }
+        var restoration = workflow.Legs[workflow.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
         if (!TryBuildCurrentQuoteMatrix(out var matrix, out failure) || matrix is null ||
-            !TryGetWorkflowSpendCap(workflow, out var spendCap, out failure) ||
-            !WorkflowCoordinator.TryRefreshRemainingPlan(
-                workflow,
-                matrix.Edges,
-                _manualProbeSessionId,
-                spendCap,
-                Settings.MinimumProfitChaos.Value,
-                DateTimeOffset.UtcNow,
-                out var refreshed,
-                out var currentLeg,
-                out failure) || currentLeg is null)
+            !TryGetWorkflowSpendCap(workflow, out var spendCap, out failure))
         {
-            return false;
+            return restoration ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
         }
+        var refresh = WorkflowCoordinator.TryRefreshRemainingPlan(
+            workflow,
+            matrix.Edges,
+            _manualProbeSessionId,
+            spendCap,
+            Settings.MinimumProfitChaos.Value,
+            DateTimeOffset.UtcNow,
+            out var refreshed,
+            out var currentLeg,
+            out failure);
+        if (refresh != WorkflowRefreshResult.Refreshed || currentLeg is null) return refresh;
         if (!TryValidateWorkflowInventoryCapacity(
                 refreshed.Legs.Skip(refreshed.CurrentLegIndex).Select(leg =>
                     (leg.FromMetadata, leg.ToMetadata, leg.InputSpent, leg.Output)),
                 out failure))
         {
-            return false;
+            return WorkflowRefreshResult.Failed;
         }
         try
         {
@@ -1072,12 +2123,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _bankroll = next;
             _workflowPreparedLeg = currentLeg;
             failure = string.Empty;
-            return true;
+            return WorkflowRefreshResult.Refreshed;
         }
         catch (Exception exception)
         {
             failure = $"Fresh workflow plan persistence failed: {exception.Message}";
-            return false;
+            return WorkflowRefreshResult.Failed;
         }
     }
 
@@ -1259,10 +2310,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 leg,
                 _pickerCalibration,
-                StagingInputPermissions.From(Settings, _fullWorkflowAuthorized),
+                StagingInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 placementWorkflowArmed,
+                placementWorkflowArmed && leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing
+                    ? SingleLegQuoteValidationPolicy.PreserveCompetingLimit
+                    : SingleLegQuoteValidationPolicy.ExactCandidate,
                 out var failure))
         {
             _lastFailure = failure;
@@ -1333,7 +2387,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _rateStore.Save(_latestRatePath);
                 if (_fullWorkflowAuthorized)
                 {
-                    if (!TryRefreshWorkflowPlan(out var workflowFailure))
+                    var workflowRefresh = TryRefreshWorkflowPlan(out var workflowFailure);
+                    if (workflowRefresh == WorkflowRefreshResult.RetryableUnavailable)
+                    {
+                        _placementPreparation = PlacementPreparationState.Idle;
+                        _placementToken = null;
+                        ScheduleActiveWorkflowRetry();
+                        return;
+                    }
+                    if (workflowRefresh != WorkflowRefreshResult.Refreshed)
                     {
                         throw new InvalidOperationException(workflowFailure);
                     }
@@ -1435,6 +2497,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     DateTimeOffset.UtcNow.AddSeconds(30));
                 StartPreparedPlacement(leg);
             }
+            else if (_sweepExecution == SweepExecutionState.Staging)
+            {
+                StartPreparedSweepPlacement(_singleLegStaging.StagedLeg!);
+            }
         }
         else if (_singleLegStaging.State == SingleLegStagingState.Cancelled &&
             !string.IsNullOrWhiteSpace(_singleLegStaging.Failure))
@@ -1445,11 +2511,23 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _placementPreparation = PlacementPreparationState.Idle;
                 _placementToken = null;
-                if (_fullWorkflowAuthorized)
+                var retryRestoration = _singleLegStaging.FreshProbeRetryRecommended &&
+                    _trackedOrderState?.IsUnresolved != true &&
+                    _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
+                    ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
+                if (retryRestoration)
+                {
+                    ScheduleActiveWorkflowRetry();
+                }
+                else if (_fullWorkflowAuthorized)
                 {
                     _fullWorkflowAuthorized = false;
                     _workflowAuthorization = null;
                 }
+            }
+            else if (_sweepExecution == SweepExecutionState.Staging && _sellSweep is { IsActive: true } sweep)
+            {
+                StopSweepBeforePlacement(sweep, _singleLegStaging.Failure, DateTimeOffset.UtcNow);
             }
         }
 
@@ -1647,10 +2725,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         switch (action)
         {
             case ContinuousLoopAction.Wait:
-                if (_startingNewWorkflow && _nextWorkflowScanAtUtc is { } deadline && !IsAnyInputOperationActive())
+                if (_nextWorkflowScanAtUtc is { } deadline && !IsAnyInputOperationActive())
                 {
-                    _operationStatus = $"Continuous trading idle: reprobing in " +
-                        $"{Math.Max(0, (int)Math.Ceiling((deadline - now).TotalSeconds))}s ({_lastCandidate}).";
+                    _operationStatus = _startingNewWorkflow
+                        ? $"Continuous trading idle: reprobing in " +
+                            $"{Math.Max(0, (int)Math.Ceiling((deadline - now).TotalSeconds))}s ({_lastCandidate})."
+                        : $"Principal restoration waiting for an executable Immediate quote; reprobing in " +
+                            $"{Math.Max(0, (int)Math.Ceiling((deadline - now).TotalSeconds))}s.";
                 }
                 ReleaseStalePlacementLatch(now);
                 return;
@@ -1666,8 +2747,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 if (workflow is not null)
                 {
                     _operationStatus = workflow.Phase == WorkflowExecutionPhase.Completed
-                        ? $"Workflow complete: planned/actual terminal {workflow.PlannedRealizedChaos} Chaos, " +
-                            $"profit {workflow.PlannedProfitChaos} Chaos; scanning for the next route."
+                        ? $"Workflow complete: {workflow.ActualChaosRealized} Chaos realized, " +
+                            $"{workflow.CumulativeActualRestorationChaosSpent} Chaos spent restoring principal, " +
+                            $"actual profit {workflow.ActualChaosRealized - workflow.CumulativeActualRestorationChaosSpent} Chaos; " +
+                            "scanning for the next route."
                         : $"Workflow stopped safely: {workflow.Detail}; scanning for the next route.";
                 }
                 _startingNewWorkflow = true;
@@ -1869,11 +2952,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 WorkflowLeg = workflow is null ? (int?)null : workflow.CurrentLegIndex + 1,
                 WorkflowLegCount = workflow?.Legs.Count,
                 WorkflowDetail = workflow?.Detail,
+                WorkflowClosureMode = workflow?.ClosureMode.ToString(),
+                WorkflowChaosRealized = workflow?.ActualChaosRealized,
+                WorkflowRestoredPrincipal = workflow?.RestoredPrincipal,
+                WorkflowOutstandingPrincipal = workflow?.OutstandingPrincipal,
+                WorkflowRestorationChaosSpent = workflow?.CumulativeActualRestorationChaosSpent,
                 CandidateStatus = _lastCandidate,
                 CandidatePath = _selectedCandidate is null
                     ? null
                     : string.Join(" -> ", _selectedCandidate.Path.Select(currency => currency.Name)),
                 CandidateProfitChaos = _selectedCandidate?.ProfitChaos,
+                CandidateChaosRealized = _selectedCandidate?.RealizedChaos,
+                CandidateRestorationPrincipal = _selectedCandidate?.RestorationPrincipal,
+                CandidateRestorationChaosSpend = _selectedCandidate?.PlannedRestorationSpendChaos,
                 CandidateCompetingLegs = _selectedCandidate?.CompetingEdgeCount,
                 CandidateLegs = _selectedCandidate?.Legs.Select(leg => new
                 {
@@ -1966,7 +3057,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 stagedLeg,
                 _pickerCalibration,
-                PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized),
+                PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 Settings.CompetingOrderWaitMinutes.Value,
@@ -1974,9 +3065,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _placementToken.CandidateSignature,
                 offeredInventory.TargetMaxStackSize,
                 wantedInventory.TargetMaxStackSize,
+                stagedLeg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing
+                    ? SingleLegQuoteValidationPolicy.PreserveCompetingLimit
+                    : SingleLegQuoteValidationPolicy.ExactCandidate,
                 leg => ValidatePlacementPreparation(leg, out var finalFailure)
                     ? (true, string.Empty)
                     : (false, finalFailure),
+                (_, _) => (true, string.Empty),
                 PersistTrackedOrder,
                 out var placementFailure))
         {
@@ -1993,6 +3088,83 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         _placementPreparation = PlacementPreparationState.Placing;
         _operationStatus = "Fresh probe/restage passed; one verified Place Order click is armed automatically.";
+    }
+
+    private void StartPreparedSweepPlacement(RouteLegResult stagedLeg)
+    {
+        var sweep = _sellSweep;
+        var token = _sweepPlacementToken;
+        var failure = string.Empty;
+        if (sweep is null || token is null || !_pickerCalibration.IsPlacementComplete ||
+            !SellSweepPlacement.TryValidatePrepared(
+                sweep, token, stagedLeg, _manualProbeSessionId, GetCurrentLeague(),
+                GameController.Game.IngameState.ServerData.InstanceId, DateTimeOffset.UtcNow,
+                out failure))
+        {
+            if (sweep is { IsActive: true })
+            {
+                StopSweepBeforePlacement(sweep, string.IsNullOrEmpty(failure)
+                    ? "Sweep Place Order calibration is unavailable."
+                    : failure, DateTimeOffset.UtcNow);
+            }
+            return;
+        }
+
+        if (!InventoryStashTransferController.TryReadSnapshot(
+                GameController, stagedLeg.Edge.From.Metadata,
+                GetStaticMaxStackSize(stagedLeg.Edge.From.Metadata), out var offeredInventory, out failure) ||
+            !InventoryStashTransferController.TryReadSnapshot(
+                GameController, stagedLeg.Edge.To.Metadata,
+                GetStaticMaxStackSize(stagedLeg.Edge.To.Metadata), out var wantedInventory, out failure) ||
+            !UnknownStackCapacityAllows(offeredInventory, stagedLeg.InputSpent, out failure) ||
+            !UnknownStackCapacityAllows(wantedInventory, stagedLeg.Output, out failure))
+        {
+            StopSweepBeforePlacement(sweep, $"Sweep placement stack-size evidence failed: {failure}", DateTimeOffset.UtcNow);
+            return;
+        }
+
+        if (!_singleLegPlacement.Start(
+                GameController,
+                stagedLeg,
+                _pickerCalibration,
+                PlacementInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
+                IsFullFaustusControllerEnabled(),
+                Settings.CursorTweenSpeed.Value,
+                Settings.CompetingOrderWaitMinutes.Value,
+                token.ProbeSessionId,
+                token.PreparedSignature,
+                offeredInventory.TargetMaxStackSize,
+                wantedInventory.TargetMaxStackSize,
+                sweep.ExecutionMode == SellSweepExecutionMode.FastestFillMarketRate
+                    ? SingleLegQuoteValidationPolicy.AggressiveImmediateLimit
+                    : SingleLegQuoteValidationPolicy.PreserveCompetingLimit,
+                leg =>
+                {
+                    if (_sellSweep is not { } current)
+                    {
+                        return (false, "The active sweep disappeared before final placement validation.");
+                    }
+                    return SellSweepPlacement.TryValidatePrepared(
+                            current, token, leg, _manualProbeSessionId, GetCurrentLeague(),
+                            GameController.Game.IngameState.ServerData.InstanceId, DateTimeOffset.UtcNow,
+                            out var finalFailure)
+                        ? (true, string.Empty)
+                        : (false, finalFailure);
+                },
+                (_, capture) => SellSweepPlacement.TryValidateLiveMarket(
+                        token, capture, DateTimeOffset.UtcNow, out var liveFailure)
+                    ? (true, string.Empty)
+                    : (false, liveFailure),
+                PersistSweepTrackedOrder,
+                out var placementFailure))
+        {
+            StopSweepBeforePlacement(sweep, placementFailure, DateTimeOffset.UtcNow);
+            return;
+        }
+
+        _sweepPreparedLeg = stagedLeg;
+        _sweepExecution = SweepExecutionState.Placing;
+        _operationStatus = "Strict sweep quote and custody preparation passed; one Place Order click is armed.";
     }
 
     private static bool UnknownStackCapacityAllows(
@@ -2020,6 +3192,46 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
+        if (_sweepExecution == SweepExecutionState.Placing)
+        {
+            _operationStatus = _singleLegPlacement.Status;
+            if (_singleLegPlacement.State == SingleLegPlacementState.Completed)
+            {
+                _lastFailure = "None";
+                _sweepExecution = SweepExecutionState.Idle;
+                _sweepPreparedLeg = null;
+                _sweepPlacementToken = null;
+            }
+            else if ((_singleLegPlacement.State is SingleLegPlacementState.Ambiguous or SingleLegPlacementState.Cancelled) &&
+                _sellSweep is { IsActive: true } sweep)
+            {
+                var reason = string.IsNullOrWhiteSpace(_singleLegPlacement.Failure)
+                    ? $"Sweep placement ended {_singleLegPlacement.State} without a reason."
+                    : _singleLegPlacement.Failure;
+                if (_singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
+                    _singleLegPlacement.FreshProbeRetryRecommended &&
+                    sweep.Phase == SellSweepPhase.ReadyForCandidate &&
+                    _trackedOrderState?.IsUnresolved != true)
+                {
+                    _sellSweep = SellSweepCoordinator.ClearPreparationForRetry(
+                        sweep, reason, DateTimeOffset.UtcNow);
+                    ClearSweepPreparation();
+                    _sellSweepStatus = DescribeSellSweep(_sellSweep);
+                    _operationStatus = "Prepared sweep quote moved before the click; re-probing both candidate markets.";
+                    _lastFailure = "None";
+                }
+                else if (sweep.Phase == SellSweepPhase.OrderLive || _trackedOrderState?.IsUnresolved == true)
+                {
+                    MarkSweepAmbiguous(sweep, reason, DateTimeOffset.UtcNow);
+                }
+                else
+                {
+                    StopSweepBeforePlacement(sweep, reason, DateTimeOffset.UtcNow);
+                }
+            }
+            return;
+        }
+
         if (_placementPreparation != PlacementPreparationState.Placing)
         {
             return;
@@ -2037,7 +3249,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = string.IsNullOrWhiteSpace(_singleLegPlacement.Failure)
                 ? $"Placement ended {_singleLegPlacement.State} without reporting a reason."
                 : _singleLegPlacement.Failure;
-            if (_fullWorkflowAuthorized)
+            var retryRestoration = _singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
+                _singleLegPlacement.FreshProbeRetryRecommended && _trackedOrderState?.IsUnresolved != true &&
+                _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
+                ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
+            if (retryRestoration)
+            {
+                ScheduleActiveWorkflowRetry();
+            }
+            else if (_fullWorkflowAuthorized)
             {
                 _fullWorkflowAuthorized = false;
                 _workflowAuthorization = null;
@@ -2080,7 +3300,79 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         return true;
     }
 
-    private bool PersistTrackedOrder(TrackedOrderState state, string eventType)
+    private bool PersistSweepTrackedOrder(TrackedOrderState state, string eventType)
+    {
+        if (state.Status != TrackedOrderStatus.Armed)
+        {
+            return PersistTrackedOrder(state, eventType);
+        }
+
+        var validationFailure = string.Empty;
+        if (_sellSweep is not { Phase: SellSweepPhase.ReadyForCandidate } sweep ||
+            _sweepPlacementToken is not { } token || _sweepPreparedLeg is not { } leg ||
+            !SellSweepPlacement.TryValidatePrepared(
+                sweep, token, leg, _manualProbeSessionId, GetCurrentLeague(),
+                GameController.Game.IngameState.ServerData.InstanceId, DateTimeOffset.UtcNow,
+                out validationFailure))
+        {
+            return RejectTrackedOrderPersist(state, eventType,
+                $"Sweep arm preparation failed: {validationFailure}");
+        }
+
+        SellSweepState placedSweep;
+        try
+        {
+            placedSweep = SellSweepCoordinator.MarkPlaced(sweep, state.AttemptId, DateTimeOffset.UtcNow);
+        }
+        catch (Exception exception)
+        {
+            return RejectTrackedOrderPersist(state, eventType,
+                $"Sweep attempt binding failed before the transaction: {exception.Message}");
+        }
+
+        var committed = PersistTrackedOrderWithFunding(
+            state,
+            "SweepCustodyCreditedAndOrderPlacementArmed",
+            (next, armed) =>
+            {
+                var scan = StashTabReader.Read(GameController);
+                if (!SellSweepPlacement.TryValidatePrepared(
+                        sweep, token, leg, _manualProbeSessionId, GetCurrentLeague(),
+                        GameController.Game.IngameState.ServerData.InstanceId, DateTimeOffset.UtcNow,
+                        out var failure) ||
+                    !SellSweepPlacement.TryValidateCustody(sweep, token, scan, out failure))
+                {
+                    return (false, failure);
+                }
+                if (_catalogue is null ||
+                    !_catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
+                    !_catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null ||
+                    armed.AttemptId != state.AttemptId || armed.OfferedMetadata != token.CandidateMetadata ||
+                    armed.OfferedAmount != token.InputSpent ||
+                    !BankrollAccounting.TryCreditSweptCustody(
+                        next, armed.OfferedMetadata, armed.OfferedAmount, chaos.Metadata, divine.Metadata))
+                {
+                    return (false, "Exact non-core sweep custody could not be credited on the cloned bankroll.");
+                }
+                return (true, string.Empty);
+            });
+        if (!committed)
+        {
+            return false;
+        }
+
+        _sellSweep = placedSweep;
+        _sellSweepStatus = DescribeSellSweep(placedSweep);
+        return true;
+    }
+
+    private bool PersistTrackedOrder(TrackedOrderState state, string eventType) =>
+        PersistTrackedOrderWithFunding(state, eventType, null);
+
+    private bool PersistTrackedOrderWithFunding(
+        TrackedOrderState state,
+        string eventType,
+        Func<BankrollState, TrackedOrderState, (bool IsValid, string Failure)>? armedFunding)
     {
         if (_bankrollStore is null || !_bankroll.IsInitialized)
         {
@@ -2093,11 +3385,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             var previous = next.TrackedOrder;
             if (state.Status == TrackedOrderStatus.Armed)
             {
-                if (previous?.IsUnresolved == true || !TryMoveAvailableToReserved(next, state.OfferedMetadata, state.OfferedAmount))
+                if (previous?.IsUnresolved == true)
+                {
+                    return RejectTrackedOrderPersist(state, eventType,
+                        $"Arming requires no unresolved order; previous={previous.Status}.");
+                }
+                var funding = armedFunding?.Invoke(next, state) ?? (true, string.Empty);
+                if (!funding.IsValid ||
+                    !TryMoveAvailableToReserved(next, state.OfferedMetadata, state.OfferedAmount))
                 {
                     return RejectTrackedOrderPersist(state, eventType,
                         $"Arming requires no unresolved order and {state.OfferedAmount} available " +
-                        $"{state.OfferedMetadata} to reserve; previous={previous?.Status.ToString() ?? "none"}.");
+                        $"{state.OfferedMetadata} to reserve; previous={previous?.Status.ToString() ?? "none"}; " +
+                        $"funding={funding.Failure}.");
                 }
             }
             else if (previous is null || previous.AttemptId != state.AttemptId || !previous.IsUnresolved)
@@ -2479,7 +3779,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _lastFailure = "Terminal settlement collection requires exact pending amounts and the calibrated left/right slot.";
                 return;
             }
-            if (!CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready || !Settings.AllowQueryInput.Value)
+            if (!CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized).Ready || !Settings.AllowQueryInput.Value)
             {
                 _lastFailure = "Enable movement, clicks, query input, and collection; disable placement/full workflow/cancellation.";
                 return;
@@ -2496,7 +3796,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = "Collection requires readable canonical CompletedUncollected state and calibrated tracked-order slot.";
             return;
         }
-        if (!CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready || !Settings.AllowQueryInput.Value)
+        if (!CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized).Ready || !Settings.AllowQueryInput.Value)
         {
             _lastFailure = "Enable movement, clicks, query input, and collection; disable placement and full workflow.";
             return;
@@ -2717,7 +4017,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController,
                 _trackedOrderState,
                 _pickerCalibration,
-                CancellationInputPermissions.From(Settings, _fullWorkflowAuthorized),
+                CancellationInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 PersistTrackedOrder,
@@ -2962,7 +4262,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private bool IsAnyInputOperationActive() =>
         _automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _singleLegStaging.IsRunning ||
         _singleLegPlacement.IsRunning || IsCollectionFlowActive() || _trackedCancellation.IsRunning ||
-        _placementPreparation != PlacementPreparationState.Idle || _calibrationObservation is not null;
+        _placementPreparation != PlacementPreparationState.Idle || _sweepExecution != SweepExecutionState.Idle ||
+        _calibrationObservation is not null;
 
     private void HandleStashCollectedCurrencyHotkey()
     {
@@ -3021,7 +4322,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _stashTransferMetadata = recoveryIntent.Metadata;
             _stashTransferAmount = recoveryIntent.Amount;
         }
-        if (!StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized).Ready || !Settings.AllowQueryInput.Value)
+        if (!StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized).Ready || !Settings.AllowQueryInput.Value)
         {
             _lastFailure = "Enable movement, clicks, query input, collection, and stash transfer; disable placement and full workflow.";
             return;
@@ -3136,7 +4437,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         GameController,
                         _trackedOrderState!,
                         _pickerCalibration,
-                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
+                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
                         IsFullFaustusControllerEnabled(),
                         Settings.CursorTweenSpeed.Value,
                         _collectionBatchAmount,
@@ -3165,7 +4466,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             else if (_collectionFlow == CollectionFlowState.ReadingStashBaseline)
             {
                 _collectionOwnedBaseline = owned;
-                if (!StashCustodyPolicy.TryResolve(_stashTransferMetadata, out var custodyMode))
+                if (!StashCustodyPolicy.IsSupported(_stashTransferMetadata))
                 {
                     AbortCollectionFlow("Settlement asset has no supported stash custody policy.");
                     return;
@@ -3173,13 +4474,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 if (!_inventoryStashTransfer.Start(
                         GameController,
                         _trackedOrderState!,
-                        StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized),
+                        StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
                         IsFullFaustusControllerEnabled(),
                         Settings.CursorTweenSpeed.Value,
                         _stashTransferMetadata,
                         _stashTransferAmount,
                         owned,
-                        custodyMode,
                         GetStaticMaxStackSize(_stashTransferMetadata),
                         PersistTrackedOrder,
                         out failure))
@@ -3189,9 +4489,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 }
 
                 _collectionFlow = CollectionFlowState.TransferringToStash;
-                _operationStatus = custodyMode == StashCustodyMode.AffinityAggregate
+                _operationStatus = _inventoryStashTransfer.CustodyMode == StashCustodyMode.AffinityAggregate
                     ? $"Pre-transfer owned count {owned}; moving exact collected amount through configured stash affinity."
-                    : $"Pre-transfer owned count {owned}; moving exact collected amount to visible Currency Stash.";
+                    : $"Pre-transfer owned count {owned}; moving exact collected amount to the visible home stash tab.";
             }
             else if (_collectionFlow == CollectionFlowState.ReadingStashAfter)
             {
@@ -3214,7 +4514,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         GameController,
                         _trackedOrderState!,
                         _pickerCalibration,
-                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized),
+                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
                         IsFullFaustusControllerEnabled(),
                         Settings.CursorTweenSpeed.Value,
                         owned,
@@ -3398,8 +4698,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var pendingBatch = wantedSide
             ? _trackedOrderState.PendingWantedBatchAmount
             : _trackedOrderState.PendingReturnBatchAmount;
-        if (!StashCustodyPolicy.TryResolve(intent.Metadata, out var canonicalMode) ||
-            canonicalMode != intent.StashCustodyMode || observedOwned != intent.AggregateOwnedBefore ||
+        if (!StashCustodyPolicy.IsResolvableCustody(intent.Metadata, intent.StashCustodyMode) ||
+            observedOwned != intent.AggregateOwnedBefore ||
             pendingBatch <= 0 || intent.Amount != pendingBatch ||
             !wantedSide && intent.Metadata != _trackedOrderState.OfferedMetadata)
         {
@@ -3712,6 +5012,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _collectionFlow = CollectionFlowState.Idle;
         _lastFailure = reason;
         _operationStatus = $"Collection cancelled: {reason}";
+        if (_sellSweep is { IsActive: true } sweep)
+        {
+            MarkSweepAmbiguous(sweep, reason, DateTimeOffset.UtcNow);
+        }
     }
 
     private bool IsPlacementFlowActive() =>
@@ -3836,6 +5140,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             Binding(nameof(Settings.CancelTimedOutOrderHotkey), Settings.CancelTimedOutOrderHotkey),
             Binding(nameof(Settings.AdoptPendingOrderHotkey), Settings.AdoptPendingOrderHotkey),
             Binding(nameof(Settings.FullWorkflowHotkey), Settings.FullWorkflowHotkey),
+            Binding(nameof(Settings.SellSweepHotkey), Settings.SellSweepHotkey),
         };
         var duplicate = bindings
             .Where(binding => binding.Active)
@@ -3899,7 +5204,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         Settings.AllowAutomatedProbing.Value || Settings.AllowVerifiedMouseMovement.Value ||
         Settings.AllowVerifiedClicks.Value || Settings.AllowQueryInput.Value || Settings.AllowAmountInput.Value ||
         Settings.AllowOrderPlacement.Value || Settings.AllowOrderCancellation.Value ||
-        Settings.AllowOrderCollection.Value || Settings.AllowStashTransfer.Value || Settings.AllowFullWorkflow.Value;
+        Settings.AllowOrderCollection.Value || Settings.AllowStashTransfer.Value ||
+        Settings.AllowFullWorkflow.Value || Settings.AllowSellSweep.Value;
 
     private void DisableLiteInputPermissions()
     {
@@ -3913,6 +5219,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         Settings.AllowOrderCollection.Value = false;
         Settings.AllowStashTransfer.Value = false;
         Settings.AllowFullWorkflow.Value = false;
+        Settings.AllowSellSweep.Value = false;
     }
 
     private string DescribePickerCalibration() =>
@@ -4082,7 +5389,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     $"Divine={Math.Min(_bankroll.AvailableDivine, divineOwnership.Count)} " +
                     $"(ledger {_bankroll.AvailableDivine}, live {divineOwnership.Count}); " +
                     $"reasons {DescribeRejections(result)}"
-                : $"{DescribeCandidatePath(best)}; realized {best.ProfitChaos} Chaos profit; residuals " +
+                : $"{DescribeCandidatePath(best)}; realized {best.RealizedChaos} Chaos before restoration, " +
+                    $"restores {best.RestorationPrincipal} Divine for {best.PlannedRestorationSpendChaos} Chaos, " +
+                    $"post-restoration profit {best.ProfitChaos} Chaos; residuals " +
                     string.Join(", ", best.Remainders.Select(item => $"{item.Value} {item.Key.Name}")) +
                     $"; competing legs {best.CompetingEdgeCount}; " +
                     $"expected gold {(best.ExpectedGold?.ToString() ?? "unknown")}";
@@ -4105,6 +5414,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_bankroll.Workflow?.IsActive == true)
         {
             failure = "Fresh-state reset blocked: a workflow is still active.";
+            return true;
+        }
+        if (_sellSweep?.IsActive == true)
+        {
+            failure = "Fresh-state reset blocked: a sell sweep is still active.";
             return true;
         }
         if (ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(_bankroll, _trackedOrderState, out var reason))
@@ -4206,6 +5520,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _nextWorkflowScanAtUtc = null;
         _placementPreparation = PlacementPreparationState.Idle;
         _placementToken = null;
+        _sweepAuthorized = false;
+        ClearSweepPreparation();
+        _sellSweep = null;
+        _sellSweepStatus = "Idle; the fresh-state reset discarded the previous sweep.";
         _placementRefreshAttempts = 0;
         _collectionFlow = CollectionFlowState.Idle;
         _collectionOwnedBaseline = 0;
@@ -4314,6 +5632,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _bankrollLoadBlocked = false;
             _trackedOrderLoadBlocked = false;
             _forcedResetArmed = false;
+            // The sweep is positioned on tracked-order state that was just quarantined, so keeping
+            // it would leave the plan pointing at a candidate whose order no longer exists.
+            _sellSweep = null;
+            _sellSweepStatus = "Idle; the forced reset discarded the previous sweep.";
             AppendRuntimeDiagnostic("ForcedFreshStateResetApplied",
                 $"Abandoned: {summary} Quarantined: {string.Join(" | ", quarantined)}");
         }
@@ -4447,7 +5769,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ? workflow.Legs.Count
             : workflow.CurrentLegIndex + 1;
         return $"{workflow.Phase}, leg {leg}/{workflow.Legs.Count}, authorized={_fullWorkflowAuthorized}, " +
-            $"planned profit={workflow.PlannedProfitChaos} Chaos | {workflow.Detail}";
+            $"Chaos realized={workflow.PlannedRealizedChaos}, restoration={workflow.RestoredPrincipal}/" +
+            $"{workflow.RestorationPrincipal} principal, outstanding={workflow.OutstandingPrincipal}, " +
+            $"restoration spend planned/actual={workflow.PlannedRestorationSpendChaos}/" +
+            $"{workflow.CumulativeActualRestorationChaosSpent} Chaos, planned profit={workflow.PlannedProfitChaos} Chaos | " +
+            workflow.Detail;
     }
 
     private string DescribeContinuousScan()
@@ -4463,7 +5789,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var remaining = deadline - DateTimeOffset.UtcNow;
         return remaining <= TimeSpan.Zero
             ? "authorized; retry cooldown elapsed"
-            : $"authorized; no accepted route, reprobing in {(int)Math.Ceiling(remaining.TotalSeconds)}s";
+            : _startingNewWorkflow
+                ? $"authorized; no accepted route, reprobing in {(int)Math.Ceiling(remaining.TotalSeconds)}s"
+                : $"authorized; restoration unavailable, reprobing in {(int)Math.Ceiling(remaining.TotalSeconds)}s";
     }
 
     private string DescribeOwned(string currencyName)

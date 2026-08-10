@@ -1,4 +1,5 @@
-using ExileCore;
+﻿using ExileCore;
+using FaustusControllerLite.Core;
 using ExileCore.PoEMemory;
 using FaustusControllerLite.Input;
 using System.Numerics;
@@ -30,13 +31,20 @@ public sealed record CancellationInputPermissions(
     bool Collection,
     bool StashTransfer,
     bool FullWorkflow,
-    bool WorkflowAuthorized = false)
+    bool WorkflowAuthorized = false,
+    bool SellSweep = false,
+    bool SweepAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Cancellation &&
-        (!FullWorkflow && !Placement && !Collection && !StashTransfer ||
-         FullWorkflow && WorkflowAuthorized && Placement && Collection && StashTransfer);
+    private CoordinatorOwnership Owner => new(FullWorkflow, WorkflowAuthorized, SellSweep, SweepAuthorized);
 
-    public static CancellationInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
+    public bool Ready => MouseMovement && Clicking && Cancellation &&
+        (Owner.None && !Placement && !Collection && !StashTransfer ||
+         Owner.Authorized && Placement && Collection && StashTransfer);
+
+    public static CancellationInputPermissions From(
+        FaustusControllerLiteSettings settings,
+        bool workflowAuthorized = false,
+        bool sweepAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderCancellation.Value,
@@ -44,7 +52,9 @@ public sealed record CancellationInputPermissions(
         settings.AllowOrderCollection.Value,
         settings.AllowStashTransfer.Value,
         settings.AllowFullWorkflow.Value,
-        workflowAuthorized);
+        workflowAuthorized,
+        settings.AllowSellSweep.Value,
+        sweepAuthorized);
 }
 
 public sealed class TrackedOrderCancellationController

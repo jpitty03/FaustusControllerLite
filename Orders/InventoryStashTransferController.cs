@@ -1,4 +1,5 @@
-using ExileCore;
+﻿using ExileCore;
+using FaustusControllerLite.Core;
 using ExileCore.PoEMemory.Components;
 using ExileCore.Shared.Enums;
 using System.Numerics;
@@ -30,13 +31,20 @@ public sealed record StashTransferInputPermissions(
     bool Cancellation,
     bool Placement,
     bool FullWorkflow,
-    bool WorkflowAuthorized = false)
+    bool WorkflowAuthorized = false,
+    bool SellSweep = false,
+    bool SweepAuthorized = false)
 {
-    public bool Ready => MouseMovement && Clicking && Collection && StashTransfer &&
-        (!FullWorkflow && !Cancellation && !Placement ||
-         FullWorkflow && WorkflowAuthorized && Cancellation && Placement);
+    private CoordinatorOwnership Owner => new(FullWorkflow, WorkflowAuthorized, SellSweep, SweepAuthorized);
 
-    public static StashTransferInputPermissions From(FaustusControllerLiteSettings settings, bool workflowAuthorized = false) => new(
+    public bool Ready => MouseMovement && Clicking && Collection && StashTransfer &&
+        (Owner.None && !Cancellation && !Placement ||
+         Owner.Authorized && Cancellation && Placement);
+
+    public static StashTransferInputPermissions From(
+        FaustusControllerLiteSettings settings,
+        bool workflowAuthorized = false,
+        bool sweepAuthorized = false) => new(
         settings.AllowVerifiedMouseMovement.Value,
         settings.AllowVerifiedClicks.Value,
         settings.AllowOrderCollection.Value,
@@ -44,7 +52,9 @@ public sealed record StashTransferInputPermissions(
         settings.AllowOrderCancellation.Value,
         settings.AllowOrderPlacement.Value,
         settings.AllowFullWorkflow.Value,
-        workflowAuthorized);
+        workflowAuthorized,
+        settings.AllowSellSweep.Value,
+        sweepAuthorized);
 }
 
 public sealed record InventoryItemEvidence(
@@ -66,7 +76,8 @@ public sealed record InventoryTransferSnapshot(
     long TargetVisibleStashAmount,
     float InventorySlotWidth = 0,
     float InventorySlotHeight = 0,
-    int TargetMaxStackSize = 0)
+    int TargetMaxStackSize = 0,
+    string VisibleTabType = StashCustodyPolicy.CurrencyTabType)
 {
     public IReadOnlyList<InventoryItemEvidence> NonTarget(string metadata) =>
         Items.Where(item => item.Metadata != metadata).OrderBy(item => item.EntityAddress).ToArray();
@@ -222,7 +233,7 @@ public static class InventoryTransferEvidence
         long observedOwned,
         int currentAreaInstanceId)
     {
-        if (!StashCustodyPolicy.TryResolve(canonicalMetadata, out var canonicalMode) ||
+        if (!StashCustodyPolicy.TryResolve(canonicalMetadata, current.VisibleTabType, out var canonicalMode) ||
             intent.StashCustodyMode != canonicalMode || intent.Metadata != canonicalMetadata || intent.Amount != canonicalAmount ||
             intent.InventoryAmountBefore != canonicalAmount || intent.AggregateOwnedBefore != observedOwned ||
             intent.AreaInstanceId != currentAreaInstanceId ||
@@ -269,6 +280,8 @@ public sealed class InventoryStashTransferController
     private long _amount;
     private long _aggregateOwnedBefore;
     private StashCustodyMode _custodyMode;
+    /// <summary>Custody mode resolved from the visible stash tab when the run started.</summary>
+    public StashCustodyMode CustodyMode => _custodyMode;
     private int _staticMaxStackSize;
     private string _league = string.Empty;
     private int _areaInstanceId;
@@ -302,13 +315,8 @@ public sealed class InventoryStashTransferController
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
     {
-        if (!StashCustodyPolicy.TryResolve(metadata, out var custodyMode))
-        {
-            failure = "Settlement asset has no supported stash custody policy.";
-            return false;
-        }
         return Start(gameController, tracked, permissions, conflictingControllerEnabled, cursorSpeed,
-            metadata, amount, aggregateOwnedBefore, custodyMode, 0, persist, out failure);
+            metadata, amount, aggregateOwnedBefore, 0, persist, out failure);
     }
 
     public bool Start(
@@ -320,14 +328,13 @@ public sealed class InventoryStashTransferController
         string metadata,
         long amount,
         long aggregateOwnedBefore,
-        StashCustodyMode custodyMode,
         int staticMaxStackSize,
         Func<TrackedOrderState, string, bool> persist,
         out string failure)
     {
         ArgumentNullException.ThrowIfNull(tracked);
         ArgumentNullException.ThrowIfNull(persist);
-        if (!StashCustodyPolicy.TryResolve(metadata, out var canonicalMode) || canonicalMode != custodyMode ||
+        if (!StashCustodyPolicy.IsSupported(metadata) ||
             IsRunning || tracked.Status != TrackedOrderStatus.Collected || !permissions.Ready ||
             conflictingControllerEnabled || amount <= 0 || aggregateOwnedBefore < amount ||
             !(metadata == tracked.WantedMetadata && amount == tracked.PendingWantedBatchAmount ||
@@ -341,6 +348,14 @@ public sealed class InventoryStashTransferController
             !InventoryTransferEvidence.TrySelectExactTarget(
                 snapshot, metadata, amount, out var target, out failure) || target is null)
         {
+            return false;
+        }
+
+        // Custody is a property of the tab that is actually visible, so it can only be resolved
+        // once the snapshot has observed it.
+        if (!StashCustodyPolicy.TryResolve(metadata, snapshot.VisibleTabType, out var custodyMode))
+        {
+            failure = "Settlement asset has no supported stash custody policy for the visible stash tab.";
             return false;
         }
 
@@ -442,12 +457,13 @@ public sealed class InventoryStashTransferController
         }
             var inventory = inventoryPanel[InventoryIndex.PlayerInventory];
         var visibleStash = stashElement.VisibleStash;
+        var visibleTabType = visibleStash?.InvType.ToString() ?? string.Empty;
         if (!gameController.Window.IsForeground() || !panel.IsVisible || panel.CurrencyPicker.IsVisible ||
             ui.PopUpWindow.IsVisible || !inventoryPanel.IsVisible || !stashElement.IsVisible || inventory is null ||
             visibleStash is null || !visibleStash.IsVisible ||
-            !string.Equals(visibleStash.InvType.ToString(), "CurrencyStash", StringComparison.Ordinal))
+            !StashCustodyPolicy.IsCustodyTabType(visibleTabType))
         {
-            failure = "Transfer requires foreground exchange, inventory, and visible Currency Stash with picker closed.";
+            failure = "Transfer requires foreground exchange, inventory, and a visible Currency or Fragment stash with picker closed.";
             return false;
         }
 
@@ -503,13 +519,13 @@ public sealed class InventoryStashTransferController
             {
                 if (item?.Item?.IsValid != true || !item.Item.TryGetComponent<Stack>(out var stack) || stack.Size <= 0)
                 {
-                    failure = "Visible Currency Stash target amount was unreadable.";
+                    failure = "Visible stash target amount was unreadable.";
                     return false;
                 }
                 var currentMax = stack.Info.MaxStackSize;
                 if (currentMax <= 0)
                 {
-                    failure = "Visible Currency Stash target maximum stack size was unreadable or inconsistent.";
+                    failure = "Visible stash target maximum stack size was unreadable or inconsistent.";
                     return false;
                 }
                 liveMaxStackSizes.Add(currentMax);
@@ -531,7 +547,7 @@ public sealed class InventoryStashTransferController
             var inventoryTarget = evidence.Where(item => item.Metadata == targetMetadata)
                 .Aggregate(0L, (total, item) => checked(total + item.Amount));
             snapshot = new InventoryTransferSnapshot(evidence.OrderBy(item => item.EntityAddress).ToArray(),
-                inventoryTarget, stashTarget, slotWidth, slotHeight, maxStackSize);
+                inventoryTarget, stashTarget, slotWidth, slotHeight, maxStackSize, visibleTabType);
             failure = string.Empty;
             return true;
         }
@@ -647,7 +663,6 @@ public sealed class InventoryStashTransferController
 
         _clickAttempted = true;
         PressKey(Keys.ControlKey);
-        PressKey(Keys.ShiftKey);
         _mouseDown = true;
         Exception? clickFailure = null;
         try
@@ -669,7 +684,6 @@ public sealed class InventoryStashTransferController
             {
                 clickFailure ??= exception;
             }
-            try { ReleaseKey(Keys.ShiftKey); } catch (Exception exception) { clickFailure ??= exception; }
             try { ReleaseKey(Keys.ControlKey); } catch (Exception exception) { clickFailure ??= exception; }
         }
 
@@ -682,8 +696,8 @@ public sealed class InventoryStashTransferController
         _deadline = DateTimeOffset.UtcNow + TransferTimeout;
         State = InventoryStashTransferState.WaitingForTransfer;
         Status = _custodyMode == StashCustodyMode.AffinityAggregate
-            ? "Ctrl+Shift-right-clicked once; waiting for exact affinity movement evidence."
-            : "Ctrl+Shift-right-clicked once; waiting for exact inventory and Currency Stash totals.";
+            ? "Ctrl-right-clicked once; waiting for exact affinity movement evidence."
+            : "Ctrl-right-clicked once; waiting for exact inventory and Currency Stash totals.";
     }
 
     private void VerifyTransfer(GameController gameController)

@@ -32,7 +32,7 @@ public sealed class BankrollStore
             ?? throw new InvalidDataException("Bankroll state was empty.");
         var migrated = schemaVersion is 1 or 2 or 3 or 4 or 5;
         var trackedMigrated = state.TrackedOrder?.SchemaVersion is 1 or 2 or 3 or 4 or 5;
-        var workflowMigrated = state.Workflow?.SchemaVersion == 1;
+        var workflowMigrated = state.Workflow?.SchemaVersion is 1 or 2;
         if (migrated)
         {
             var targetMetadata = root.Value<string>("TargetMetadata");
@@ -70,9 +70,12 @@ public sealed class BankrollStore
         if (workflowMigrated && state.Workflow is { } migratedWorkflow)
         {
             var legacyFingerprint = migratedWorkflow.PlanFingerprint;
-            if (!WorkflowCoordinator.LegacyVersionOneFingerprintMatches(migratedWorkflow))
+            var fingerprintMatches = migratedWorkflow.SchemaVersion == 1
+                ? WorkflowCoordinator.LegacyVersionOneFingerprintMatches(migratedWorkflow)
+                : WorkflowCoordinator.LegacyVersionTwoFingerprintMatches(migratedWorkflow);
+            if (!fingerprintMatches)
             {
-                throw new InvalidDataException("Schema-one workflow failed legacy fingerprint authentication.");
+                throw new InvalidDataException($"Schema-{migratedWorkflow.SchemaVersion} workflow failed legacy fingerprint authentication.");
             }
             if (migratedWorkflow.Phase == WorkflowExecutionPhase.LegActive)
             {
@@ -80,7 +83,7 @@ public sealed class BankrollStore
                     !WorkflowCoordinator.LegacyActiveTrackedMatches(
                         migratedWorkflow, activeTracked, legacyFingerprint))
                 {
-                    throw new InvalidDataException("Schema-one active workflow did not match its tracked order.");
+                    throw new InvalidDataException($"Schema-{migratedWorkflow.SchemaVersion} active workflow did not match its tracked order.");
                 }
                 migratedWorkflow.CurrentProbeSessionId = activeTracked.ProbeSessionId;
             }
@@ -88,9 +91,9 @@ public sealed class BankrollStore
             {
                 migratedWorkflow.CurrentProbeSessionId = migratedWorkflow.OriginProbeSessionId;
             }
-            migratedWorkflow.SchemaVersion = WorkflowExecutionState.CurrentSchemaVersion;
             if (string.IsNullOrWhiteSpace(migratedWorkflow.TerminalChaosMetadata) && migratedWorkflow.Legs.Count > 0)
                 migratedWorkflow.TerminalChaosMetadata = migratedWorkflow.Legs[^1].ToMetadata;
+            WorkflowCoordinator.MigrateLegacySemantics(migratedWorkflow);
             migratedWorkflow.PlanFingerprint = WorkflowCoordinator.ComputeFingerprint(migratedWorkflow);
             if (migratedWorkflow.Phase == WorkflowExecutionPhase.LegActive && state.TrackedOrder is { } migratedActive)
                 migratedActive.CandidateSignature = migratedWorkflow.PlanFingerprint;
@@ -181,6 +184,9 @@ public sealed class BankrollStore
                 throw new InvalidDataException("Workflow league did not match canonical bankroll league.");
             }
             WorkflowCoordinator.Validate(workflow, state.TrackedOrder);
+            if (workflow.Phase == WorkflowExecutionPhase.Completed &&
+                ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(state, state.TrackedOrder, out _))
+                throw new InvalidDataException("Completed workflow still had unsettled canonical custody.");
         }
 
         if (migrated || trackedMigrated || workflowMigrated)
@@ -193,8 +199,9 @@ public sealed class BankrollStore
 
     private static bool IsValidStashTransferIntent(StashTransferIntentState? intent)
     {
-        if (intent is null || !StashCustodyPolicy.TryResolve(intent.Metadata, out var expectedMode) ||
-            intent.StashCustodyMode != expectedMode || intent.Amount <= 0 ||
+        if (intent is null ||
+            !StashCustodyPolicy.IsResolvableCustody(intent.Metadata, intent.StashCustodyMode) ||
+            intent.Amount <= 0 ||
             intent.InventoryAmountBefore != intent.Amount || intent.VisibleStashAmountBefore < 0 ||
             !string.IsNullOrWhiteSpace(intent.Metadata) == false ||
             string.IsNullOrWhiteSpace(intent.NonTargetInventoryFingerprint) ||
@@ -273,6 +280,9 @@ public sealed class BankrollStore
                 throw new InvalidDataException("Workflow league did not match canonical bankroll league.");
             }
             WorkflowCoordinator.Validate(workflow, state.TrackedOrder);
+            if (workflow.Phase == WorkflowExecutionPhase.Completed &&
+                ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(state, state.TrackedOrder, out _))
+                throw new InvalidDataException("Completed workflow still had unsettled canonical custody.");
         }
         ValidateTrackedForSave(state.TrackedOrder, state.League);
         Directory.CreateDirectory(_directory);
@@ -481,28 +491,45 @@ public sealed record WorkflowAuditEvent(
     DateTimeOffset OccurredAtUtc,
     Guid WorkflowId,
     int CompletedLegs,
+    WorkflowClosureMode ClosureMode,
     long PlannedRealizedChaos,
+    long PlannedRestorationChaosSpent,
     long PlannedProfitChaos,
     long? ActualTerminalChaos,
+    long? ActualChaosRealized,
+    long? ActualRestorationChaosSpent,
+    long? ActualRestoredPrincipal,
     long? ActualProfitChaos,
     string Detail)
 {
     public static WorkflowAuditEvent From(WorkflowExecutionState workflow, TrackedOrderState tracked)
     {
-        var actual = workflow.Phase == WorkflowExecutionPhase.Completed
+        var legacyActual = workflow.ClosureMode == WorkflowClosureMode.LegacyTerminalChaos &&
+            workflow.Phase == WorkflowExecutionPhase.Completed
             ? tracked.TerminalReceivedWantedAmount
             : null;
+        var closedCompleted = workflow.ClosureMode == WorkflowClosureMode.ClosedCycle &&
+            workflow.Phase == WorkflowExecutionPhase.Completed;
         return new WorkflowAuditEvent(
-            1,
+            2,
             workflow.Phase == WorkflowExecutionPhase.Completed ? "WorkflowCompleted" : "WorkflowStopped",
             workflow.League,
             workflow.UpdatedAtUtc,
             workflow.WorkflowId,
             workflow.CurrentLegIndex,
+            workflow.ClosureMode,
             workflow.PlannedRealizedChaos,
+            workflow.PlannedRestorationSpendChaos,
             workflow.PlannedProfitChaos,
-            actual,
-            actual is null ? null : actual.Value - workflow.BenchmarkChaos,
+            legacyActual,
+            closedCompleted ? workflow.ActualChaosRealized : null,
+            closedCompleted ? workflow.CumulativeActualRestorationChaosSpent : null,
+            closedCompleted ? workflow.RestoredPrincipal : null,
+            legacyActual is not null
+                ? legacyActual.Value - workflow.BenchmarkChaos
+                : closedCompleted
+                    ? workflow.ActualChaosRealized - workflow.CumulativeActualRestorationChaosSpent
+                    : null,
             workflow.Detail);
     }
 }

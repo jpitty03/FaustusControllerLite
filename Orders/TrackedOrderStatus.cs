@@ -28,21 +28,75 @@ public static class StashCustodyPolicy
     public const string CurrencyPrefix = "Metadata/Items/Currency/";
     public const string ScarabPrefix = "Metadata/Items/Scarabs/";
 
-    public static bool TryResolve(string metadata, out StashCustodyMode mode)
+    public const string CurrencyTabType = "CurrencyStash";
+    public const string FragmentTabType = "FragmentStash";
+
+    /// <summary>
+    /// The stash tab type that ctrl+shift+click sends this asset family to. Custody is provable
+    /// exactly when that home tab is the visible one, and only in aggregate otherwise.
+    /// </summary>
+    public static bool TryResolveHomeTabType(string metadata, out string homeTabType)
     {
-        if (metadata.StartsWith(CurrencyPrefix, StringComparison.Ordinal))
+        if (metadata is not null)
         {
-            mode = StashCustodyMode.VisibleCurrencyStashExact;
-            return true;
+            if (metadata.StartsWith(CurrencyPrefix, StringComparison.Ordinal))
+            {
+                homeTabType = CurrencyTabType;
+                return true;
+            }
+            if (metadata.StartsWith(ScarabPrefix, StringComparison.Ordinal))
+            {
+                homeTabType = FragmentTabType;
+                return true;
+            }
         }
-        if (metadata.StartsWith(ScarabPrefix, StringComparison.Ordinal))
-        {
-            mode = StashCustodyMode.AffinityAggregate;
-            return true;
-        }
-        mode = default;
+        homeTabType = string.Empty;
         return false;
     }
+
+    /// <summary>Tab types whose contents this plugin can read as custody evidence.</summary>
+    public static bool IsCustodyTabType(string tabType) =>
+        string.Equals(tabType, CurrencyTabType, StringComparison.Ordinal) ||
+        string.Equals(tabType, FragmentTabType, StringComparison.Ordinal);
+
+    public static bool IsSupported(string metadata) => TryResolveHomeTabType(metadata, out _);
+
+    /// <summary>
+    /// Resolves custody against the tab that is actually visible. The asset's home tab being
+    /// visible yields <see cref="StashCustodyMode.VisibleCurrencyStashExact"/> (the visible stash
+    /// count must rise by exactly the moved amount); any other custody tab yields
+    /// <see cref="StashCustodyMode.AffinityAggregate"/> (the item leaves via affinity and only
+    /// unchanged aggregate ownership is provable).
+    /// </summary>
+    public static bool TryResolve(string metadata, string visibleTabType, out StashCustodyMode mode)
+    {
+        if (!TryResolveHomeTabType(metadata, out var homeTabType) || !IsCustodyTabType(visibleTabType))
+        {
+            mode = default;
+            return false;
+        }
+        mode = string.Equals(homeTabType, visibleTabType, StringComparison.Ordinal)
+            ? StashCustodyMode.VisibleCurrencyStashExact
+            : StashCustodyMode.AffinityAggregate;
+        return true;
+    }
+
+    /// <summary>
+    /// Legacy resolution that assumes the Currency Stash is visible. Reproduces the original
+    /// currency-exact / scarab-affinity table exactly.
+    /// </summary>
+    public static bool TryResolve(string metadata, out StashCustodyMode mode) =>
+        TryResolve(metadata, CurrencyTabType, out mode);
+
+    /// <summary>
+    /// Whether a persisted intent's recorded custody mode is legitimate for its metadata. The tab
+    /// that was visible at arm time is not persisted, so both modes are reachable for any supported
+    /// asset; the load-bearing check stays at recovery time, where the mode is re-derived from the
+    /// live visible tab and a mismatch forces an ambiguous (safe) classification.
+    /// </summary>
+    public static bool IsResolvableCustody(string metadata, StashCustodyMode mode) =>
+        IsSupported(metadata) &&
+        mode is StashCustodyMode.VisibleCurrencyStashExact or StashCustodyMode.AffinityAggregate;
 }
 
 public sealed class TrackedOrderState

@@ -11,7 +11,14 @@ public sealed record SdkDiagnosticResult(string Report, int IssueCount, string S
 
 public static class SdkDiagnosticProbe
 {
-    public static SdkDiagnosticResult Read(GameController gameController, CurrencyCatalogue? catalogue)
+    public static SdkDiagnosticResult Read(
+        GameController gameController,
+        CurrencyCatalogue? catalogue,
+        IReadOnlyCollection<MarketCapture>? captures = null,
+        Guid sessionId = default,
+        long minimumSaleChaos = 10,
+        TimeSpan maximumQuoteAge = default,
+        SellSweepExecutionMode executionMode = SellSweepExecutionMode.MostCurrency)
     {
         var report = new StringBuilder();
         var issues = new List<string>();
@@ -317,6 +324,144 @@ public static class SdkDiagnosticProbe
                     DumpElement(report, elements[index], "    ", depth: 2);
                 }
             }
+        });
+
+        Section("Sell queue", () =>
+        {
+            var scan = StashTabReader.Read(gameController);
+            report.AppendLine(
+                $"  scan readable={scan.Readable} type={scan.TabType} visible={scan.Visible} " +
+                $"slots={scan.Slots.Count} holdings={scan.Holdings.Count}" +
+                (scan.Readable ? string.Empty : $" failure='{scan.FailureReason}'"));
+            if (!scan.Readable)
+            {
+                return;
+            }
+
+            if (catalogue is null ||
+                !catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) || chaos is null ||
+                !catalogue.TryGetUniqueByName("Divine Orb", out var divine) || divine is null)
+            {
+                report.AppendLine("  numeraire identities unavailable; no queue evaluated");
+                return;
+            }
+
+            var quoteAge = maximumQuoteAge > TimeSpan.Zero ? maximumQuoteAge : TimeSpan.FromSeconds(300);
+            var now = DateTimeOffset.UtcNow;
+            var area = gameController.Game.IngameState.ServerData.InstanceId
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var session = sessionId.ToString("D");
+            var edges = new List<DirectedExchangeEdge>();
+            foreach (var capture in captures ?? Array.Empty<MarketCapture>())
+            {
+                try
+                {
+                    edges.AddRange(MarketCaptureNormalizer.CreateEdges(capture));
+                }
+                catch (Exception exception)
+                {
+                    report.AppendLine(
+                        $"  capture {capture.Pair} normalization failed: {exception.GetType().Name}: {exception.Message}");
+                }
+            }
+
+            report.AppendLine(
+                $"  session={session} area={area} edges={edges.Count} " +
+                $"maxQuoteAge={quoteAge.TotalSeconds:0}s minimumSale={minimumSaleChaos}c " +
+                $"strategy='{SellSweepExecutionModes.ToLabel(executionMode)}' " +
+                $"intent={SellSweepExecutionModes.ToExecutionIntent(executionMode)}");
+            foreach (var pair in edges
+                         .Select(edge => $"{edge.From.Metadata}>{edge.To.Metadata}:{edge.ExecutionIntent}={edge.Rate}")
+                         .Distinct(StringComparer.Ordinal)
+                         .OrderBy(text => text, StringComparer.Ordinal))
+            {
+                report.AppendLine($"  edge {pair}");
+            }
+
+            var benchmarkIntent = SellSweepExecutionModes.ToExecutionIntent(executionMode);
+            var benchmark = edges
+                .Where(edge => edge.From.Equals(divine) && edge.To.Equals(chaos) &&
+                    edge.ExecutionIntent == benchmarkIntent)
+                .OrderByDescending(edge => edge.CapturedAt)
+                .ThenByDescending(edge => edge.Rate)
+                .FirstOrDefault();
+            report.AppendLine(benchmark is null
+                ? $"  divineBenchmark intent={benchmarkIntent} unavailable"
+                : $"  divineBenchmark intent={benchmarkIntent} rate={benchmark.Rate} " +
+                  $"immediateDepth={benchmark.ImmediateInputDepth} capturedAt={benchmark.CapturedAt:O}");
+
+            var accepted = 0;
+            long totalProceedsChaos = 0;
+            foreach (var holding in scan.Holdings.OrderBy(entry => entry.Metadata, StringComparer.Ordinal))
+            {
+                if (!catalogue.TryGetByMetadata(holding.Metadata, out var target) || target is null)
+                {
+                    report.AppendLine(
+                        $"  skip path='{holding.Metadata}' amount={holding.Amount} reason=NotInCatalogue");
+                    continue;
+                }
+
+                if (target.Equals(chaos) || target.Equals(divine))
+                {
+                    report.AppendLine(
+                        $"  skip path='{holding.Metadata}' amount={holding.Amount} reason=NumeraireCurrency");
+                    continue;
+                }
+
+                SellCandidateResult result;
+                try
+                {
+                    result = FaustusSellPlanner.Evaluate(new SellCandidateRequest(
+                        chaos,
+                        divine,
+                        target,
+                        holding.Amount,
+                        edges,
+                        now,
+                        quoteAge,
+                        session,
+                        area,
+                        minimumSaleChaos,
+                        executionMode));
+                }
+                catch (Exception exception)
+                {
+                    report.AppendLine(
+                        $"  skip path='{holding.Metadata}' amount={holding.Amount} " +
+                        $"reason={exception.GetType().Name}: {exception.Message}");
+                    continue;
+                }
+
+                if (result.Best is { } best)
+                {
+                    accepted++;
+                    totalProceedsChaos = checked(totalProceedsChaos + best.ProceedsChaos);
+                    report.AppendLine(
+                        $"  sell '{target.Name}' amount={holding.Amount} slots={holding.SlotCount} " +
+                        $"unreadable={holding.UnreadableSlots} market={best.Signature} lots={best.Lots} " +
+                        $"spend={best.InputSpent} receive={best.Output} remainder={best.InputRemainder} " +
+                        $"proceedsChaos={best.ProceedsChaos}");
+                }
+                else
+                {
+                    report.AppendLine(
+                        $"  skip '{target.Name}' amount={holding.Amount} slots={holding.SlotCount} " +
+                        $"reason={result.RejectionReason} detail='{result.Detail}'");
+                }
+
+                foreach (var evaluation in result.Evaluations)
+                {
+                    report.AppendLine(evaluation.Quote is { } quote
+                        ? $"    candidate {quote.Signature} lots={quote.Lots} spend={quote.InputSpent} " +
+                          $"receive={quote.Output} remainder={quote.InputRemainder} proceedsChaos={quote.ProceedsChaos}"
+                        : $"    candidate proceeds='{evaluation.Proceeds.Name}' rejected={evaluation.RejectionReason} " +
+                          $"detail='{evaluation.Detail}'");
+                }
+            }
+
+            report.AppendLine(
+                $"  queue accepted={accepted} of {scan.Holdings.Count} holdings, " +
+                $"totalProceedsChaos={totalProceedsChaos}");
         });
 
         return new SdkDiagnosticResult(
