@@ -27,6 +27,12 @@ public sealed class FaustusControllerLiteSettings : ISettings
     [Category("Market")]
     public ListNode TargetCurrency { get; set; } = new() { Value = "Orb of Alteration" };
 
+    [Category("Calibration Wizard")]
+    public HotkeyNodeV2 CalibrationWizardStartHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Calibration Wizard")]
+    public HotkeyNodeV2 CalibrationWizardNextHotkey { get; set; } = CreateUnboundHotkey();
+
     [IgnoreMenu]
     public string TargetCurrencyMetadata { get; set; } = "Metadata/Items/Currency/CurrencyRerollMagic";
 
@@ -139,21 +145,6 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 ProbeMarketsHotkey { get; set; } = CreateUnboundHotkey();
-
-    [Category("Hotkeys")]
-    public HotkeyNodeV2 CalibratePickerButtonHotkey { get; set; } = CreateUnboundHotkey();
-
-    [Category("Hotkeys")]
-    public HotkeyNodeV2 CalibratePlaceOrderHotkey { get; set; } = CreateUnboundHotkey();
-
-    [Category("Hotkeys")]
-    public HotkeyNodeV2 CalibrateCollectionHotkey { get; set; } = CreateUnboundHotkey();
-
-    [Category("Hotkeys")]
-    public HotkeyNodeV2 CalibrateCancelHotkey { get; set; } = CreateUnboundHotkey();
-
-    [Category("Hotkeys")]
-    public HotkeyNodeV2 CalibrateReturnSlotHotkey { get; set; } = CreateUnboundHotkey();
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 CaptureCurrentPairHotkey { get; set; } = CreateUnboundHotkey();

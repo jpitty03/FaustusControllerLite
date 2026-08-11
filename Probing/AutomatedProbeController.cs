@@ -183,7 +183,15 @@ public sealed class AutomatedProbeController
 
         return StartPlans(
             gameController, plans, calibration, permissions, conflictingControllerEnabled, cursorSpeed,
-            selectionOnly: false, requestedSessionId: sessionId, forceOfferedPickerOpen: false, out failure);
+            selectionOnly: false, requestedSessionId: sessionId,
+            forceOfferedPickerOpen: RequiresOfferedOwnershipRefresh(plans), out failure);
+    }
+
+    public static bool RequiresOfferedOwnershipRefresh(IReadOnlyCollection<ProbeMarketPlan> plans)
+    {
+        ArgumentNullException.ThrowIfNull(plans);
+        return plans.Count > 0 && plans.Select(plan => plan.Offered.Metadata)
+            .Distinct(StringComparer.Ordinal).Count() == 1;
     }
 
     public static IReadOnlyList<ProbeMarketPlan> CreateThreeMarketPlans(
@@ -930,6 +938,12 @@ public sealed class AutomatedProbeController
             return;
         }
 
+        if (!_selectingWanted)
+        {
+            // A same-offered batch only needs one forced opening to refresh all "I have" counts.
+            _forceOfferedPickerOpen = false;
+        }
+
         CompleteSideSelection(gameController, calibration, now, cursorSpeed);
     }
 
@@ -964,6 +978,14 @@ public sealed class AutomatedProbeController
         if (!CurrentMarketReader.TryCapture(gameController, _sessionId, out var capture, out var failure) ||
             capture is null)
         {
+            if (CurrentMarketReader.IsTransientBookTransition(failure))
+            {
+                _stableSamples.Reset();
+                Status = $"Pair {_pairIndex + 1}/{_plans.Count}: waiting for selected rate and immediate book head to agree.";
+                _nextActionAt = now + SampleInterval;
+                return;
+            }
+
             CancelForFreshProbe(failure);
             return;
         }

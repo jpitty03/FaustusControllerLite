@@ -51,6 +51,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private string _diagnosticPath = string.Empty;
     private string _pickerCalibrationPath = string.Empty;
     private PickerCalibration _pickerCalibration = new();
+    private CalibrationWizardState _calibrationWizard = CalibrationWizardState.Inactive;
     private CalibrationObservation? _calibrationObservation;
     private bool _latestRateCacheAvailable = true;
     private string _observedTargetLabel = string.Empty;
@@ -158,7 +159,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         float PanelHeight,
         string League,
         int AreaInstanceId,
-        DateTimeOffset Deadline);
+        DateTimeOffset Deadline,
+        bool? ExpectedWantedSide);
 
     public override bool Initialise()
     {
@@ -243,72 +245,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         ObservePickerCalibration();
         PollTrackedOrderLifecycle();
 
-        if (Settings.CalibratePickerButtonHotkey.PressedOnce())
+        var wizardHotkeyHandled = HandleCalibrationWizardHotkeys();
+        if (!wizardHotkeyHandled)
         {
-            if (TryGetHotkeyConflict(out var conflict))
+            if (Settings.CaptureCurrentPairHotkey.PressedOnce())
             {
-                _lastFailure = conflict;
-            }
-            else if (IsCollectionFlowActive())
-            {
-                AbortCollectionFlow("Picker calibration interrupted tracked-order collection.");
-            }
-            else if (IsPlacementFlowActive())
-            {
-                AbortPlacementFlow("Calibration hotkey interrupted placement preparation.");
-            }
-            else if (_singleLegStaging.IsRunning)
-            {
-                _singleLegStaging.Cancel("Calibration hotkey interrupted single-leg staging.");
-            }
-            else if (_automatedProbe.IsRunning)
-            {
-                _automatedProbe.Cancel("Calibration hotkey interrupted the automated probe.");
-            }
-            else
-            {
-                ArmPickerCalibration();
-            }
-        }
-
-        if (Settings.CalibratePlaceOrderHotkey.PressedOnce())
-        {
-            if (TryGetHotkeyConflict(out var conflict))
-            {
-                _lastFailure = conflict;
-            }
-            else if (IsCollectionFlowActive())
-            {
-                AbortCollectionFlow("Place Order calibration interrupted tracked-order collection.");
-            }
-            else if (IsPlacementFlowActive())
-            {
-                AbortPlacementFlow("Place Order calibration interrupted placement preparation.");
-            }
-            else if (_automatedProbe.IsRunning || _singleLegStaging.IsRunning || _singleLegPlacement.IsRunning)
-            {
-                _lastFailure = "Place Order calibration is blocked while another input operation is active.";
-            }
-            else
-            {
-                CalibratePlaceOrderTarget();
-            }
-        }
-        if (Settings.CalibrateCollectionHotkey.PressedOnce())
-        {
-            CalibrateTrackedCollectionSlot();
-        }
-        if (Settings.CalibrateCancelHotkey.PressedOnce())
-        {
-            CalibrateTrackedCancelButton();
-        }
-        if (Settings.CalibrateReturnSlotHotkey.PressedOnce())
-        {
-            CalibrateCanceledReturnSlot();
-        }
-
-        if (Settings.CaptureCurrentPairHotkey.PressedOnce())
-        {
             if (IsCollectionFlowActive())
             {
                 AbortCollectionFlow("Manual capture interrupted tracked-order collection.");
@@ -329,15 +270,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 CaptureCurrentPair();
             }
-        }
+            }
 
-        if (Settings.DumpSdkReadsHotkey.PressedOnce())
-        {
-            DumpSdkReads();
-        }
+            if (Settings.DumpSdkReadsHotkey.PressedOnce())
+            {
+                DumpSdkReads();
+            }
 
-        if (Settings.ProbeMarketsHotkey.PressedOnce())
-        {
+            if (Settings.ProbeMarketsHotkey.PressedOnce())
+            {
             if (IsPlacementFlowActive())
             {
                 AbortPlacementFlow("Probe hotkey interrupted placement preparation.");
@@ -354,10 +295,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 StartAutomatedProbe();
             }
-        }
+            }
 
-        if (Settings.ExecuteSingleLegHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
+            if (Settings.ExecuteSingleLegHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
             if (IsPlacementFlowActive())
             {
                 AbortPlacementFlow("Staging hotkey interrupted placement preparation.");
@@ -370,37 +311,38 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 StartSingleLegStaging();
             }
-        }
+            }
 
 
-        if (Settings.PlaceStagedLegHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
-            HandlePlaceStagedLegHotkey();
-        }
-        if (Settings.CollectTrackedOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
-            HandleCollectTrackedOrderHotkey();
-        }
-        if (Settings.StashCollectedCurrencyHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
-            HandleStashCollectedCurrencyHotkey();
-        }
-        if (Settings.CancelTimedOutOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
-            HandleCancelTimedOutOrderHotkey();
-        }
-        if (Settings.AdoptPendingOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
-            AdoptUniquePendingOrderForLifecycle();
-        }
+            if (Settings.PlaceStagedLegHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
+                HandlePlaceStagedLegHotkey();
+            }
+            if (Settings.CollectTrackedOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
+                HandleCollectTrackedOrderHotkey();
+            }
+            if (Settings.StashCollectedCurrencyHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
+                HandleStashCollectedCurrencyHotkey();
+            }
+            if (Settings.CancelTimedOutOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
+                HandleCancelTimedOutOrderHotkey();
+            }
+            if (Settings.AdoptPendingOrderHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
+                AdoptUniquePendingOrderForLifecycle();
+            }
 
-        if (Settings.FullWorkflowHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
-        {
-            HandleFullWorkflowHotkey();
-        }
-        if (Settings.SellSweepHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.SellSweep))
-        {
-            HandleSellSweepHotkey();
+            if (Settings.FullWorkflowHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.Arbitrage))
+            {
+                HandleFullWorkflowHotkey();
+            }
+            if (Settings.SellSweepHotkey.PressedOnce() && !RefusesFeatureScope(FeatureActionScope.SellSweep))
+            {
+                HandleSellSweepHotkey();
+            }
         }
         ValidateWorkflowAuthorizationBeforeInput();
         ValidateSweepAuthorizationBeforeInput();
@@ -562,6 +504,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         ClearSweepPreparation();
         _lastObservedStagingState = _singleLegStaging.State;
         _calibrationObservation = null;
+        _calibrationWizard = CalibrationWizardState.Inactive;
         _manualProbeSessionId = Guid.NewGuid();
         _liveOwnedByMetadata.Clear();
         _selectedCandidate = null;
@@ -630,6 +573,39 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             $"cancel={Ready(_pickerCalibration.IsCancellationComplete)}, " +
             $"return={Ready(_pickerCalibration.IsReturnCollectionComplete)}",
             ref y, allCalibrated ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
+        if (CalibrationWizard.IsVisible(_calibrationWizard))
+        {
+            var step = _calibrationWizard.Step;
+            var wizardColor = step == CalibrationWizardStep.Complete
+                ? SharpDX.Color.LimeGreen
+                : SharpDX.Color.Cyan;
+            var remainingWanted = _trackedOrderState is null
+                ? 0
+                : TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState);
+            var remainingReturn = _trackedOrderState is null
+                ? 0
+                : TrackedOrderLifecycle.RemainingReturnToCollect(_trackedOrderState);
+            DrawStatus(
+                $"CALIBRATION WIZARD - Step {CalibrationWizard.StepNumber(step)}/{CalibrationWizard.CalibrationStepCount}: {step}",
+                ref y,
+                wizardColor);
+            DrawStatus(
+                $"Instruction: {CalibrationWizard.Instruction(step, _calibrationObservation?.ExpectedWantedSide is not null)}",
+                ref y,
+                SharpDX.Color.White);
+            DrawStatus(
+                $"Prerequisite: {CalibrationWizard.Prerequisite(step, _trackedOrderState?.Status, remainingWanted, remainingReturn)}",
+                ref y,
+                SharpDX.Color.Yellow);
+            DrawStatus(
+                $"Confirmation: {EmptyAsNone(_calibrationWizard.LatestConfirmation)}",
+                ref y,
+                string.IsNullOrEmpty(_calibrationWizard.LatestConfirmation) ? SharpDX.Color.Gray : SharpDX.Color.LimeGreen);
+            DrawStatus(
+                $"Wizard error: {EmptyAsNone(_calibrationWizard.LatestError)}",
+                ref y,
+                string.IsNullOrEmpty(_calibrationWizard.LatestError) ? SharpDX.Color.Gray : SharpDX.Color.OrangeRed);
+        }
         if (_freshStateResetArmed)
             DrawStatus("Fresh-state reset armed; apply within 10 seconds.", ref y, SharpDX.Color.OrangeRed);
         if (_forcedResetArmed)
@@ -640,6 +616,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         static string Ready(bool ready) => ready ? "ready" : "missing";
+        static string EmptyAsNone(string value) => string.IsNullOrEmpty(value) ? "None" : value;
 
         void DrawStatus(string text, ref float currentY, SharpDX.Color color)
         {
@@ -911,6 +888,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 "fresh state reset before planning another sweep.";
             return;
         }
+        if (CalibrationWizard.IsBlocking(_calibrationWizard))
+        {
+            RefuseWizardBlockedStart("Sell sweep start");
+            return;
+        }
 
         var permissions = PermissionSnapshot.From(Settings);
         if (_activeFeature != FeatureMode.SellSweep || !permissions.ReadyForSellSweep ||
@@ -953,6 +935,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         sweep = null;
         var permissions = PermissionSnapshot.From(Settings);
+        if (CalibrationWizard.IsBlocking(_calibrationWizard))
+        {
+            failure = "Sell sweep planning is blocked while a calibration wizard step is active.";
+            return false;
+        }
         if (_activeFeature != FeatureMode.SellSweep || !permissions.ReadyForSellSweep ||
             _fullWorkflowAuthorized || IsAnyInputOperationActive() ||
             _bankrollLoadBlocked || _trackedOrderLoadBlocked || !_bankroll.IsInitialized ||
@@ -1132,10 +1119,113 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             $"{sweep.RealizedProceedsChaos}c realized. {sweep.Detail}";
     }
 
-    private void ArmPickerCalibration()
+    private bool HandleCalibrationWizardHotkeys()
+    {
+        var startPressed = Settings.CalibrationWizardStartHotkey.PressedOnce();
+        var nextPressed = Settings.CalibrationWizardNextHotkey.PressedOnce();
+        if (!startPressed && !nextPressed)
+        {
+            return false;
+        }
+
+        if (TryGetHotkeyConflict(out var conflict))
+        {
+            _lastFailure = conflict;
+            if (CalibrationWizard.IsVisible(_calibrationWizard))
+                _calibrationWizard = CalibrationWizard.Fail(_calibrationWizard, conflict);
+            return true;
+        }
+
+        if (startPressed)
+        {
+            var canceledPickerObservation = _calibrationObservation is not null;
+            _calibrationObservation = null;
+            if (_fullWorkflowAuthorized || _sweepAuthorized || IsAnyInputOperationActive())
+            {
+                _lastFailure =
+                    "Calibration wizard start/restart requires no workflow or sweep authorization and no active input operation.";
+                if (CalibrationWizard.IsVisible(_calibrationWizard))
+                    _calibrationWizard = CalibrationWizard.Fail(_calibrationWizard, _lastFailure);
+                return true;
+            }
+
+            _calibrationWizard = CalibrationWizard.StartOrRestart();
+            if (canceledPickerObservation)
+            {
+                _calibrationWizard = _calibrationWizard with
+                {
+                    LatestConfirmation =
+                        "Calibration wizard restarted at the wanted picker; the prior picker observation was canceled."
+                };
+            }
+            _operationStatus = _calibrationWizard.LatestConfirmation;
+            _lastFailure = "None";
+            return true;
+        }
+
+        HandleCalibrationWizardNext();
+        return true;
+    }
+
+    private void HandleCalibrationWizardNext()
+    {
+        switch (_calibrationWizard.Step)
+        {
+            case CalibrationWizardStep.Inactive:
+                _operationStatus = CalibrationWizard.Instruction(CalibrationWizardStep.Inactive);
+                _lastFailure = "None";
+                return;
+            case CalibrationWizardStep.Complete:
+                _operationStatus = CalibrationWizard.Instruction(CalibrationWizardStep.Complete);
+                _lastFailure = "None";
+                return;
+            case CalibrationWizardStep.WantedPicker:
+                ArmPickerCalibration(expectedWantedSide: true);
+                break;
+            case CalibrationWizardStep.OfferedPicker:
+                ArmPickerCalibration(expectedWantedSide: false);
+                break;
+            case CalibrationWizardStep.PlaceOrderButton:
+                if (CalibratePlaceOrderTarget()) AdvanceCalibrationWizard();
+                break;
+            case CalibrationWizardStep.TrackedCollectionSlot:
+                if (CalibrateTrackedCollectionSlot()) AdvanceCalibrationWizard();
+                break;
+            case CalibrationWizardStep.TrackedCancelButton:
+                if (CalibrateTrackedCancelButton()) AdvanceCalibrationWizard();
+                break;
+            case CalibrationWizardStep.CanceledReturnSlot:
+                if (CalibrateCanceledReturnSlot()) AdvanceCalibrationWizard();
+                break;
+        }
+
+        if (_lastFailure != "None")
+            _calibrationWizard = CalibrationWizard.Fail(_calibrationWizard, _lastFailure);
+    }
+
+    private void AdvanceCalibrationWizard()
+    {
+        var confirmation = _operationStatus;
+        _calibrationWizard = CalibrationWizard.Succeed(_calibrationWizard, confirmation);
+        _operationStatus = _calibrationWizard.Step == CalibrationWizardStep.Complete
+            ? "Calibration wizard complete: all six targets persisted. Collect and stash any calibration test order before production automation."
+            : confirmation;
+    }
+
+    private void RefuseWizardBlockedStart(string action)
+    {
+        _lastFailure = $"{action} is blocked while a calibration wizard step is active; finish all six steps or change area first.";
+    }
+
+    private void ArmPickerCalibration(bool? expectedWantedSide = null)
     {
         try
         {
+            if (_calibrationObservation is not null)
+            {
+                _lastFailure = "Picker calibration observation is already armed; manually click or wait for it to expire.";
+                return;
+            }
             var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
             var cursor = ExileInput.MousePositionNum;
             var rect = panel.GetClientRectCache;
@@ -1158,8 +1248,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 rect.Height,
                 GetCurrentLeague(),
                 GameController.Game.IngameState.ServerData.InstanceId,
-                DateTimeOffset.UtcNow.AddSeconds(5));
-            _operationStatus = "Calibration armed: manually click the picker button under the cursor within 5 seconds.";
+                DateTimeOffset.UtcNow.AddSeconds(5),
+                expectedWantedSide);
+            _operationStatus = expectedWantedSide is { } wantedSide
+                ? $"Wizard observation armed: manually click the {(wantedSide ? "wanted" : "offered")} picker without moving within 5 seconds."
+                : "Calibration armed: manually click the picker button under the cursor within 5 seconds.";
             _lastFailure = "None";
         }
         catch (Exception exception)
@@ -1190,12 +1283,24 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _calibrationObservation = null;
                 _lastFailure = "Picker calibration observation expired or lost its live UI context.";
+                if (observation.ExpectedWantedSide is not null)
+                    _calibrationWizard = CalibrationWizard.Fail(_calibrationWizard, _lastFailure);
                 return;
             }
 
             var picker = panel.CurrencyPicker;
             if (!picker.IsVisible)
             {
+                return;
+            }
+
+            var openedWantedSide = picker.IsPickingWantedCurrency;
+            if (observation.ExpectedWantedSide is not null &&
+                !CalibrationWizard.PickerSideMatches(_calibrationWizard.Step, openedWantedSide))
+            {
+                _calibrationObservation = null;
+                _lastFailure = $"Wrong picker side opened: expected {(observation.ExpectedWantedSide.Value ? "wanted" : "offered")}, observed {(openedWantedSide ? "wanted" : "offered")}. Close it and retry this step.";
+                _calibrationWizard = CalibrationWizard.Fail(_calibrationWizard, _lastFailure);
                 return;
             }
 
@@ -1238,11 +1343,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _calibrationObservation = null;
             _operationStatus = $"Recorded normalized {(picker.IsPickingWantedCurrency ? "wanted" : "offered")} picker button calibration.";
             _lastFailure = "None";
+            if (observation.ExpectedWantedSide is not null)
+                AdvanceCalibrationWizard();
         }
         catch (Exception exception)
         {
             _calibrationObservation = null;
             _lastFailure = $"Picker calibration failed: {exception.Message}";
+            if (CalibrationWizard.IsVisible(_calibrationWizard))
+                _calibrationWizard = CalibrationWizard.Fail(_calibrationWizard, _lastFailure);
         }
     }
 
@@ -1271,6 +1380,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         Guid? requestedSessionId,
         out string failure)
     {
+        if (CalibrationWizard.IsBlocking(_calibrationWizard))
+        {
+            failure = "Automated probing is blocked while a calibration wizard step is active.";
+            return false;
+        }
         if (_trackedCancellation.IsRunning)
         {
             failure = "Automated probing is blocked while cancellation is active.";
@@ -2113,7 +2227,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
             if (classification != WorkflowPreparationResult.Accepted || candidate is null)
             {
-                _lastFailure = $"Fresh three-market probe could not produce an accepted full-workflow candidate: {_lastCandidate}";
+                _lastFailure = $"Fresh required-market probe could not produce an accepted full-workflow candidate: {_lastCandidate}";
                 return WorkflowPreparationResult.Failed;
             }
             if (!TryValidateWorkflowInventoryCapacity(
@@ -2465,6 +2579,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void StartSingleLegStaging(bool placementWorkflowArmed = false)
     {
+        if (CalibrationWizard.IsBlocking(_calibrationWizard))
+        {
+            RefuseWizardBlockedStart("Single-leg staging");
+            return;
+        }
         if (_trackedCancellation.IsRunning)
         {
             _lastFailure = "Staging is blocked while cancellation is active.";
@@ -2750,6 +2869,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void HandlePlaceStagedLegHotkey()
     {
+        if (CalibrationWizard.IsBlocking(_calibrationWizard))
+        {
+            RefuseWizardBlockedStart("Order placement");
+            return;
+        }
         if (_trackedCancellation.IsRunning)
         {
             _lastFailure = "Placement is blocked while cancellation is active.";
@@ -2815,6 +2939,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_fullWorkflowAuthorized)
         {
             StopFullWorkflowLocal("Second workflow hotkey stopped local automation; any server-side order remains tracked.");
+            return;
+        }
+        if (CalibrationWizard.IsBlocking(_calibrationWizard))
+        {
+            RefuseWizardBlockedStart("Full workflow start");
             return;
         }
         if (TryGetHotkeyConflict(out var conflict))
@@ -3983,19 +4112,27 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _lastFailure = "None";
     }
 
-    private void CalibrateTrackedCollectionSlot()
+    private bool CalibrateTrackedCollectionSlot()
     {
         if (TryGetHotkeyConflict(out var conflict))
         {
             _lastFailure = conflict;
-            return;
+            return false;
         }
         if (_collectionFlow != CollectionFlowState.Idle || _trackedCollection.IsRunning ||
             _automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _singleLegStaging.IsRunning ||
             _singleLegPlacement.IsRunning || _placementPreparation != PlacementPreparationState.Idle)
         {
             _lastFailure = "Collection calibration is blocked while another input operation is active.";
-            return;
+            return false;
+        }
+        var collectionEligibility = CalibrationWizard.CollectionEligibility(
+            _trackedOrderState?.Status,
+            _trackedOrderState is null ? 0 : TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState));
+        if (!collectionEligibility.Eligible)
+        {
+            _lastFailure = collectionEligibility.Guidance;
+            return false;
         }
         var ui = GameController.Game.IngameState.IngameUi;
         var failure = string.Empty;
@@ -4005,14 +4142,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ExileInput.IsKeyDown(Keys.ShiftKey) || ExileInput.IsKeyDown(Keys.Menu))
         {
             _lastFailure = "Collection calibration requires foreground exchange, stash, inventory, closed picker, and released modifiers.";
-            return;
+            return false;
         }
         if (_trackedOrderState is null ||
             !TrackedOrderCollectionController.TryResolveTrackedRow(
                 GameController, _trackedOrderState, out var row, out _, out failure) || row is null)
         {
             _lastFailure = _trackedOrderState is null ? "No tracked order is available for collection calibration." : failure;
-            return;
+            return false;
         }
 
         var cursor = ExileInput.MousePositionNum;
@@ -4041,13 +4178,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             collectionControl is null)
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
         if (!candidate.TryRecordCollectionSlot(
                 rect.X, rect.Y, rect.Width, rect.Height, collectionControl, out failure))
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
 
         try
@@ -4056,10 +4193,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _pickerCalibration = candidate;
             _operationStatus = $"Recorded collection slot offset for exact tracked order {_trackedOrderState.PlayerOrderId}.";
             _lastFailure = "None";
+            return true;
         }
         catch (Exception exception)
         {
             _lastFailure = $"Collection calibration persistence failed: {exception.Message}";
+            return false;
         }
     }
 
@@ -4226,23 +4365,27 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
-    private void CalibrateTrackedCancelButton()
+    private bool CalibrateTrackedCancelButton()
     {
         if (TryGetHotkeyConflict(out var conflict))
         {
             _lastFailure = conflict;
-            return;
+            return false;
         }
-        if (_trackedOrderState?.Status != TrackedOrderStatus.TimedOut || IsAnyInputOperationActive())
+        var cancelEligibility = CalibrationWizard.CancelEligibility(_trackedOrderState?.Status);
+        if (!cancelEligibility.Eligible || IsAnyInputOperationActive())
         {
-            _lastFailure = "Cancel calibration requires exact canonical TimedOut state and no active input operation.";
-            return;
+            _lastFailure = !cancelEligibility.Eligible
+                ? cancelEligibility.Guidance
+                : "Cancel calibration requires no active input operation.";
+            return false;
         }
+        var tracked = _trackedOrderState!;
         if (!TrackedOrderCancellationController.TryResolvePendingRow(
-                GameController, _trackedOrderState, out var row, out _, out _, out var failure) || row is null)
+                GameController, tracked, out var row, out _, out _, out var failure) || row is null)
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
         var ui = GameController.Game.IngameState.IngameUi;
         if (!GameController.Window.IsForeground() || ui.PopUpWindow.IsVisible ||
@@ -4250,7 +4393,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ExileInput.IsKeyDown(Keys.ControlKey) || ExileInput.IsKeyDown(Keys.ShiftKey) || ExileInput.IsKeyDown(Keys.Menu))
         {
             _lastFailure = "Cancel calibration requires foreground exchange, stash, inventory, no popup, and released modifiers.";
-            return;
+            return false;
         }
 
         var candidate = ClonePickerCalibration();
@@ -4260,13 +4403,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 row, cursor, out var control, out failure) || control is null)
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
         if (!candidate.TryRecordCancelButton(
                 rect.X, rect.Y, rect.Width, rect.Height, control, out failure))
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
         try
         {
@@ -4274,31 +4417,39 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _pickerCalibration = candidate;
             _operationStatus = "Recorded exact pending-row cancel X calibration; no click occurred.";
             _lastFailure = "None";
+            return true;
         }
         catch (Exception exception)
         {
             _lastFailure = $"Cancel calibration persistence failed: {exception.Message}";
+            return false;
         }
     }
 
-    private void CalibrateCanceledReturnSlot()
+    private bool CalibrateCanceledReturnSlot()
     {
         if (TryGetHotkeyConflict(out var conflict))
         {
             _lastFailure = conflict;
-            return;
+            return false;
         }
         var failure = string.Empty;
-        if (_trackedOrderState?.Status is not TrackedOrderStatus.CanceledUncollected and
-                not TrackedOrderStatus.CompletedUncollected || IsAnyInputOperationActive() ||
-            _trackedOrderState.TerminalRemainingOfferedAmount is not > 0 ||
-            !CanceledReturnCollectionController.TryResolveTerminalAssetRow(
-                GameController, _trackedOrderState, out var row, out _, out failure) || row is null)
+        var returnEligibility = CalibrationWizard.ReturnEligibility(
+            _trackedOrderState?.Status,
+            _trackedOrderState is null ? 0 : TrackedOrderLifecycle.RemainingReturnToCollect(_trackedOrderState));
+        if (!returnEligibility.Eligible || IsAnyInputOperationActive())
         {
-            _lastFailure = string.IsNullOrEmpty(failure)
-                ? "Return calibration requires exact terminal row with offered return and no active input operation."
-                : failure;
-            return;
+            _lastFailure = !returnEligibility.Eligible
+                ? returnEligibility.Guidance
+                : "Return calibration requires no active input operation.";
+            return false;
+        }
+        var tracked = _trackedOrderState!;
+        if (!CanceledReturnCollectionController.TryResolveTerminalAssetRow(
+                GameController, tracked, out var row, out _, out failure) || row is null)
+        {
+            _lastFailure = failure;
+            return false;
         }
         var candidate = ClonePickerCalibration();
         var rect = row.GetClientRectCache;
@@ -4307,24 +4458,26 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 row, cursor, wantedSlot: false, out var returnControl, out failure) || returnControl is null)
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
         if (!candidate.TryRecordReturnSlot(
                 rect.X, rect.Y, rect.Width, rect.Height, returnControl, out failure))
         {
             _lastFailure = failure;
-            return;
+            return false;
         }
         try
         {
             _pickerCalibrationStore.Save(_pickerCalibrationPath, candidate);
             _pickerCalibration = candidate;
-            _operationStatus = "Recorded canceled offered-return slot calibration; no click occurred.";
+            _operationStatus = "Recorded terminal offered-return slot calibration; no click occurred.";
             _lastFailure = "None";
+            return true;
         }
         catch (Exception exception)
         {
             _lastFailure = $"Return-slot calibration persistence failed: {exception.Message}";
+            return false;
         }
     }
 
@@ -4449,6 +4602,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         var now = DateTimeOffset.UtcNow;
+        var acceleratedCancelTest =
+            CalibrationWizard.UsesAcceleratedCancelTimeout(_calibrationWizard) &&
+            !order.IsCompleted && !order.IsCanceled;
+        var waitStartedAtUtc = acceleratedCancelTest ? now : order.CreationDate;
+        var waitUntilUtc = acceleratedCancelTest
+            ? now.Add(CalibrationWizard.CancelTestTimeout)
+            : order.CreationDate.AddMinutes(Settings.CompetingOrderWaitMinutes.Value);
         var tracked = new TrackedOrderState
         {
             League = GetCurrentLeague(),
@@ -4470,13 +4630,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             BaselineOrderIds = orders.Where(candidate => candidate.PlayerOrderId != order.PlayerOrderId)
                 .Select(candidate => candidate.PlayerOrderId).Order().ToList(),
             Detail = workflowLeg is null
-                ? "Explicit read-only adoption of one unique existing order for lifecycle validation."
+                ? acceleratedCancelTest
+                    ? "Explicit read-only adoption of one unique calibration order with a five-second cancel-test timeout."
+                    : "Explicit read-only adoption of one unique existing order for lifecycle validation."
                 : $"Explicit read-only adoption of exact persisted workflow leg {workflowLeg.Index + 1}.",
             OrderCreationDateUtc = order.CreationDate,
             PlacedOfferedRatioPart = order.OfferedRatioPart,
             PlacedWantedRatioPart = order.WantedRatioPart,
-            WaitStartedAtUtc = order.CreationDate,
-            WaitUntilUtc = order.CreationDate.AddMinutes(Settings.CompetingOrderWaitMinutes.Value),
+            WaitStartedAtUtc = waitStartedAtUtc,
+            WaitUntilUtc = waitUntilUtc,
             LastObservedAtUtc = now,
             LastRemainingOfferedAmount = order.RemainingOfferedAmount,
             LastReceivedWantedAmount = order.ReceivedWantedAmount
@@ -4559,7 +4721,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 return;
             }
             _operationStatus = tracked.Status == TrackedOrderStatus.Pending
-                ? "Adopted exact pending order without input; lifecycle polling will use its captured deadline."
+                ? acceleratedCancelTest
+                    ? "Adopted exact calibration order without input; it will become TimedOut five seconds after adoption."
+                    : "Adopted exact pending order without input; lifecycle polling will use its captured deadline."
                 : "Adopted exact terminal order without input; terminal assets await deterministic collection.";
             _lastFailure = "None";
             _nextLifecyclePollAtUtc = DateTimeOffset.MinValue;
@@ -5479,11 +5643,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         var bindings = new[]
         {
-            Binding(nameof(Settings.CalibratePickerButtonHotkey), Settings.CalibratePickerButtonHotkey),
-            Binding(nameof(Settings.CalibratePlaceOrderHotkey), Settings.CalibratePlaceOrderHotkey),
-            Binding(nameof(Settings.CalibrateCollectionHotkey), Settings.CalibrateCollectionHotkey),
-            Binding(nameof(Settings.CalibrateCancelHotkey), Settings.CalibrateCancelHotkey),
-            Binding(nameof(Settings.CalibrateReturnSlotHotkey), Settings.CalibrateReturnSlotHotkey),
+            Binding(nameof(Settings.CalibrationWizardStartHotkey), Settings.CalibrationWizardStartHotkey),
+            Binding(nameof(Settings.CalibrationWizardNextHotkey), Settings.CalibrationWizardNextHotkey),
             Binding(nameof(Settings.ProbeMarketsHotkey), Settings.ProbeMarketsHotkey),
             Binding(nameof(Settings.CaptureCurrentPairHotkey), Settings.CaptureCurrentPairHotkey),
             Binding(nameof(Settings.DumpSdkReadsHotkey), Settings.DumpSdkReadsHotkey),
@@ -5511,10 +5672,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         static (string Name, string Signature, bool Active) Binding(
             string name,
-            ExileCore.Shared.Nodes.HotkeyNodeV2 node)
+            ExileCore.Shared.Nodes.HotkeyNodeV2 node,
+            bool enabled = true)
         {
             var value = node.Value;
-            var active = value.Key != Keys.None || !string.Equals(value.ControllerKey.ToString(), "None", StringComparison.Ordinal);
+            var active = enabled && (value.Key != Keys.None ||
+                !string.Equals(value.ControllerKey.ToString(), "None", StringComparison.Ordinal));
             return (name,
                 $"key={value.Key};win={value.Win};controller={value.ControllerKey};modifier={value.ControllerModifierKey}",
                 active);
@@ -5580,7 +5743,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         $"offered={(_pickerCalibration.OfferedButton?.IsValid == true ? "ready" : "missing")}, " +
         $"wanted={(_pickerCalibration.WantedButton?.IsValid == true ? "ready" : "missing")}";
 
-    private void CalibratePlaceOrderTarget()
+    private bool CalibratePlaceOrderTarget()
     {
         try
         {
@@ -5595,7 +5758,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 ExileInput.IsKeyDown(Keys.Menu))
             {
                 _lastFailure = "Place Order calibration requires foreground exchange, closed picker, and cursor over the intended button.";
-                return;
+                return false;
             }
 
             var candidate = new PickerCalibration
@@ -5621,17 +5784,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     rect.X, rect.Y, rect.Width, rect.Height, cursor.X, cursor.Y, out var failure))
             {
                 _lastFailure = failure;
-                return;
+                return false;
             }
 
             _pickerCalibrationStore.Save(_pickerCalibrationPath, candidate);
             _pickerCalibration = candidate;
             _operationStatus = "Recorded normalized Place Order target without clicking it.";
             _lastFailure = "None";
+            return true;
         }
         catch (Exception exception)
         {
             _lastFailure = $"Place Order calibration failed: {exception.Message}";
+            return false;
         }
     }
 

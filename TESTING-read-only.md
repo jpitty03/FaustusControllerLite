@@ -47,8 +47,8 @@ Input automation remains blocked until all reads above are plausible in game.
 
 Use disposable bindings such as function keys. Keep placement, cancellation, collection, amount input, and full-workflow permissions disabled throughout.
 
-1. Bind `CalibratePickerButtonHotkey` and `ProbeMarketsHotkey`. Leave all input permissions disabled.
-2. Open the exchange with its picker closed. Hover the `I have` picker button, press calibration, then manually click that same button within five seconds. Close it and repeat for `I want`.
+1. Bind `CalibrationWizardStartHotkey`, `CalibrationWizardNextHotkey`, and `ProbeMarketsHotkey`. Leave all input permissions disabled.
+2. Start the wizard. Open the exchange with its picker closed, hover the `I want` picker button, press Next, then manually click that same button within five seconds. Close it and repeat for `I have`. Change area after both picker steps to end the runtime wizard while retaining persisted calibration.
 3. Confirm the overlay reports both calibration sides ready and `picker-calibration.json` contains two normalized points between zero and one.
 4. Change resolution/window geometry, reopen the exchange, and confirm calibration remains normalized to the panel. Recalibrate if the UI layout itself changed.
 5. Press the probe hotkey while any one of probing, movement, click, or query permission is disabled. Confirm no mouse or keyboard input occurs.
@@ -93,8 +93,8 @@ Milestone 5 passes only after the staged fields, no-Enter/no-placement behavior,
 This checkpoint creates one real order. Use the smallest disposable accepted candidate. Never retry after an ambiguous result.
 
 1. Restart ExileAPI. Confirm bankroll and calibration files migrate to schema 2 while preserving prior seeds and picker coordinates.
-2. Bind `CalibratePlaceOrderHotkey` and `PlaceStagedLegHotkey` to unique keys. Keep full workflow disabled.
-3. Open the exchange, hover the exact Place Order button, and press its calibration hotkey. Confirm the cursor does not click and the overlay reports Place Order calibration ready.
+2. Bind both calibration wizard hotkeys and `PlaceStagedLegHotkey` to unique keys. Keep full workflow disabled.
+3. Run the wizard through the two picker steps, then hover the exact Place Order button and press Next. Confirm the cursor does not click and the overlay reports Place Order calibration ready.
 4. Use a deliberately small initialized bankroll no larger than live ownership. Do not test with the normal full bankroll; a manual probe or existing staged form is not required.
 5. Record the complete current order-ID set. Enable `Allow Order Placement`, leave full workflow off, and press `PlaceStagedLegHotkey` once. This is the sole authorization for the sequence.
 6. Confirm Lite runs a fresh three-market probe, recalculates the full route, refreshes the selected first-leg market again in the same session, restages the pair, enters exact amounts, and presses Enter once to lock them.
@@ -129,9 +129,9 @@ Live placement passed on 2026-07-31 in Allflame:
 Canonical state has been manually reconciled from SDK evidence to exact order 2: completed 1,920 Alterations → 320 Chaos, proceeds uncollected. Prior audit history remains unchanged and a reconciliation event was appended.
 
 1. Restart ExileAPI. Confirm tracked state is `CompletedUncollected`, ID 2, completed-uncollected Chaos is 320, available Chaos is 0, and unresolved remains true.
-2. Bind `CalibrateCollectionHotkey` and `CollectTrackedOrderHotkey` to unique keys. Enable verified movement, verified clicks, query input, and collection. Disable placement and full workflow.
+2. Bind both calibration wizard hotkeys and `CollectTrackedOrderHotkey` to unique keys. Enable verified movement, verified clicks, query input, and collection. Disable placement and full workflow.
 3. Open exchange, stash, and inventory with the picker closed. Confirm live order 2 is completed with exact Alteration/Chaos metadata and hashes, original 1,920, remaining 0, received 320, and ratio 1:6/6:1.
-4. Hover the center of order 2's left-side bought-currency slot displaying 320 Chaos and press `CalibrateCollectionHotkey`. Confirm no click occurs and collection calibration reports ready. Do not hover row center, amount text, another completed order, or the right-side offered slot.
+4. Run the wizard through its first three steps, hover the center of order 2's left-side bought-currency slot displaying 320 Chaos, and press Next. Confirm no click occurs and collection calibration reports ready. Do not hover row center, amount text, another completed order, or the right-side offered slot.
 5. Press `CollectTrackedOrderHotkey` once and do not touch mouse/keyboard. Lite must force a fresh pre-collection `I have Chaos` ownership read, then uniquely identify order 2 by model and row text/economics.
 6. Confirm the cursor moves to order 2's calibrated left slot and performs exactly one Ctrl-right-click after canonical `CollectionArmed` persistence. It must not touch completed order 1 or pending order 3.
 7. Confirm order 2 disappears while every full SDK snapshot for unrelated orders remains unchanged. Additions, removals, or economics/status changes are ambiguous.

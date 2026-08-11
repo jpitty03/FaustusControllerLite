@@ -36,6 +36,12 @@ public sealed record MarketCapture(
 
 public static class CurrentMarketReader
 {
+    public const string SelectedMarketHeadMismatch =
+        "Selected market rate did not match the immediate book head.";
+
+    public static bool IsTransientBookTransition(string failure) =>
+        string.Equals(failure, SelectedMarketHeadMismatch, StringComparison.Ordinal);
+
     public static bool TryCapture(
         GameController gameController,
         Guid sessionId,
@@ -112,7 +118,7 @@ public static class CurrentMarketReader
             if (requireSelectedMarketHead && marketRateGet > 0 && marketRateGive > 0 && topImmediate is not null &&
                 new Rational(marketRateGet, marketRateGive) != new Rational(topImmediate.Get, topImmediate.Give))
             {
-                failure = "Selected market rate did not match the immediate book head.";
+                failure = SelectedMarketHeadMismatch;
                 return false;
             }
 

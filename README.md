@@ -24,10 +24,10 @@ normal affinity tab is not yet supported.
 2. Set `ActiveFeature = Arbitrage`.
 3. Open the Currency Exchange and wait for `Catalogue: ready`.
 4. Select `TargetCurrency`.
-5. Assign the calibration, adoption, recovery, and workflow hotkeys.
+5. Assign the two calibration-wizard, adoption, recovery, and workflow hotkeys.
 6. Seed a small test bankroll.
-7. Calibrate both picker buttons and the Place Order button.
-8. Use small test orders to calibrate collection, cancel, and return controls.
+7. Run the six-step calibration wizard with small tracked test orders.
+8. Resolve the test orders with the operational lifecycle hotkeys.
 9. Resolve every test order until `Tracked order` is `Stashed` or `None`.
 10. Safely reseed the production bankroll.
 11. Enable the full-workflow permissions.
@@ -40,7 +40,7 @@ normal affinity tab is not yet supported.
 | `StartingChaos` | 1-5000 | Chaos committed when a fresh-state reset is applied. |
 | `StartingDivine` | 1-1000 | Divine committed when a fresh-state reset is applied. |
 | `MinimumProfitChaos` | 1-5000 | Minimum post-restoration profit required for a new route. |
-| `CompetingOrderWaitMinutes` | 1-3600 | Time before a pending order becomes `TimedOut`. |
+| `CompetingOrderWaitMinutes` | 1-3600 | Production time before a pending order becomes `TimedOut`; wizard step 5 overrides this with five seconds. |
 | `EnableDirectDivineCycles` | on/off | Opts into two-competing-leg Divine-to-target-to-Divine cycles. |
 | `MaximumDirectDivinePrincipal` | 1-1000 | Maximum Divine that one direct cycle may lock. |
 | `MinimumSaleChaos` | 1-5000 | Minimum estimated Chaos value for a sell-sweep holding. |
@@ -56,11 +56,8 @@ All hotkeys are unbound by default.
 
 | Hotkey setting | Purpose |
 | --- | --- |
-| `CalibratePickerButtonHotkey` | Calibrates offered and wanted picker buttons. |
-| `CalibratePlaceOrderHotkey` | Calibrates Place Order without clicking it. |
-| `CalibrateCollectionHotkey` | Calibrates the bought-currency slot. |
-| `CalibrateCancelHotkey` | Calibrates the pending-row cancel X. |
-| `CalibrateReturnSlotHotkey` | Calibrates the offered-currency return slot. |
+| `CalibrationWizardStartHotkey` | Starts or restarts the six-step calibration wizard. |
+| `CalibrationWizardNextHotkey` | Attempts the current wizard step and advances only after persistence. |
 | `AdoptPendingOrderHotkey` | Adds one exact existing order to plugin tracking. |
 | `CollectTrackedOrderHotkey` | Collects one verified settlement batch. |
 | `StashCollectedCurrencyHotkey` | Stashes one collected batch. |
@@ -84,85 +81,42 @@ Calibration is saved in:
 
 `config/FaustusControllerLite/FaustusControllerLite/picker-calibration.json`
 
-### Offered Picker
+Bind unique keys to `CalibrationWizardStartHotkey` and `CalibrationWizardNextHotkey`. Start/restart is
+accepted only with no workflow or sell-sweep authorization and no active input operation. While the
+wizard has an incomplete step active, normal probe, placement, full-workflow, and sell-sweep starts
+are blocked. The Complete confirmation remains visible but no longer blocks normal operation.
+Adoption, cancellation, collection, and stash-transfer actions remain available because they are
+needed to prepare and resolve the terminal calibration orders.
 
-1. Open the exchange and close the currency picker.
-2. Hover the offered-currency picker button.
-3. Press `CalibratePickerButtonHotkey`.
-4. Without moving the cursor, manually click that button within five seconds.
-5. Close the picker after the overlay reports success.
+Press `CalibrationWizardStartHotkey`, then follow the expanded overlay. It shows `Step N/6`, the exact
+instruction and live prerequisite, and the latest green confirmation or red error. A failed attempt
+stays on the same step. `CalibrationWizardNextHotkey` while inactive only reports how to start.
 
-### Wanted Picker
+1. **Wanted picker:** close the picker, hover the wanted-currency picker button, and press Next. Within
+   five seconds, manually click without moving the cursor. The wizard advances only if the UI proves
+   that the wanted picker opened and the calibration file was saved. Close the picker afterward.
+2. **Offered picker:** repeat the same proof over the offered-currency picker button. Opening the
+   wanted side is an error and does not advance. Close the picker after confirmation.
+3. **Place Order button:** select a valid pair and amounts, hover Place Order, and press Next. Do not
+   click the button. The normalized target and panel aspect ratio must persist before advancement.
+4. **Tracked collection slot:** create or adopt a tiny order and let it reach exact
+   `CompletedUncollected` with remaining wanted proceeds greater than zero. Hover the tracked row's
+   left wanted-proceeds slot and press Next. Do not click the slot. Resolve and stash this test order
+   before preparing the cancellation test.
+5. **Tracked cancel button:** create a tiny unattractive order and adopt it while step 5 is active.
+   The wizard gives this calibration order a five-second timeout without changing
+   `CompetingOrderWaitMinutes`. Wait for exact plugin status `TimedOut`, hover the tracked row's
+   right-edge cancel X, and press Next. Do not click the X.
+6. **Canceled return slot:** use `CancelTimedOutOrderHotkey`, wait for exact `CanceledUncollected` or
+   `CompletedUncollected` with remaining offered return greater than zero, hover the terminal row's
+   right offered-return slot, and press Next. Do not click the slot.
 
-Repeat the offered-picker steps over the wanted-currency picker button.
+Complete means all six targets were persisted, not that test-order custody is resolved. Collect and
+stash every calibration test order before starting production automation.
 
-The overlay should show:
-
-`Picker calibration: offered=ready, wanted=ready`
-
-### Place Order
-
-1. Select any valid pair and amounts so Place Order is visible.
-2. Hover the Place Order button.
-3. Press `CalibratePlaceOrderHotkey`.
-4. Do not click Place Order.
-5. Confirm `Place Order calibration: ready`.
-
-### Collection Slot
-
-This requires one tracked order in `CompletedUncollected` state.
-
-Schema 7 records the live asset slot's row-relative position and size so collection works across
-scaled 2560x1440 and 1920x1080 layouts. Older collection/return calibration is cleared once and must
-be recorded again.
-
-1. Manually place a tiny order offering seeded Chaos or Divine for the selected target.
-2. Let it fill and leave the completed row visible.
-3. Press `AdoptPendingOrderHotkey`.
-4. Confirm the overlay reports `CompletedUncollected`.
-5. Hover the completed row's left bought-currency slot.
-6. Press `CalibrateCollectionHotkey`.
-7. Do not click the slot.
-
-### Cancel Button
-
-This requires one tracked order in `TimedOut` state. `TimedOut` is a plugin status, not game text.
-
-Before starting:
-
-- Bind `AdoptPendingOrderHotkey`, `CalibrateCancelHotkey`, and `CancelTimedOutOrderHotkey`.
-- Set `CompetingOrderWaitMinutes = 1` for calibration.
-- Set the timeout before adopting the order.
-- Resolve any previous tracked order first.
-
-Procedure:
-
-1. Manually place a tiny, unattractive order offering seeded Chaos or Divine for the selected target.
-2. Ensure it is the only matching core-to-target order.
-3. Press `AdoptPendingOrderHotkey`.
-4. Confirm the overlay reports `Pending adopted`.
-5. Keep the exchange and pending row visible until the overlay reports `TimedOut`.
-6. Hover directly inside the small right-edge cancel X.
-7. Press `CalibrateCancelHotkey`.
-8. Do not click the X.
-9. Confirm `Recorded exact pending-row cancel X calibration; no click occurred.`
-
-Schema 6 records the live control's row-relative position and size. It supports scaled layouts such
-as 2560x1440 and 1920x1080. Older cancel calibration is cleared once and must be recorded again.
-
-If the test order fills, resolve it and create another order at a less attractive rate.
-
-### Return Slot
-
-1. After cancel calibration, enable the manual cancellation permissions below.
-2. Press `CancelTimedOutOrderHotkey` once.
-3. Wait for `CanceledUncollected` with returned offered currency.
-4. Hover the terminal row's right offered-currency slot.
-5. Press `CalibrateReturnSlotHotkey`.
-6. Do not click the slot.
-
-Hover directly inside the visible returned-currency slot. Schema 7 records the actual scaled slot,
-not only the cursor position.
+`AdoptPendingOrderHotkey`, `CancelTimedOutOrderHotkey`, `CollectTrackedOrderHotkey`, and
+`StashCollectedCurrencyHotkey` remain necessary operational lifecycle bindings. Changing area resets
+only the runtime wizard and leaves saved calibration intact.
 
 ## Resolve Test Orders
 
@@ -288,7 +242,7 @@ The plugin resumes the durable workflow phase instead of creating a replacement 
 | Hotkey conflict | Assign every action a unique binding. |
 | Adoption finds zero orders | Verify offered currency, selected target, and visible order row. |
 | Adoption finds multiple orders | Leave only one matching Chaos/Divine-to-target order. |
-| Order never becomes `TimedOut` | Keep the row visible and verify the timeout was set before adoption. |
+| Calibration order never becomes `TimedOut` | Keep the row visible and verify it was adopted while wizard step 5 was active. |
 | Cancel calibration finds no control | Reload schema 6 and hover directly inside the X. |
 | Calibration finds multiple controls | Reposition the cursor in the center of the X. |
 | Transient pre-click quote unavailable | Authorization remains active for up to 10 fresh reprobes; inspect `retry N/10` in the runtime log. |

@@ -94,9 +94,11 @@ public sealed class LatestRateStore
     public void StoreBatchAtomically(string path, IReadOnlyCollection<MarketCapture> captures)
     {
         ArgumentNullException.ThrowIfNull(captures);
-        if (captures.Count != 3)
+        if (captures.Count is not 2 and not 3)
         {
-            throw new ArgumentException("An automated latest-rate batch must contain exactly three captures.", nameof(captures));
+            throw new ArgumentException(
+                "An automated latest-rate batch must contain exactly two or three captures.",
+                nameof(captures));
         }
 
         foreach (var capture in captures)
