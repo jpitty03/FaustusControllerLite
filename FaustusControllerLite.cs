@@ -1209,6 +1209,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
                 CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
                 CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
+                CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
+                CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
                 ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
                 ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
             };
@@ -3844,6 +3846,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
             CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
             CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
+            CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
+            CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
             ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
             ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
         };
@@ -4060,8 +4064,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var candidate = ClonePickerCalibration();
         var rect = row.GetClientRectCache;
         var cursor = ExileInput.MousePositionNum;
+        if (!TrackedOrderCancellationController.TryResolveCancelCalibrationControl(
+                row, cursor, out var control, out failure) || control is null)
+        {
+            _lastFailure = failure;
+            return;
+        }
         if (!candidate.TryRecordCancelButton(
-                rect.X, rect.Y, rect.Width, rect.Height, cursor.X, cursor.Y, out failure))
+                rect.X, rect.Y, rect.Width, rect.Height, control, out failure))
         {
             _lastFailure = failure;
             return;
@@ -4130,6 +4140,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
         CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
         CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
+        CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
+        CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
         ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
         ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
     };
@@ -5394,6 +5406,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
                 CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
                 CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
+                CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
+                CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
                 ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
                 ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
             };

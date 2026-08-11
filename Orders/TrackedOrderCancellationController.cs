@@ -251,6 +251,22 @@ public sealed class TrackedOrderCancellationController
         });
     }
 
+    public static bool TryResolveCancelCalibrationControl(
+        Element row,
+        Vector2 cursor,
+        out UiControlRect? control,
+        out string failure)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        var rect = row.GetClientRectCache;
+        return PickerCalibration.TrySelectCancelControl(
+            rect.X, rect.Y, rect.Width, rect.Height,
+            cursor.X, cursor.Y,
+            ReadVisibleLeafControls(row),
+            out control,
+            out failure);
+    }
+
     private static bool TryResolveCancelTarget(
         GameController gameController,
         TrackedOrderState tracked,
@@ -269,24 +285,22 @@ public sealed class TrackedOrderCancellationController
             return false;
         }
         var rect = row.GetClientRectCache;
-        if (!calibration.TryResolveCancelButton(rect.X, rect.Y, rect.Width, rect.Height, out target, out failure))
+        if (!calibration.TryResolveCancelButton(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadVisibleLeafControls(row), out target, out failure))
         {
-            return false;
-        }
-        var resolvedTarget = target;
-        var controls = EnumerateElements(row, 0).Where(element =>
-        {
-            var candidate = element.GetClientRectCache;
-            return element.IsVisible && element.ChildCount == 0 && candidate.Width is >= 16 and <= 20 &&
-                candidate.Height is >= 16 and <= 20 && candidate.Contains(resolvedTarget.X, resolvedTarget.Y);
-        }).ToArray();
-        if (controls.Length != 1)
-        {
-            failure = $"Calibrated cancel point did not resolve to one visible 18x18 leaf control; found {controls.Length}.";
             return false;
         }
         return true;
     }
+
+    private static IReadOnlyCollection<UiControlRect> ReadVisibleLeafControls(Element row) =>
+        EnumerateElements(row, 0)
+            .Where(element => element.IsVisible && element.ChildCount == 0)
+            .Select(element => element.GetClientRectCache)
+            .Where(rect => rect.Width > 0 && rect.Height > 0)
+            .Select(rect => new UiControlRect(rect.X, rect.Y, rect.Width, rect.Height))
+            .ToArray();
 
     private bool ValidateGlobal(
         GameController gameController,

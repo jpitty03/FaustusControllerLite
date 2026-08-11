@@ -7,9 +7,16 @@ public sealed record NormalizedUiPoint(double X, double Y)
     public bool IsValid => X is >= 0 and <= 1 && Y is >= 0 and <= 1;
 }
 
+public sealed record UiControlRect(float X, float Y, float Width, float Height)
+{
+    public float CenterX => X + Width / 2f;
+    public float CenterY => Y + Height / 2f;
+    public bool Contains(float x, float y) => x >= X && x <= X + Width && y >= Y && y <= Y + Height;
+}
+
 public sealed class PickerCalibration
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public NormalizedUiPoint? OfferedButton { get; set; }
@@ -20,13 +27,16 @@ public sealed class PickerCalibration
     public double? CollectionRowAspectRatio { get; set; }
     public NormalizedUiPoint? CancelButtonOffset { get; set; }
     public double? CancelRowAspectRatio { get; set; }
+    public double? CancelButtonWidthRatio { get; set; }
+    public double? CancelButtonHeightRatio { get; set; }
     public NormalizedUiPoint? ReturnSlotOffset { get; set; }
     public double? ReturnRowAspectRatio { get; set; }
 
     public bool IsComplete => OfferedButton?.IsValid == true && WantedButton?.IsValid == true;
     public bool IsPlacementComplete => PlaceOrderButton?.IsValid == true;
     public bool IsCollectionComplete => IsSafeCollectionOffset(CollectionSlotOffset);
-    public bool IsCancellationComplete => IsSafeCancelOffset(CancelButtonOffset);
+    public bool IsCancellationComplete => IsSafeCancelGeometry(
+        CancelButtonOffset, CancelButtonWidthRatio, CancelButtonHeightRatio, CancelRowAspectRatio);
     public bool IsReturnCollectionComplete => IsSafeReturnOffset(ReturnSlotOffset);
 
     public bool TryRecord(
@@ -204,43 +214,120 @@ public sealed class PickerCalibration
 
     public bool TryRecordCancelButton(
         float rowX, float rowY, float rowWidth, float rowHeight,
-        float cursorX, float cursorY, out string failure)
+        UiControlRect control, out string failure)
     {
-        var point = rowWidth > 0 && rowHeight > 0
-            ? new NormalizedUiPoint((cursorX - rowX) / rowWidth, (cursorY - rowY) / rowHeight)
+        var point = rowWidth > 0 && rowHeight > 0 && control.Width > 0 && control.Height > 0
+            ? new NormalizedUiPoint((control.CenterX - rowX) / rowWidth, (control.CenterY - rowY) / rowHeight)
             : null;
-        if (!IsSafeCancelOffset(point))
+        var widthRatio = rowWidth > 0 ? control.Width / rowWidth : 0;
+        var heightRatio = rowHeight > 0 ? control.Height / rowHeight : 0;
+        var rowAspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
+        if (!IsSafeCancelGeometry(point, widthRatio, heightRatio, rowAspect))
         {
-            failure = "Cancel calibration must be inside the pending row's small right-edge X control.";
+            failure = "Cancel calibration did not identify a safe square right-edge leaf control.";
             return false;
         }
         CancelButtonOffset = point;
         CancelRowAspectRatio = rowWidth / rowHeight;
+        CancelButtonWidthRatio = widthRatio;
+        CancelButtonHeightRatio = heightRatio;
+        failure = string.Empty;
+        return true;
+    }
+
+    public static bool TrySelectCancelControl(
+        float rowX, float rowY, float rowWidth, float rowHeight,
+        float cursorX, float cursorY,
+        IReadOnlyCollection<UiControlRect> visibleLeafControls,
+        out UiControlRect? control,
+        out string failure)
+    {
+        control = null;
+        var rowAspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
+        if (rowWidth <= 0 || rowHeight <= 0)
+        {
+            failure = "Pending order row geometry is invalid.";
+            return false;
+        }
+
+        var matches = visibleLeafControls.Where(candidate =>
+        {
+            if (candidate.Width <= 0 || candidate.Height <= 0 || !candidate.Contains(cursorX, cursorY))
+                return false;
+            var center = new NormalizedUiPoint(
+                (candidate.CenterX - rowX) / rowWidth,
+                (candidate.CenterY - rowY) / rowHeight);
+            return IsSafeCancelGeometry(
+                center, candidate.Width / rowWidth, candidate.Height / rowHeight, rowAspect);
+        }).ToArray();
+        if (matches.Length != 1)
+        {
+            failure = $"Cancel calibration cursor did not resolve to one visible square right-edge leaf control; found {matches.Length}.";
+            return false;
+        }
+
+        control = matches[0];
         failure = string.Empty;
         return true;
     }
 
     public bool TryResolveCancelButton(
         float rowX, float rowY, float rowWidth, float rowHeight,
+        IReadOnlyCollection<UiControlRect> visibleLeafControls,
         out System.Numerics.Vector2 point, out string failure)
     {
         var aspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
-        if (!IsSafeCancelOffset(CancelButtonOffset) || CancelRowAspectRatio is not > 0 ||
+        if (!IsSafeCancelGeometry(
+                CancelButtonOffset, CancelButtonWidthRatio, CancelButtonHeightRatio, CancelRowAspectRatio) ||
+            CancelRowAspectRatio is not > 0 ||
             Math.Abs(aspect - CancelRowAspectRatio.Value) / CancelRowAspectRatio.Value > 0.03)
         {
             point = default;
             failure = "Cancel button calibration is missing or does not match the pending-row layout.";
             return false;
         }
-        point = new System.Numerics.Vector2(
-            rowX + (float)(CancelButtonOffset!.X * rowWidth),
-            rowY + (float)(CancelButtonOffset.Y * rowHeight));
+
+        var matches = visibleLeafControls.Where(control =>
+        {
+            if (control.Width <= 0 || control.Height <= 0) return false;
+            var center = new NormalizedUiPoint(
+                (control.CenterX - rowX) / rowWidth,
+                (control.CenterY - rowY) / rowHeight);
+            var widthRatio = control.Width / rowWidth;
+            var heightRatio = control.Height / rowHeight;
+            return IsSafeCancelGeometry(center, widthRatio, heightRatio, aspect) &&
+                Math.Abs(center.X - CancelButtonOffset!.X) <= 0.015 &&
+                Math.Abs(center.Y - CancelButtonOffset.Y) <= 0.05 &&
+                RelativeDifference(widthRatio, CancelButtonWidthRatio!.Value) <= 0.20 &&
+                RelativeDifference(heightRatio, CancelButtonHeightRatio!.Value) <= 0.20;
+        }).ToArray();
+        if (matches.Length != 1)
+        {
+            point = default;
+            failure = $"Calibrated cancel geometry did not resolve to one visible scaled leaf control; found {matches.Length}.";
+            return false;
+        }
+
+        point = new System.Numerics.Vector2(matches[0].CenterX, matches[0].CenterY);
         failure = string.Empty;
         return true;
     }
 
     private static bool IsSafeCancelOffset(NormalizedUiPoint? point) =>
         point?.IsValid == true && point.X is >= 0.93 and <= 0.99 && point.Y is >= 0.35 and <= 0.65;
+
+    private static bool IsSafeCancelGeometry(
+        NormalizedUiPoint? point,
+        double? widthRatio,
+        double? heightRatio,
+        double? rowAspectRatio) =>
+        IsSafeCancelOffset(point) && widthRatio is >= 0.015 and <= 0.08 &&
+        heightRatio is >= 0.05 and <= 0.25 &&
+        rowAspectRatio is > 0 &&
+        widthRatio.Value / heightRatio.Value * rowAspectRatio.Value is >= 0.75 and <= 1.34;
+
+    private static double RelativeDifference(double left, double right) =>
+        Math.Abs(left - right) / right;
 
     public bool TryRecordReturnSlot(
         float rowX, float rowY, float rowWidth, float rowHeight,
@@ -307,12 +394,14 @@ public sealed class PickerCalibrationStore
 
         var calibration = JsonSerializer.Deserialize<PickerCalibration>(json, JsonOptions)
             ?? throw new InvalidDataException("Picker calibration file was empty.");
-        if (schemaVersion is not 1 and not 2 and not 3 and not 4 and not PickerCalibration.CurrentSchemaVersion ||
+        if (schemaVersion is not 1 and not 2 and not 3 and not 4 and not 5 and
+                not PickerCalibration.CurrentSchemaVersion ||
             calibration.OfferedButton is { IsValid: false } ||
             calibration.WantedButton is { IsValid: false } ||
             calibration.PlaceOrderButton is { IsValid: false } ||
             calibration.CollectionSlotOffset is not null && !IsSafeLoadedCollectionOffset(calibration.CollectionSlotOffset) ||
-            calibration.CancelButtonOffset is not null && !IsSafeLoadedCancelOffset(calibration.CancelButtonOffset) ||
+            schemaVersion >= 6 && HasAnyCancelGeometry(calibration) &&
+                !IsSafeLoadedCancelGeometry(calibration) ||
             calibration.ReturnSlotOffset is not null && !IsSafeLoadedReturnOffset(calibration.ReturnSlotOffset))
         {
             throw new InvalidDataException("Picker calibration schema or normalized coordinates are invalid.");
@@ -339,6 +428,13 @@ public sealed class PickerCalibrationStore
             calibration.ReturnSlotOffset = null;
             calibration.ReturnRowAspectRatio = null;
         }
+        if (schemaVersion < 6)
+        {
+            calibration.CancelButtonOffset = null;
+            calibration.CancelRowAspectRatio = null;
+            calibration.CancelButtonWidthRatio = null;
+            calibration.CancelButtonHeightRatio = null;
+        }
         if (schemaVersion < PickerCalibration.CurrentSchemaVersion) Save(path, calibration);
 
         return calibration;
@@ -347,8 +443,18 @@ public sealed class PickerCalibrationStore
     private static bool IsSafeLoadedCollectionOffset(NormalizedUiPoint point) =>
         point.IsValid && point.X is >= 0.03 and <= 0.22 && point.Y is >= 0.20 and <= 0.80;
 
-    private static bool IsSafeLoadedCancelOffset(NormalizedUiPoint point) =>
-        point.IsValid && point.X is >= 0.93 and <= 0.99 && point.Y is >= 0.35 and <= 0.65;
+    private static bool HasAnyCancelGeometry(PickerCalibration calibration) =>
+        calibration.CancelButtonOffset is not null || calibration.CancelRowAspectRatio is not null ||
+        calibration.CancelButtonWidthRatio is not null || calibration.CancelButtonHeightRatio is not null;
+
+    private static bool IsSafeLoadedCancelGeometry(PickerCalibration calibration) =>
+        calibration.CancelButtonOffset is { IsValid: true } point &&
+        point.X is >= 0.93 and <= 0.99 && point.Y is >= 0.35 and <= 0.65 &&
+        calibration.CancelButtonWidthRatio is >= 0.015 and <= 0.08 &&
+        calibration.CancelButtonHeightRatio is >= 0.05 and <= 0.25 &&
+        calibration.CancelRowAspectRatio is > 0 &&
+        calibration.CancelButtonWidthRatio.Value / calibration.CancelButtonHeightRatio.Value *
+            calibration.CancelRowAspectRatio.Value is >= 0.75 and <= 1.34;
 
     private static bool IsSafeLoadedReturnOffset(NormalizedUiPoint point) =>
         point.IsValid && point.X is >= 0.76 and <= 0.89 && point.Y is >= 0.20 and <= 0.80;
