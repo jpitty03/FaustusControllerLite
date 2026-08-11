@@ -411,8 +411,8 @@ public sealed class TrackedOrderCollectionController
             return false;
         }
 
-        var rect = row.GetClientRectCache;
-        return calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out target, out failure);
+        return CanceledReturnCollectionController.TryResolveVisibleTerminalSlot(
+            row, calibration, wantedSlot: true, iconPresent: true, out target, out failure);
     }
 
     private bool ValidateGlobal(

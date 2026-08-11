@@ -196,3 +196,41 @@ public sealed class StashTransferIntentState
     public int AreaInstanceId { get; set; }
     public DateTimeOffset ArmedAtUtc { get; set; }
 }
+
+public static class CollectionAbortEvidence
+{
+    public static bool HasCollectionInputBoundary(TrackedOrderState? tracked) =>
+        tracked is not null &&
+        (tracked.Status == TrackedOrderStatus.CollectionArmed ||
+         tracked.Status == TrackedOrderStatus.Ambiguous && tracked.CollectionAssetIntent is not null);
+
+    public static bool HasStashInputBoundary(TrackedOrderState? tracked) =>
+        tracked is not null &&
+        (tracked.Status == TrackedOrderStatus.StashTransferArmed ||
+         tracked.Status == TrackedOrderStatus.Ambiguous && tracked.StashTransferIntent is not null);
+
+    public static bool CanRecoverUntouchedCanceledTerminal(TrackedOrderState? tracked) =>
+        tracked is
+        {
+            Status: TrackedOrderStatus.Ambiguous,
+            PlayerOrderId: > 0,
+            TerminalObservedAtUtc: not null,
+            TerminalRemainingOfferedAmount: not null,
+            TerminalReceivedWantedAmount: not null,
+            LedgerCommittedAtUtc: not null,
+            CancelIntent: null,
+            CollectionAssetIntent: null,
+            StashTransferIntent: null,
+            WantedAssetCollected: false,
+            OfferedReturnCollected: false,
+            WantedAssetStashed: false,
+            OfferedReturnStashed: false,
+            SettledWantedAmount: 0,
+            PendingWantedBatchAmount: 0,
+            SettledReturnAmount: 0,
+            PendingReturnBatchAmount: 0,
+        } &&
+        TrackedOrderLifecycle.HasDurableIdentity(tracked) &&
+        tracked.TerminalRemainingOfferedAmount.GetValueOrDefault() +
+            tracked.TerminalReceivedWantedAmount.GetValueOrDefault() > 0;
+}

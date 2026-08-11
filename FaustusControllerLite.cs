@@ -1207,12 +1207,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 PlaceOrderPanelAspectRatio = _pickerCalibration.PlaceOrderPanelAspectRatio,
                 CollectionSlotOffset = _pickerCalibration.CollectionSlotOffset,
                 CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
+                CollectionSlotWidthRatio = _pickerCalibration.CollectionSlotWidthRatio,
+                CollectionSlotHeightRatio = _pickerCalibration.CollectionSlotHeightRatio,
                 CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
                 CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
                 CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
                 CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
                 ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
-                ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
+                ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio,
+                ReturnSlotWidthRatio = _pickerCalibration.ReturnSlotWidthRatio,
+                ReturnSlotHeightRatio = _pickerCalibration.ReturnSlotHeightRatio
             };
             if (!candidate.TryRecord(
                     picker.IsPickingWantedCurrency,
@@ -3619,7 +3623,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_trackedOrderState is null) return;
         var placementNeedsReconciliation = _trackedOrderState is { } tracked &&
             ArmedPlacementReconciliation.CanReconcile(tracked);
-        if (!placementNeedsReconciliation &&
+        var terminalNeedsReconciliation = CollectionAbortEvidence.CanRecoverUntouchedCanceledTerminal(_trackedOrderState);
+        if (!placementNeedsReconciliation && !terminalNeedsReconciliation &&
             _trackedOrderState?.Status is not TrackedOrderStatus.Pending and
                 not TrackedOrderStatus.TimedOut and not TrackedOrderStatus.CancelArmed and
                 not TrackedOrderStatus.CancelClicked ||
@@ -3635,6 +3640,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
         _nextLifecyclePollAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(250);
+
+        if (terminalNeedsReconciliation)
+        {
+            ReconcileUntouchedCanceledTerminal();
+            return;
+        }
 
         var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
         var failure = string.Empty;
@@ -3802,6 +3813,37 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
+    private void ReconcileUntouchedCanceledTerminal()
+    {
+        var tracked = _trackedOrderState!;
+        if (!CanceledReturnCollectionController.TryResolveTerminalAssetRow(
+                GameController, tracked, out _, out var orders, out var failure))
+        {
+            _operationStatus = $"Terminal ambiguity recovery waiting: {failure}";
+            return;
+        }
+        var matches = orders.Where(order =>
+            TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order) && order.IsCompleted && order.IsCanceled &&
+            order.RemainingOfferedAmount == tracked.TerminalRemainingOfferedAmount &&
+            order.ReceivedWantedAmount == tracked.TerminalReceivedWantedAmount).ToArray();
+        if (matches.Length != 1)
+        {
+            _operationStatus = $"Terminal ambiguity recovery retained: expected one exact canceled row, found {matches.Length}.";
+            return;
+        }
+
+        var recovered = TrackedOrderCollectionController.CloneTracked(
+            tracked,
+            TrackedOrderStatus.CanceledUncollected,
+            "Read-only recovery proved the untouched canceled terminal row; no collection or stash input had been armed.");
+        if (!PersistTrackedOrder(recovered, "PreClickTerminalAmbiguityRecoveredCanceledUncollected")) return;
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
+        _sweepAuthorized = false;
+        _operationStatus = "Recovered untouched canceled order to CanceledUncollected; explicit reauthorization is required.";
+        _lastFailure = "None";
+    }
+
     private void CalibrateTrackedCollectionSlot()
     {
         if (TryGetHotkeyConflict(out var conflict))
@@ -3844,15 +3886,26 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             PlaceOrderPanelAspectRatio = _pickerCalibration.PlaceOrderPanelAspectRatio,
             CollectionSlotOffset = _pickerCalibration.CollectionSlotOffset,
             CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
+            CollectionSlotWidthRatio = _pickerCalibration.CollectionSlotWidthRatio,
+            CollectionSlotHeightRatio = _pickerCalibration.CollectionSlotHeightRatio,
             CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
             CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
             CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
             CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
             ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
-            ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
+            ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio,
+            ReturnSlotWidthRatio = _pickerCalibration.ReturnSlotWidthRatio,
+            ReturnSlotHeightRatio = _pickerCalibration.ReturnSlotHeightRatio
         };
+        if (!CanceledReturnCollectionController.TryResolveTerminalCalibrationSlot(
+                row, cursor, wantedSlot: true, out var collectionControl, out failure) ||
+            collectionControl is null)
+        {
+            _lastFailure = failure;
+            return;
+        }
         if (!candidate.TryRecordCollectionSlot(
-                rect.X, rect.Y, rect.Width, rect.Height, cursor.X, cursor.Y, out failure))
+                rect.X, rect.Y, rect.Width, rect.Height, collectionControl, out failure))
         {
             _lastFailure = failure;
             return;
@@ -4111,8 +4164,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var candidate = ClonePickerCalibration();
         var rect = row.GetClientRectCache;
         var cursor = ExileInput.MousePositionNum;
+        if (!CanceledReturnCollectionController.TryResolveTerminalCalibrationSlot(
+                row, cursor, wantedSlot: false, out var returnControl, out failure) || returnControl is null)
+        {
+            _lastFailure = failure;
+            return;
+        }
         if (!candidate.TryRecordReturnSlot(
-                rect.X, rect.Y, rect.Width, rect.Height, cursor.X, cursor.Y, out failure))
+                rect.X, rect.Y, rect.Width, rect.Height, returnControl, out failure))
         {
             _lastFailure = failure;
             return;
@@ -4138,12 +4197,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         PlaceOrderPanelAspectRatio = _pickerCalibration.PlaceOrderPanelAspectRatio,
         CollectionSlotOffset = _pickerCalibration.CollectionSlotOffset,
         CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
+        CollectionSlotWidthRatio = _pickerCalibration.CollectionSlotWidthRatio,
+        CollectionSlotHeightRatio = _pickerCalibration.CollectionSlotHeightRatio,
         CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
         CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
         CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
         CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
         ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
-        ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
+        ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio,
+        ReturnSlotWidthRatio = _pickerCalibration.ReturnSlotWidthRatio,
+        ReturnSlotHeightRatio = _pickerCalibration.ReturnSlotHeightRatio
     };
 
     private void HandleCancelTimedOutOrderHotkey()
@@ -5140,16 +5203,17 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         _fullWorkflowAuthorized = false;
         _workflowAuthorization = null;
-        var collectionAfterClick = _trackedOrderState?.Status == TrackedOrderStatus.CollectionArmed ||
-            _trackedCollection.State == TrackedCollectionState.CollectedEvidence ||
-            _collectionFlow == CollectionFlowState.ReadingAfter;
-        var stashAfterClick = _trackedOrderState?.Status == TrackedOrderStatus.StashTransferArmed ||
-            _inventoryStashTransfer.State == InventoryStashTransferState.TransferEvidence ||
-            _collectionFlow == CollectionFlowState.ReadingStashAfter;
+        var collectionAfterClick = CollectionAbortEvidence.HasCollectionInputBoundary(_trackedOrderState);
+        var stashAfterClick = CollectionAbortEvidence.HasStashInputBoundary(_trackedOrderState);
         if (_trackedCollection.IsRunning) _trackedCollection.Cancel(reason);
         if (_canceledReturnCollection.IsRunning) _canceledReturnCollection.Cancel(reason);
         if (_inventoryStashTransfer.IsRunning) _inventoryStashTransfer.Cancel(reason);
         if (_collectionOwnershipSelector.IsRunning) _collectionOwnershipSelector.Cancel(reason);
+        if (stashAfterClick && collectionAfterClick)
+        {
+            MarkCollectionAmbiguous($"Conflicting collection and stash-transfer intents: {reason}");
+            return;
+        }
         if (stashAfterClick)
         {
             MarkStashTransferAmbiguous(reason);
@@ -5404,12 +5468,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 PlaceOrderPanelAspectRatio = _pickerCalibration.PlaceOrderPanelAspectRatio,
                 CollectionSlotOffset = _pickerCalibration.CollectionSlotOffset,
                 CollectionRowAspectRatio = _pickerCalibration.CollectionRowAspectRatio,
+                CollectionSlotWidthRatio = _pickerCalibration.CollectionSlotWidthRatio,
+                CollectionSlotHeightRatio = _pickerCalibration.CollectionSlotHeightRatio,
                 CancelButtonOffset = _pickerCalibration.CancelButtonOffset,
                 CancelRowAspectRatio = _pickerCalibration.CancelRowAspectRatio,
                 CancelButtonWidthRatio = _pickerCalibration.CancelButtonWidthRatio,
                 CancelButtonHeightRatio = _pickerCalibration.CancelButtonHeightRatio,
                 ReturnSlotOffset = _pickerCalibration.ReturnSlotOffset,
-                ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio
+                ReturnRowAspectRatio = _pickerCalibration.ReturnRowAspectRatio,
+                ReturnSlotWidthRatio = _pickerCalibration.ReturnSlotWidthRatio,
+                ReturnSlotHeightRatio = _pickerCalibration.ReturnSlotHeightRatio
             };
             if (!candidate.TryRecordPlaceOrder(
                     rect.X, rect.Y, rect.Width, rect.Height, cursor.X, cursor.Y, out var failure))

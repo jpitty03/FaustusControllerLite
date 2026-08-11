@@ -223,6 +223,42 @@ public sealed class CanceledReturnCollectionController
         return true;
     }
 
+    public static bool TryResolveTerminalCalibrationSlot(
+        Element row,
+        Vector2 cursor,
+        bool wantedSlot,
+        out UiControlRect? control,
+        out string failure)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        var rect = row.GetClientRectCache;
+        return PickerCalibration.TrySelectTerminalSlot(
+            rect.X, rect.Y, rect.Width, rect.Height,
+            cursor.X, cursor.Y,
+            ReadTerminalSlotRects(row, iconPresent: true),
+            wantedSlot,
+            out control,
+            out failure);
+    }
+
+    public static bool TryResolveVisibleTerminalSlot(
+        Element row,
+        PickerCalibration calibration,
+        bool wantedSlot,
+        bool iconPresent,
+        out Vector2 target,
+        out string failure)
+    {
+        var rect = row.GetClientRectCache;
+        return wantedSlot
+            ? calibration.TryResolveCollectionSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent), out target, out failure)
+            : calibration.TryResolveReturnSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent), out target, out failure);
+    }
+
     private static bool TryResolveTarget(
         GameController gameController,
         TrackedOrderState tracked,
@@ -247,26 +283,13 @@ public sealed class CanceledReturnCollectionController
         }
         var rect = row.GetClientRectCache;
         var resolved = asset.WantedSlot
-            ? calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out target, out failure)
-            : calibration.TryResolveReturnSlot(rect.X, rect.Y, rect.Width, rect.Height, out target, out failure);
-        if (!resolved) return false;
-        var point = target;
-        var slots = EnumerateElements(row, 0).Where(element =>
-        {
-            var candidate = element.GetClientRectCache;
-            return element.IsVisible && candidate.Width is >= 68 and <= 76 && candidate.Height is >= 68 and <= 76 &&
-                candidate.Contains(point.X, point.Y) && element.Children.Any(child =>
-                {
-                    var childRect = child.GetClientRectCache;
-                    return child.IsVisible && childRect.Width >= 80 && childRect.Height >= 80;
-                });
-        }).ToArray();
-        if (slots.Length != 1)
-        {
-            failure = $"Terminal asset calibration did not resolve to one slot with a visible collectible icon; found {slots.Length}.";
-            return false;
-        }
-        return true;
+            ? calibration.TryResolveCollectionSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: true), out target, out failure)
+            : calibration.TryResolveReturnSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: true), out target, out failure);
+        return resolved;
     }
 
     private void BeginMovement(Vector2 target, int cursorSpeed)
@@ -579,20 +602,13 @@ public sealed class CanceledReturnCollectionController
         var rect = row.GetClientRectCache;
         Vector2 point;
         var resolved = asset.WantedSlot
-            ? calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure)
-            : calibration.TryResolveReturnSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure);
-        if (!resolved) return false;
-        var slots = EnumerateElements(row, 0).Where(element =>
-        {
-            var candidate = element.GetClientRectCache;
-            return element.IsVisible && candidate.Width is >= 68 and <= 76 && candidate.Height is >= 68 and <= 76 &&
-                candidate.Contains(point.X, point.Y);
-        }).ToArray();
-        if (slots.Length != 1 || slots[0].Children.Any(child =>
-            {
-                var childRect = child.GetClientRectCache;
-                return child.IsVisible && childRect.Width >= 80 && childRect.Height >= 80;
-            }))
+            ? calibration.TryResolveCollectionSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: false), out point, out failure)
+            : calibration.TryResolveReturnSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: false), out point, out failure);
+        if (!resolved)
         {
             failure = "Clicked terminal slot did not become uniquely icon-cleared.";
             return false;
@@ -623,22 +639,16 @@ public sealed class CanceledReturnCollectionController
         var rect = row.GetClientRectCache;
         Vector2 point;
         var resolved = asset.WantedSlot
-            ? calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure)
-            : calibration.TryResolveReturnSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure);
+            ? calibration.TryResolveCollectionSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: true), out point, out failure)
+            : calibration.TryResolveReturnSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: true), out point, out failure);
         if (!resolved) return false;
-        var slots = EnumerateElements(row, 0).Where(element =>
-        {
-            var candidate = element.GetClientRectCache;
-            return element.IsVisible && candidate.Width is >= 68 and <= 76 && candidate.Height is >= 68 and <= 76 &&
-                candidate.Contains(point.X, point.Y);
-        }).ToArray();
-        if (slots.Length != 1 ||
-            !slots[0].Children.Any(child =>
-            {
-                var childRect = child.GetClientRectCache;
-                return child.IsVisible && childRect.Width >= 80 && childRect.Height >= 80;
-            }) ||
-            !EnumerateText(slots[0], 0).Any(text =>
+        var slots = ReadTerminalSlotElements(row, iconPresent: true)
+            .Where(slot => slot.GetClientRectCache.Contains(point.X, point.Y)).ToArray();
+        if (slots.Length != 1 || !EnumerateText(slots[0], 0).Any(text =>
                 long.TryParse(text.Replace(",", string.Empty), out var stack) && stack == expectedStack))
         {
             failure = $"Clicked terminal slot did not retain one icon with an exact remaining stack of {expectedStack}.";
@@ -669,26 +679,36 @@ public sealed class CanceledReturnCollectionController
         var rect = row.GetClientRectCache;
         Vector2 point;
         var resolved = asset.WantedSlot
-            ? calibration.TryResolveCollectionSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure)
-            : calibration.TryResolveReturnSlot(rect.X, rect.Y, rect.Width, rect.Height, out point, out failure);
-        if (!resolved) return false;
-        var slots = EnumerateElements(row, 0).Where(element =>
+            ? calibration.TryResolveCollectionSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: true), out point, out failure)
+            : calibration.TryResolveReturnSlot(
+                rect.X, rect.Y, rect.Width, rect.Height,
+                ReadTerminalSlotRects(row, iconPresent: true), out point, out failure);
+        return resolved;
+    }
+
+    private static IReadOnlyCollection<Element> ReadTerminalSlotElements(Element row, bool iconPresent) =>
+        EnumerateElements(row, 0)
+            .Where(element => element.IsVisible && element.GetClientRectCache.Width > 0 &&
+                element.GetClientRectCache.Height > 0 && HasVisibleIcon(element) == iconPresent)
+            .ToArray();
+
+    private static IReadOnlyCollection<UiControlRect> ReadTerminalSlotRects(Element row, bool iconPresent) =>
+        ReadTerminalSlotElements(row, iconPresent)
+            .Select(element => element.GetClientRectCache)
+            .Select(rect => new UiControlRect(rect.X, rect.Y, rect.Width, rect.Height))
+            .ToArray();
+
+    private static bool HasVisibleIcon(Element element)
+    {
+        var rect = element.GetClientRectCache;
+        return element.Children.Any(child =>
         {
-            var candidate = element.GetClientRectCache;
-            return element.IsVisible && candidate.Width is >= 68 and <= 76 && candidate.Height is >= 68 and <= 76 &&
-                candidate.Contains(point.X, point.Y);
-        }).ToArray();
-        if (slots.Length != 1 || !slots[0].Children.Any(child =>
-            {
-                var childRect = child.GetClientRectCache;
-                return child.IsVisible && childRect.Width >= 80 && childRect.Height >= 80;
-            }))
-        {
-            failure = "Terminal pre-click slot did not retain one exact visible asset icon.";
-            return false;
-        }
-        failure = string.Empty;
-        return true;
+            var childRect = child.GetClientRectCache;
+            return child.IsVisible && childRect.Width >= rect.Width * 1.05f &&
+                childRect.Height >= rect.Height * 1.05f;
+        });
     }
 
     private void Finish(string reason)

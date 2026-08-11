@@ -16,7 +16,7 @@ public sealed record UiControlRect(float X, float Y, float Width, float Height)
 
 public sealed class PickerCalibration
 {
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public NormalizedUiPoint? OfferedButton { get; set; }
@@ -25,19 +25,27 @@ public sealed class PickerCalibration
     public double? PlaceOrderPanelAspectRatio { get; set; }
     public NormalizedUiPoint? CollectionSlotOffset { get; set; }
     public double? CollectionRowAspectRatio { get; set; }
+    public double? CollectionSlotWidthRatio { get; set; }
+    public double? CollectionSlotHeightRatio { get; set; }
     public NormalizedUiPoint? CancelButtonOffset { get; set; }
     public double? CancelRowAspectRatio { get; set; }
     public double? CancelButtonWidthRatio { get; set; }
     public double? CancelButtonHeightRatio { get; set; }
     public NormalizedUiPoint? ReturnSlotOffset { get; set; }
     public double? ReturnRowAspectRatio { get; set; }
+    public double? ReturnSlotWidthRatio { get; set; }
+    public double? ReturnSlotHeightRatio { get; set; }
 
     public bool IsComplete => OfferedButton?.IsValid == true && WantedButton?.IsValid == true;
     public bool IsPlacementComplete => PlaceOrderButton?.IsValid == true;
-    public bool IsCollectionComplete => IsSafeCollectionOffset(CollectionSlotOffset);
+    public bool IsCollectionComplete => IsSafeTerminalGeometry(
+        CollectionSlotOffset, CollectionSlotWidthRatio, CollectionSlotHeightRatio,
+        CollectionRowAspectRatio, wantedSlot: true);
     public bool IsCancellationComplete => IsSafeCancelGeometry(
         CancelButtonOffset, CancelButtonWidthRatio, CancelButtonHeightRatio, CancelRowAspectRatio);
-    public bool IsReturnCollectionComplete => IsSafeReturnOffset(ReturnSlotOffset);
+    public bool IsReturnCollectionComplete => IsSafeTerminalGeometry(
+        ReturnSlotOffset, ReturnSlotWidthRatio, ReturnSlotHeightRatio,
+        ReturnRowAspectRatio, wantedSlot: false);
 
     public bool TryRecord(
         bool wantedSide,
@@ -157,60 +165,134 @@ public sealed class PickerCalibration
     }
 
     public bool TryRecordCollectionSlot(
-        float rowX,
-        float rowY,
-        float rowWidth,
-        float rowHeight,
-        float cursorX,
-        float cursorY,
+        float rowX, float rowY, float rowWidth, float rowHeight,
+        UiControlRect control, out string failure) =>
+        TryRecordTerminalSlot(rowX, rowY, rowWidth, rowHeight, control, wantedSlot: true, out failure);
+
+    public bool TryResolveCollectionSlot(
+        float rowX, float rowY, float rowWidth, float rowHeight,
+        IReadOnlyCollection<UiControlRect> candidateSlots,
+        out System.Numerics.Vector2 point, out string failure) =>
+        TryResolveTerminalSlot(rowX, rowY, rowWidth, rowHeight, candidateSlots,
+            wantedSlot: true, out point, out failure);
+
+    public static bool TrySelectTerminalSlot(
+        float rowX, float rowY, float rowWidth, float rowHeight,
+        float cursorX, float cursorY,
+        IReadOnlyCollection<UiControlRect> candidateSlots,
+        bool wantedSlot,
+        out UiControlRect? control,
         out string failure)
     {
-        if (rowWidth <= 0 || rowHeight <= 0)
+        control = null;
+        var rowAspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
+        var matches = candidateSlots.Where(candidate =>
         {
-            failure = "Tracked order row geometry is invalid.";
+            if (!candidate.Contains(cursorX, cursorY)) return false;
+            var center = new NormalizedUiPoint(
+                (candidate.CenterX - rowX) / rowWidth,
+                (candidate.CenterY - rowY) / rowHeight);
+            return IsSafeTerminalGeometry(center, candidate.Width / rowWidth,
+                candidate.Height / rowHeight, rowAspect, wantedSlot);
+        }).ToArray();
+        if (matches.Length != 1)
+        {
+            failure = $"Terminal calibration cursor did not resolve to one visible scaled {(wantedSlot ? "collection" : "return")} slot; found {matches.Length}.";
             return false;
         }
-
-        var point = new NormalizedUiPoint((cursorX - rowX) / rowWidth, (cursorY - rowY) / rowHeight);
-        if (!IsSafeCollectionOffset(point))
-        {
-            failure = "Collection calibration must be inside the left-side bought-currency slot of the tracked order row.";
-            return false;
-        }
-
-        CollectionSlotOffset = point;
-        CollectionRowAspectRatio = rowWidth / rowHeight;
+        control = matches[0];
         failure = string.Empty;
         return true;
     }
 
-    public bool TryResolveCollectionSlot(
-        float rowX,
-        float rowY,
-        float rowWidth,
-        float rowHeight,
+    private bool TryRecordTerminalSlot(
+        float rowX, float rowY, float rowWidth, float rowHeight,
+        UiControlRect control, bool wantedSlot, out string failure)
+    {
+        var rowAspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
+        var point = rowWidth > 0 && rowHeight > 0
+            ? new NormalizedUiPoint((control.CenterX - rowX) / rowWidth, (control.CenterY - rowY) / rowHeight)
+            : null;
+        var widthRatio = rowWidth > 0 ? control.Width / rowWidth : 0;
+        var heightRatio = rowHeight > 0 ? control.Height / rowHeight : 0;
+        if (!IsSafeTerminalGeometry(point, widthRatio, heightRatio, rowAspect, wantedSlot))
+        {
+            failure = $"Terminal {(wantedSlot ? "collection" : "return")} calibration did not identify a safe square asset slot.";
+            return false;
+        }
+        if (wantedSlot)
+        {
+            CollectionSlotOffset = point;
+            CollectionRowAspectRatio = rowAspect;
+            CollectionSlotWidthRatio = widthRatio;
+            CollectionSlotHeightRatio = heightRatio;
+        }
+        else
+        {
+            ReturnSlotOffset = point;
+            ReturnRowAspectRatio = rowAspect;
+            ReturnSlotWidthRatio = widthRatio;
+            ReturnSlotHeightRatio = heightRatio;
+        }
+        failure = string.Empty;
+        return true;
+    }
+
+    private bool TryResolveTerminalSlot(
+        float rowX, float rowY, float rowWidth, float rowHeight,
+        IReadOnlyCollection<UiControlRect> candidateSlots,
+        bool wantedSlot,
         out System.Numerics.Vector2 point,
         out string failure)
     {
+        var offset = wantedSlot ? CollectionSlotOffset : ReturnSlotOffset;
+        var widthRatio = wantedSlot ? CollectionSlotWidthRatio : ReturnSlotWidthRatio;
+        var heightRatio = wantedSlot ? CollectionSlotHeightRatio : ReturnSlotHeightRatio;
+        var recordedAspect = wantedSlot ? CollectionRowAspectRatio : ReturnRowAspectRatio;
         var aspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
-        if (!IsSafeCollectionOffset(CollectionSlotOffset) ||
-            CollectionRowAspectRatio is not > 0 ||
-            Math.Abs(aspect - CollectionRowAspectRatio.Value) / CollectionRowAspectRatio.Value > 0.03)
+        if (!IsSafeTerminalGeometry(offset, widthRatio, heightRatio, recordedAspect, wantedSlot) ||
+            recordedAspect is not > 0 ||
+            Math.Abs(aspect - recordedAspect.Value) / recordedAspect.Value > 0.03)
         {
             point = default;
-            failure = "Collection slot calibration is missing or does not match the order-row layout.";
+            failure = $"Terminal {(wantedSlot ? "collection" : "return")} slot calibration is missing or does not match the order-row layout.";
             return false;
         }
-
-        point = new System.Numerics.Vector2(
-            rowX + (float)(CollectionSlotOffset!.X * rowWidth),
-            rowY + (float)(CollectionSlotOffset.Y * rowHeight));
+        var matches = candidateSlots.Where(candidate =>
+        {
+            var center = new NormalizedUiPoint(
+                (candidate.CenterX - rowX) / rowWidth,
+                (candidate.CenterY - rowY) / rowHeight);
+            return IsSafeTerminalGeometry(center, candidate.Width / rowWidth,
+                    candidate.Height / rowHeight, aspect, wantedSlot) &&
+                Math.Abs(center.X - offset!.X) <= 0.03 &&
+                Math.Abs(center.Y - offset.Y) <= 0.08 &&
+                RelativeDifference(candidate.Width / rowWidth, widthRatio!.Value) <= 0.20 &&
+                RelativeDifference(candidate.Height / rowHeight, heightRatio!.Value) <= 0.20;
+        }).ToArray();
+        if (matches.Length != 1)
+        {
+            point = default;
+            failure = $"Terminal asset calibration did not resolve to one visible scaled slot; found {matches.Length}.";
+            return false;
+        }
+        point = new System.Numerics.Vector2(matches[0].CenterX, matches[0].CenterY);
         failure = string.Empty;
         return true;
     }
 
-    private static bool IsSafeCollectionOffset(NormalizedUiPoint? point) =>
-        point?.IsValid == true && point.X is >= 0.03 and <= 0.22 && point.Y is >= 0.20 and <= 0.80;
+    private static bool IsSafeTerminalGeometry(
+        NormalizedUiPoint? point,
+        double? widthRatio,
+        double? heightRatio,
+        double? rowAspectRatio,
+        bool wantedSlot) =>
+        point?.IsValid == true &&
+        point.X >= (wantedSlot ? 0.03 : 0.76) && point.X <= (wantedSlot ? 0.22 : 0.89) &&
+        point.Y is >= 0.20 and <= 0.80 &&
+        widthRatio is >= 0.08 and <= 0.25 && heightRatio is >= 0.25 and <= 0.75 &&
+        rowAspectRatio is > 0 &&
+        widthRatio.Value / heightRatio.Value * rowAspectRatio.Value is >= 0.80 and <= 1.25;
 
     public bool TryRecordCancelButton(
         float rowX, float rowY, float rowWidth, float rowHeight,
@@ -331,43 +413,15 @@ public sealed class PickerCalibration
 
     public bool TryRecordReturnSlot(
         float rowX, float rowY, float rowWidth, float rowHeight,
-        float cursorX, float cursorY, out string failure)
-    {
-        var point = rowWidth > 0 && rowHeight > 0
-            ? new NormalizedUiPoint((cursorX - rowX) / rowWidth, (cursorY - rowY) / rowHeight)
-            : null;
-        if (!IsSafeReturnOffset(point))
-        {
-            failure = "Return calibration must be inside the canceled row's right offered-currency slot.";
-            return false;
-        }
-        ReturnSlotOffset = point;
-        ReturnRowAspectRatio = rowWidth / rowHeight;
-        failure = string.Empty;
-        return true;
-    }
+        UiControlRect control, out string failure) =>
+        TryRecordTerminalSlot(rowX, rowY, rowWidth, rowHeight, control, wantedSlot: false, out failure);
 
     public bool TryResolveReturnSlot(
         float rowX, float rowY, float rowWidth, float rowHeight,
-        out System.Numerics.Vector2 point, out string failure)
-    {
-        var aspect = rowHeight > 0 ? rowWidth / rowHeight : 0;
-        if (!IsSafeReturnOffset(ReturnSlotOffset) || ReturnRowAspectRatio is not > 0 ||
-            Math.Abs(aspect - ReturnRowAspectRatio.Value) / ReturnRowAspectRatio.Value > 0.03)
-        {
-            point = default;
-            failure = "Return slot calibration is missing or does not match the canceled-row layout.";
-            return false;
-        }
-        point = new System.Numerics.Vector2(
-            rowX + (float)(ReturnSlotOffset!.X * rowWidth),
-            rowY + (float)(ReturnSlotOffset.Y * rowHeight));
-        failure = string.Empty;
-        return true;
-    }
-
-    private static bool IsSafeReturnOffset(NormalizedUiPoint? point) =>
-        point?.IsValid == true && point.X is >= 0.76 and <= 0.89 && point.Y is >= 0.20 and <= 0.80;
+        IReadOnlyCollection<UiControlRect> candidateSlots,
+        out System.Numerics.Vector2 point, out string failure) =>
+        TryResolveTerminalSlot(rowX, rowY, rowWidth, rowHeight, candidateSlots,
+            wantedSlot: false, out point, out failure);
 }
 
 public sealed class PickerCalibrationStore
@@ -394,15 +448,17 @@ public sealed class PickerCalibrationStore
 
         var calibration = JsonSerializer.Deserialize<PickerCalibration>(json, JsonOptions)
             ?? throw new InvalidDataException("Picker calibration file was empty.");
-        if (schemaVersion is not 1 and not 2 and not 3 and not 4 and not 5 and
+        if (schemaVersion is not 1 and not 2 and not 3 and not 4 and not 5 and not 6 and
                 not PickerCalibration.CurrentSchemaVersion ||
             calibration.OfferedButton is { IsValid: false } ||
             calibration.WantedButton is { IsValid: false } ||
             calibration.PlaceOrderButton is { IsValid: false } ||
-            calibration.CollectionSlotOffset is not null && !IsSafeLoadedCollectionOffset(calibration.CollectionSlotOffset) ||
+            schemaVersion >= 7 && HasAnyTerminalGeometry(calibration, wantedSlot: true) &&
+                !IsSafeLoadedTerminalGeometry(calibration, wantedSlot: true) ||
             schemaVersion >= 6 && HasAnyCancelGeometry(calibration) &&
                 !IsSafeLoadedCancelGeometry(calibration) ||
-            calibration.ReturnSlotOffset is not null && !IsSafeLoadedReturnOffset(calibration.ReturnSlotOffset))
+            schemaVersion >= 7 && HasAnyTerminalGeometry(calibration, wantedSlot: false) &&
+                !IsSafeLoadedTerminalGeometry(calibration, wantedSlot: false))
         {
             throw new InvalidDataException("Picker calibration schema or normalized coordinates are invalid.");
         }
@@ -435,13 +491,41 @@ public sealed class PickerCalibrationStore
             calibration.CancelButtonWidthRatio = null;
             calibration.CancelButtonHeightRatio = null;
         }
+        if (schemaVersion < 7)
+        {
+            calibration.CollectionSlotOffset = null;
+            calibration.CollectionRowAspectRatio = null;
+            calibration.CollectionSlotWidthRatio = null;
+            calibration.CollectionSlotHeightRatio = null;
+            calibration.ReturnSlotOffset = null;
+            calibration.ReturnRowAspectRatio = null;
+            calibration.ReturnSlotWidthRatio = null;
+            calibration.ReturnSlotHeightRatio = null;
+        }
         if (schemaVersion < PickerCalibration.CurrentSchemaVersion) Save(path, calibration);
 
         return calibration;
     }
 
-    private static bool IsSafeLoadedCollectionOffset(NormalizedUiPoint point) =>
-        point.IsValid && point.X is >= 0.03 and <= 0.22 && point.Y is >= 0.20 and <= 0.80;
+    private static bool HasAnyTerminalGeometry(PickerCalibration calibration, bool wantedSlot) =>
+        wantedSlot
+            ? calibration.CollectionSlotOffset is not null || calibration.CollectionRowAspectRatio is not null ||
+                calibration.CollectionSlotWidthRatio is not null || calibration.CollectionSlotHeightRatio is not null
+            : calibration.ReturnSlotOffset is not null || calibration.ReturnRowAspectRatio is not null ||
+                calibration.ReturnSlotWidthRatio is not null || calibration.ReturnSlotHeightRatio is not null;
+
+    private static bool IsSafeLoadedTerminalGeometry(PickerCalibration calibration, bool wantedSlot)
+    {
+        var point = wantedSlot ? calibration.CollectionSlotOffset : calibration.ReturnSlotOffset;
+        var rowAspect = wantedSlot ? calibration.CollectionRowAspectRatio : calibration.ReturnRowAspectRatio;
+        var widthRatio = wantedSlot ? calibration.CollectionSlotWidthRatio : calibration.ReturnSlotWidthRatio;
+        var heightRatio = wantedSlot ? calibration.CollectionSlotHeightRatio : calibration.ReturnSlotHeightRatio;
+        return point?.IsValid == true &&
+            point.X >= (wantedSlot ? 0.03 : 0.76) && point.X <= (wantedSlot ? 0.22 : 0.89) &&
+            point.Y is >= 0.20 and <= 0.80 && widthRatio is >= 0.08 and <= 0.25 &&
+            heightRatio is >= 0.25 and <= 0.75 && rowAspect is > 0 &&
+            widthRatio.Value / heightRatio.Value * rowAspect.Value is >= 0.80 and <= 1.25;
+    }
 
     private static bool HasAnyCancelGeometry(PickerCalibration calibration) =>
         calibration.CancelButtonOffset is not null || calibration.CancelRowAspectRatio is not null ||
@@ -455,9 +539,6 @@ public sealed class PickerCalibrationStore
         calibration.CancelRowAspectRatio is > 0 &&
         calibration.CancelButtonWidthRatio.Value / calibration.CancelButtonHeightRatio.Value *
             calibration.CancelRowAspectRatio.Value is >= 0.75 and <= 1.34;
-
-    private static bool IsSafeLoadedReturnOffset(NormalizedUiPoint point) =>
-        point.IsValid && point.X is >= 0.76 and <= 0.89 && point.Y is >= 0.20 and <= 0.80;
 
     public void Save(string path, PickerCalibration calibration)
     {

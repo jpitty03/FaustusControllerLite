@@ -1,126 +1,79 @@
 # FaustusControllerLite
 
-FaustusControllerLite automates Currency Exchange arbitrage and stash sell sweeps using exact,
-persisted order state. It starts fail-closed: the plugin, every input permission, and every hotkey
-are disabled or unbound by default.
+FaustusControllerLite automates Currency Exchange arbitrage and sell sweeps. It tracks every order,
+collection, and stash transfer in durable state so interrupted workflows can resume safely.
 
-This guide covers a clean first-time setup. Complete the calibration and test-order sections before
-enabling the full workflow.
+Everything starts disabled. Complete this guide before enabling full automation.
 
 ## Requirements
 
-- A working ExileAPI installation loading `Plugins/Source/FaustusControllerLite`.
-- Access to the in-game Currency Exchange in the intended league.
-- Enough exchange gold for probing, calibration orders, and production orders.
-- Chaos and Divine physically available for the bankroll amount you configure.
-- Free inventory space and at least one free Currency Exchange order slot.
-- A visible Currency stash tab during arbitrage custody operations.
-- Correct stash affinities for non-currency targets such as scarabs.
-- Stable game resolution, window mode, UI scale, and exchange layout after calibration.
+- Disable the full `FaustusController` plugin.
+- Open Path of Exile in the league you intend to use.
+- Have enough Chaos, Divine, and gold for the configured bankroll.
+- Keep the Currency Exchange, stash, and inventory visible while operating.
+- Keep Path of Exile foreground and release Control, Shift, and Alt.
+- Use a stable resolution, window mode, UI scale, and exchange layout.
+- Assign a unique key to every hotkey you use.
 
-Plugin settings are persisted in:
+The current custody implementation requires a visible Currency or Fragment premium stash tab. A
+normal affinity tab is not yet supported.
 
-`config/global/FaustusControllerLite_settings.json`
+## Quick Setup
 
-## Safety Rules
+1. Enable `FaustusControllerLite` and disable all `Allow...` permissions.
+2. Set `ActiveFeature = Arbitrage`.
+3. Open the Currency Exchange and wait for `Catalogue: ready`.
+4. Select `TargetCurrency`.
+5. Assign the calibration, adoption, recovery, and workflow hotkeys.
+6. Seed a small test bankroll.
+7. Calibrate both picker buttons and the Place Order button.
+8. Use small test orders to calibrate collection, cancel, and return controls.
+9. Resolve every test order until `Tracked order` is `Stashed` or `None`.
+10. Safely reseed the production bankroll.
+11. Enable the full-workflow permissions.
+12. Press `FullWorkflowHotkey` once.
 
-- Disable the full `FaustusController` plugin. It must not run alongside Lite input automation.
-- Use unique hotkeys. A duplicate binding causes both actions to refuse input.
-- Keep Path of Exile in the foreground while the plugin is operating.
-- Keep the Currency Exchange, stash, and inventory visible. Keep the currency picker closed unless
-  the plugin opens it.
-- Release Control, Shift, and Alt before calibration or automation.
-- Do not move the mouse while the plugin is moving it.
-- Do not change the target, feature, permissions, league, area, or UI layout during a workflow.
-- Never delete state files to clear an unresolved order. Reconcile the exchange, inventory, and
-  stash first.
-
-## First-Time Checklist
-
-1. Disable `FaustusController` and enable `FaustusControllerLite`.
-2. Leave every `Allow...` permission disabled.
-3. Enter the intended league and open the Currency Exchange, stash, and inventory.
-4. Wait for the overlay to report `Catalogue: ready (...)`.
-5. Set `ActiveFeature` to `Arbitrage` and select `TargetCurrency`.
-6. Assign unique hotkeys, including all calibration and recovery hotkeys.
-7. Initialize a small test bankroll.
-8. Calibrate the offered picker, wanted picker, and Place Order button.
-9. Use small test orders to calibrate collection, cancellation, and the offered-return slot.
-10. Resolve and stash every test-order asset.
-11. Safely reseed the intended production bankroll.
-12. Enable the full-workflow permission profile.
-13. Verify the required UI and overlay state, then press `FullWorkflowHotkey` once.
-
-## Configure the Plugin
-
-### Feature and Target
-
-Set:
-
-- `ActiveFeature = Arbitrage`
-- `TargetCurrency` to the currency or scarab to trade
-
-The target list is populated from the live Currency Exchange catalogue. Wait for the catalogue to
-be ready before selecting a target. The plugin persists exact metadata, not only the display name.
-
-Do not change the feature or target while a workflow, tracked order, or recovery operation exists.
-
-### Strategy
-
-Important settings:
-
-| Setting | Default | Purpose |
-| --- | ---: | --- |
-| `StartingChaos` | `0` | Chaos committed to the canonical bankroll when reset is applied. |
-| `StartingDivine` | `0` | Divine committed to the canonical bankroll when reset is applied. |
-| `MinimumProfitChaos` | `5` | Minimum post-restoration profit for a new route. |
-| `CompetingOrderWaitMinutes` | `5` | Time before a resting order is eligible for cancellation. |
-| `ContinuousWorkflowRetrySeconds` | `10` | Base delay before a no-trade/restoration retry. |
-| `MaximumQuoteAgeSeconds` | `60` | Maximum accepted quote and ownership age. |
-| `StableRateSampleCount` | `3` | Matching book samples required before accepting a quote. |
-| `CursorTweenSpeed` | `1600` | Verified cursor movement speed. |
-
-`StartingChaos` and `StartingDivine` do not alter an already loaded bankroll. They take effect only
-after a safe or forced fresh-state reset. Seed only currency that is physically available and
-intentionally committed to the plugin.
-
-### Hotkeys
-
-All hotkeys are unbound by default. Assign a different key or controller signature to each action.
-
-Required for calibration and full operation:
+## Important Settings
 
 | Setting | Purpose |
 | --- | --- |
-| `CalibratePickerButtonHotkey` | Calibrates both picker buttons, one at a time. |
-| `CalibratePlaceOrderHotkey` | Records the Place Order button without clicking it. |
-| `CalibrateCollectionHotkey` | Records the bought-currency slot on a completed row. |
-| `CalibrateCancelHotkey` | Records the cancel X on a timed-out row. |
-| `CalibrateReturnSlotHotkey` | Records the offered-currency return slot on a terminal row. |
-| `AdoptPendingOrderHotkey` | Adopts one exact existing test order into canonical tracking. |
-| `CollectTrackedOrderHotkey` | Collects or reconciles one terminal asset batch. |
-| `StashCollectedCurrencyHotkey` | Stashes or reconciles the current collected batch. |
-| `CancelTimedOutOrderHotkey` | Cancels the exact canonical timed-out order. |
+| `StartingChaos` | Chaos committed when a fresh-state reset is applied. |
+| `StartingDivine` | Divine committed when a fresh-state reset is applied. |
+| `MinimumProfitChaos` | Minimum post-restoration profit required for a new route. |
+| `CompetingOrderWaitMinutes` | Time before a pending order becomes `TimedOut`. |
+| `ContinuousWorkflowRetrySeconds` | Delay before retrying a route or restoration. |
+| `MaximumQuoteAgeSeconds` | Maximum accepted market and ownership age. |
+
+Changing `StartingChaos` or `StartingDivine` does not change the current bankroll. Apply a safe
+fresh-state reset to use the new values.
+
+## Hotkeys to Assign
+
+All hotkeys are unbound by default.
+
+| Hotkey setting | Purpose |
+| --- | --- |
+| `CalibratePickerButtonHotkey` | Calibrates offered and wanted picker buttons. |
+| `CalibratePlaceOrderHotkey` | Calibrates Place Order without clicking it. |
+| `CalibrateCollectionHotkey` | Calibrates the bought-currency slot. |
+| `CalibrateCancelHotkey` | Calibrates the pending-row cancel X. |
+| `CalibrateReturnSlotHotkey` | Calibrates the offered-currency return slot. |
+| `AdoptPendingOrderHotkey` | Adds one exact existing order to plugin tracking. |
+| `CollectTrackedOrderHotkey` | Collects one verified settlement batch. |
+| `StashCollectedCurrencyHotkey` | Stashes one collected batch. |
+| `CancelTimedOutOrderHotkey` | Cancels the exact tracked timed-out order. |
 | `FullWorkflowHotkey` | Starts, stops, or resumes arbitrage automation. |
-| `DumpSdkReadsHotkey` | Writes a diagnostic dump for troubleshooting. |
+| `DumpSdkReadsHotkey` | Writes a diagnostic dump. |
 
-Optional/manual-operation hotkeys include `ProbeMarketsHotkey`, `CaptureCurrentPairHotkey`,
-`ExecuteSingleLegHotkey`, `PlaceStagedLegHotkey`, and `SellSweepHotkey`.
+## Seed a Test Bankroll
 
-## Initialize a Test Bankroll
-
-The bankroll is durable accounting state, not an automatic inventory scan.
-
-1. Set `StartingChaos` and `StartingDivine` to small amounts that cover the test orders below.
-2. In the plugin settings, press `ArmFreshStateReset`.
+1. Set small `StartingChaos` and `StartingDivine` values that cover your test orders.
+2. Press `ArmFreshStateReset` in plugin settings.
 3. Press `ApplyArmedFreshStateReset` within 10 seconds.
-4. Verify the overlay `Bankroll:` line shows the current league and expected seed.
+4. Confirm the overlay `Bankroll` line shows the expected amounts.
 
-A safe reset is refused while a workflow, sell sweep, unresolved order, unreadable state, or input
-operation exists. It preserves calibration, rates, audits, and runtime diagnostics.
-
-Do not use the forced reset for normal setup. A forced reset abandons accounting and moves no
-in-game items.
+The bankroll is accounting state, not an inventory scan. Only seed currency you physically own and
+intend the plugin to use.
 
 ## Calibration
 
@@ -128,95 +81,91 @@ Calibration is saved in:
 
 `config/FaustusControllerLite/FaustusControllerLite/picker-calibration.json`
 
-Use the same game resolution, window mode, UI scale, and exchange layout intended for operation.
-Recalibrate after a material layout or aspect-ratio change.
+### Offered Picker
 
-### 1. Offered-Currency Picker Button
-
-1. Open the Currency Exchange and close the currency picker.
+1. Open the exchange and close the currency picker.
 2. Hover the offered-currency picker button.
 3. Press `CalibratePickerButtonHotkey`.
-4. Without moving the cursor, manually click that picker button within five seconds.
-5. Wait for `Recorded normalized offered picker button calibration.`
-6. Close the picker.
+4. Without moving the cursor, manually click that button within five seconds.
+5. Close the picker after the overlay reports success.
 
-The game must remain foreground, the exchange and cursor geometry must remain stable, and modifiers
-must be released.
+### Wanted Picker
 
-### 2. Wanted-Currency Picker Button
+Repeat the offered-picker steps over the wanted-currency picker button.
 
-Repeat the same process while hovering the wanted-currency picker button. Wait for:
-
-`Recorded normalized wanted picker button calibration.`
-
-The overlay should now show:
+The overlay should show:
 
 `Picker calibration: offered=ready, wanted=ready`
 
-### 3. Place Order Button
+### Place Order
 
-1. Make the Place Order button visible by selecting any valid pair and entering harmless amounts.
-2. Hover the actual Place Order button.
+1. Select any valid pair and amounts so Place Order is visible.
+2. Hover the Place Order button.
 3. Press `CalibratePlaceOrderHotkey`.
-4. Do **not** click Place Order during calibration.
-5. Verify `Recorded normalized Place Order target without clicking it.`
-6. Verify `Place Order calibration: ready` on the overlay.
+4. Do not click Place Order.
+5. Confirm `Place Order calibration: ready`.
 
-### 4. Collection Slot
+### Collection Slot
 
-This calibration requires a canonical tracked order in `CompletedUncollected` state.
+This requires one tracked order in `CompletedUncollected` state.
 
-1. With all automation permissions still disabled, manually place a very small order offering seeded
-   Chaos or Divine for the selected target.
+Schema 7 records the live asset slot's row-relative position and size so collection works across
+scaled 2560x1440 and 1920x1080 layouts. Older collection/return calibration is cleared once and must
+be recorded again.
+
+1. Manually place a tiny order offering seeded Chaos or Divine for the selected target.
 2. Let it fill and leave the completed row visible.
-3. Press `AdoptPendingOrderHotkey`. Despite the name, it can adopt the exact terminal row.
-4. Verify the tracked status is `CompletedUncollected`.
-5. Hover the completed row's **left bought/wanted-currency slot**.
+3. Press `AdoptPendingOrderHotkey`.
+4. Confirm the overlay reports `CompletedUncollected`.
+5. Hover the completed row's left bought-currency slot.
 6. Press `CalibrateCollectionHotkey`.
-7. Verify `Recorded collection slot offset for exact tracked order ...` and
-   `Collection calibration: ready`.
+7. Do not click the slot.
 
-Calibration records the location only; it does not collect the order.
+### Cancel Button
 
-### 5. Cancel Button
+This requires one tracked order in `TimedOut` state. `TimedOut` is a plugin status, not game text.
 
-This calibration requires a canonical tracked order in exact `TimedOut` state.
+Before starting:
 
-Calibration schema 6 records the live cancel control's row-relative center and dimensions, so the
-same layout can scale between 2560x1440 and 1920x1080. Older point-only cancel calibration is
-cleared on upgrade and must be recorded again.
+- Bind `AdoptPendingOrderHotkey`, `CalibrateCancelHotkey`, and `CancelTimedOutOrderHotkey`.
+- Set `CompetingOrderWaitMinutes = 1` for calibration.
+- Set the timeout before adopting the order.
+- Resolve any previous tracked order first.
 
-1. Resolve and stash the completed calibration order as described below.
-2. Manually place a tiny resting order offering seeded Chaos or Divine for the selected target.
-3. Press `AdoptPendingOrderHotkey` while that is the one exact matching order.
-4. Keep the exchange visible until the overlay reports `TimedOut`.
-5. Hover directly inside the pending row's small **right-edge cancel X**. Calibration must resolve
-   the cursor to one unique visible square leaf control.
-6. Press `CalibrateCancelHotkey`.
-7. Do not click the X during calibration.
-8. Verify `Recorded exact pending-row cancel X calibration; no click occurred.`
+Procedure:
 
-The timeout is captured when the order is adopted. Set `CompetingOrderWaitMinutes` before adoption.
+1. Manually place a tiny, unattractive order offering seeded Chaos or Divine for the selected target.
+2. Ensure it is the only matching core-to-target order.
+3. Press `AdoptPendingOrderHotkey`.
+4. Confirm the overlay reports `Pending adopted`.
+5. Keep the exchange and pending row visible until the overlay reports `TimedOut`.
+6. Hover directly inside the small right-edge cancel X.
+7. Press `CalibrateCancelHotkey`.
+8. Do not click the X.
+9. Confirm `Recorded exact pending-row cancel X calibration; no click occurred.`
 
-### 6. Offered-Return Slot
+Schema 6 records the live control's row-relative position and size. It supports scaled layouts such
+as 2560x1440 and 1920x1080. Older cancel calibration is cleared once and must be recorded again.
 
-After the cancel button is calibrated:
+If the test order fills, resolve it and create another order at a less attractive rate.
 
-1. Enable the manual cancellation permissions listed below.
+### Return Slot
+
+1. After cancel calibration, enable the manual cancellation permissions below.
 2. Press `CancelTimedOutOrderHotkey` once.
-3. Wait for `CanceledUncollected` with a positive offered return.
-4. Hover the terminal row's **right offered-currency return slot**.
+3. Wait for `CanceledUncollected` with returned offered currency.
+4. Hover the terminal row's right offered-currency slot.
 5. Press `CalibrateReturnSlotHotkey`.
-6. Verify `Recorded canceled offered-return slot calibration; no click occurred.`
+6. Do not click the slot.
 
-If the test order fills completely, it cannot supply return-slot calibration. Create another small
-resting order.
+Hover directly inside the visible returned-currency slot. Schema 7 records the actual scaled slot,
+not only the cursor position.
 
-## Resolve the Calibration Orders
+## Resolve Test Orders
 
-Only one collection batch may be pending stash custody at a time.
+Use only one manual permission profile at a time.
 
-### Manual Cancellation Permissions
+### Cancel
 
 Enable:
 
@@ -224,10 +173,10 @@ Enable:
 - `AllowVerifiedClicks`
 - `AllowOrderCancellation`
 
-Keep placement, collection, stash transfer, full workflow, and sell sweep disabled. Press
-`CancelTimedOutOrderHotkey` once and wait for terminal state.
+Disable placement, collection, stash transfer, full workflow, and sell sweep. Press
+`CancelTimedOutOrderHotkey` once.
 
-### Manual Collection Permissions
+### Collect
 
 Enable:
 
@@ -236,10 +185,10 @@ Enable:
 - `AllowQueryInput`
 - `AllowOrderCollection`
 
-Keep placement, cancellation, stash transfer, full workflow, and sell sweep disabled. Press
-`CollectTrackedOrderHotkey` once per authorized collection/reconciliation step.
+Disable placement, cancellation, stash transfer, full workflow, and sell sweep. Press
+`CollectTrackedOrderHotkey` once per batch.
 
-### Manual Stash Permissions
+### Stash
 
 Enable:
 
@@ -249,27 +198,25 @@ Enable:
 - `AllowOrderCollection`
 - `AllowStashTransfer`
 
-Keep placement, cancellation, full workflow, and sell sweep disabled. Press
-`StashCollectedCurrencyHotkey` after each collected batch. Do not collect another batch until the
-current batch has verified stash custody.
+Disable placement, cancellation, full workflow, and sell sweep. Press
+`StashCollectedCurrencyHotkey` after each collected batch.
 
-Continue until the tracked order reaches `Stashed` and no canonical custody remains unresolved.
+Do not collect another batch until the current batch has verified stash custody. Continue until the
+tracked order reaches `Stashed`.
 
-## Apply the Production Bankroll
+## Production Bankroll
 
-After all test orders are resolved:
+After every test order is resolved:
 
 1. Disable all input permissions.
 2. Set the intended production `StartingChaos` and `StartingDivine`.
 3. Press `ArmFreshStateReset`.
 4. Press `ApplyArmedFreshStateReset` within 10 seconds.
-5. Confirm the overlay shows the intended seeded balances, no active workflow, and no tracked order.
+5. Confirm the expected bankroll, no active workflow, and no tracked order.
 
-## Enable Full Arbitrage
+## Full Workflow Permissions
 
-Set `ActiveFeature = Arbitrage`.
-
-Enable all of these:
+Enable:
 
 - `AllowAutomatedProbing`
 - `AllowVerifiedMouseMovement`
@@ -282,88 +229,47 @@ Enable all of these:
 - `AllowStashTransfer`
 - `AllowFullWorkflow`
 
-Disable:
+Disable `AllowSellSweep` and keep `ActiveFeature = Arbitrage`.
 
-- `AllowSellSweep`
+Before starting, verify the exchange, stash, and inventory are visible; the picker and popups are
+closed; all calibration is ready; and `Last failure` is `None`.
 
-The permission snapshot is captured when the workflow is authorized. Changing any permission while
-authorized stops local workflow input before the next controller step.
+Press `FullWorkflowHotkey` once to start.
 
-## Required UI Before Starting
+## Stop and Resume
 
-Verify all of the following:
+Pressing `FullWorkflowHotkey` again stops local automation. It does not forget or automatically
+cancel a server-side order.
 
-- Path of Exile is foreground.
-- Currency Exchange is visible.
-- Currency picker is closed.
-- No popup is visible.
-- Stash and inventory are visible.
-- The full `FaustusController` plugin is disabled.
-- The bankroll and tracked-order files loaded without errors.
-- No unrelated order or input operation is unresolved.
-- The overlay reports:
-  - `Active feature: Arbitrage`
-  - `Exchange panel: visible`
-  - `Catalogue: ready (...)`
-  - the intended target metadata
-  - `Last failure: None`
-  - the intended bankroll seed
-  - picker offered/wanted ready
-  - Place Order ready
-  - Collection ready
+To resume after stopping, changing area, or reloading the plugin:
 
-## Start, Stop, and Resume
-
-Press `FullWorkflowHotkey` once to authorize automation.
-
-For a new workflow, the plugin probes the required markets, persists an exact route before clicking,
-refreshes each market before placement, tracks one order at a time, collects and stashes exact
-settlement assets, and restores Divine principal before completing a Divine-funded cycle.
-
-If no route is accepted, authorization remains active and the plugin retries after the configured
-delay. A restoration waits and reprobes rather than abandoning outstanding principal.
-
-Pressing `FullWorkflowHotkey` a second time stops **local automation**. It does not forget or
-automatically cancel a server-side order.
-
-To resume:
-
-1. Restore the exact full-workflow permission profile and required UI.
+1. Restore the required UI and permission profile.
 2. Press `FullWorkflowHotkey` once.
-3. The plugin resumes the durable phase and leg instead of creating a replacement route.
 
-An area change or plugin reload revokes local authorization but preserves durable workflow and order
-state. Reopen the required UI and press the workflow hotkey once to resume.
+The plugin resumes the durable workflow phase instead of creating a replacement route.
 
 ## Troubleshooting
 
-Read `Operation`, `Last failure`, `Workflow`, `Continuous trading`, and `Tracked order` on the
-overlay before pressing another hotkey.
+| Problem | Action |
+| --- | --- |
+| Hotkey does nothing | Bind it, enable the plugin, and verify the active feature. |
+| Hotkey conflict | Assign every action a unique binding. |
+| Adoption finds zero orders | Verify offered currency, selected target, and visible order row. |
+| Adoption finds multiple orders | Leave only one matching Chaos/Divine-to-target order. |
+| Order never becomes `TimedOut` | Keep the row visible and verify the timeout was set before adoption. |
+| Cancel calibration finds no control | Reload schema 6 and hover directly inside the X. |
+| Calibration finds multiple controls | Reposition the cursor in the center of the X. |
+| Quote unavailable | Leave authorization active; the workflow retries safely. |
+| Ambiguous order or custody | Do not place another order or reset state. Reconcile it manually. |
 
-Common failures:
-
-- **Hotkey conflict:** assign unique hotkeys.
-- **Catalogue unavailable:** open the Currency Exchange and wait for a readable catalogue.
-- **Calibration missing:** complete all six captures above.
-- **Full controller conflict:** disable `FaustusController`.
-- **Permission changed:** restore the exact profile and reauthorize.
-- **Area changed:** reopen the exchange/stash/inventory and reauthorize.
-- **Quote unavailable:** leave authorization active; the workflow retries safely.
-- **Ambiguous custody/order:** do not place another order or reset state. Reconcile the exact live
-  order, inventory, and stash first.
-
-Press `DumpSdkReadsHotkey` for a live diagnostic. Useful evidence is written to:
+Diagnostics are written to:
 
 - `config/FaustusControllerLite/FaustusControllerLite/sdk-diagnostic.txt`
 - `config/FaustusControllerLite/FaustusControllerLite/workflow-runtime.log`
 - `config/FaustusControllerLite/FaustusControllerLite/execution-audit-<league>.jsonl`
 - `config/FaustusControllerLite/FaustusControllerLite/bankroll-<league>.json`
 
-## Forced Reset Warning
+Do not use forced reset as normal recovery. It abandons accounting but does not move items or cancel
+orders.
 
-`ArmForcedFreshStateReset` and `ApplyArmedForcedFreshStateReset` are last-resort recovery controls.
-They quarantine canonical files and abandon the listed accounting, but they do not move an item or
-cancel an exchange order. Use them only after manually reconciling every listed custody item and
-preserving the audit evidence.
-
-For sell-sweep-specific behavior, see [SELL-SWEEP.md](SELL-SWEEP.md).
+For sell sweep behavior, see [SELL-SWEEP.md](SELL-SWEEP.md).
