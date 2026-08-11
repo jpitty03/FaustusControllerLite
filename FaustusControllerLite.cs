@@ -596,50 +596,45 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         var x = 100f;
         var y = 100f;
-        DrawStatus("FaustusControllerLite - Milestone 9 full workflow", ref y, SharpDX.Color.Cyan);
-        DrawStatus($"Active feature: {_observedFeatureLabel} (the other feature's hotkeys refuse)", ref y, SharpDX.Color.Yellow);
-        DrawStatus($"Exchange panel: {(panelVisible ? "visible" : "closed")}", ref y, SharpDX.Color.White);
-        DrawStatus($"Catalogue: {_catalogueStatus}", ref y, _catalogue == null ? SharpDX.Color.Orange : SharpDX.Color.LimeGreen);
-        DrawStatus($"Target: {Settings.TargetCurrencyDisplayName} | {Settings.TargetCurrencyMetadata}", ref y, SharpDX.Color.White);
+        var automationAuthorized = _activeFeature == FeatureMode.Arbitrage
+            ? _fullWorkflowAuthorized
+            : _sweepAuthorized;
+        var allCalibrated = _pickerCalibration.IsComplete && _pickerCalibration.IsPlacementComplete &&
+            _pickerCalibration.IsCollectionComplete && _pickerCalibration.IsCancellationComplete &&
+            _pickerCalibration.IsReturnCollectionComplete;
+        DrawStatus("FaustusControllerLite", ref y, SharpDX.Color.Cyan);
+        DrawStatus($"Mode: {_observedFeatureLabel} | Automation: {(automationAuthorized ? "authorized" : "idle")}",
+            ref y, automationAuthorized ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
+        DrawStatus($"Market: exchange {(panelVisible ? "open" : "closed")} | " +
+            $"catalogue {(_catalogue is null ? "unavailable" : "ready")} | target {Settings.TargetCurrencyDisplayName}",
+            ref y, panelVisible && _catalogue is not null ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
         DrawStatus($"Operation: {_operationStatus}", ref y, SharpDX.Color.White);
         DrawStatus($"Last failure: {_lastFailure}", ref y, _lastFailure == "None" ? SharpDX.Color.Gray : SharpDX.Color.OrangeRed);
-        DrawStatus($"Bankroll: {DescribeBankroll()}", ref y, _bankroll.IsInitialized ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
-        DrawStatus($"Latest rates: {_rateStore.Captures.Count} canonical league/pair records", ref y, SharpDX.Color.White);
-        DrawStatus($"Picker calibration: {DescribePickerCalibration()}", ref y,
-            _pickerCalibration.IsComplete ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
-        DrawStatus($"Place Order calibration: {(_pickerCalibration.IsPlacementComplete ? "ready" : "missing")}", ref y,
-            _pickerCalibration.IsPlacementComplete ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
-        DrawStatus($"Collection calibration: {(_pickerCalibration.IsCollectionComplete ? "ready" : "missing")}", ref y,
-            _pickerCalibration.IsCollectionComplete ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
-        DrawStatus($"Probe state: {_automatedProbe.State} | {_automatedProbe.Status}", ref y,
-            _automatedProbe.IsRunning ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
-        DrawStatus($"Staging state: {_singleLegStaging.State} | {_singleLegStaging.Status}", ref y,
-            _singleLegStaging.IsRunning ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
-        DrawStatus($"Placement: {_placementPreparation}/{_singleLegPlacement.State} | {_singleLegPlacement.Status}", ref y,
-            _singleLegPlacement.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
-        DrawStatus($"Collection: {_collectionFlow}/{_trackedCollection.State} | {_trackedCollection.Status}", ref y,
-            _trackedCollection.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
-        DrawStatus($"Stash transfer: {_inventoryStashTransfer.State} | {_inventoryStashTransfer.Status}", ref y,
-            _inventoryStashTransfer.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
-        DrawStatus($"Cancellation: {_trackedCancellation.State} | {_trackedCancellation.Status}", ref y,
-            _trackedCancellation.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
-        DrawStatus($"Canceled return: {_canceledReturnCollection.State} | {_canceledReturnCollection.Status}", ref y,
-            _canceledReturnCollection.IsRunning ? SharpDX.Color.Orange : SharpDX.Color.Gray);
-        DrawStatus($"Sell sweep: {_sellSweepStatus}", ref y,
-            _sellSweep?.IsActive == true ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
-        DrawStatus($"Workflow: {DescribeWorkflow()}", ref y,
-            _bankroll.Workflow?.IsActive == true ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
-        DrawStatus($"Continuous trading: {DescribeContinuousScan()}", ref y,
-            _fullWorkflowAuthorized ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
-        DrawStatus($"Tracked order: {_trackedOrder}", ref y, SharpDX.Color.Gray);
-        DrawStatus($"Last candidate path: {_lastCandidate}", ref y, SharpDX.Color.Gray);
-        DrawStatus($"Fresh-state reset armed: {(_freshStateResetArmed ? "YES (apply within 10 seconds)" : "no")}", ref y, _freshStateResetArmed ? SharpDX.Color.OrangeRed : SharpDX.Color.Gray);
+        DrawStatus($"Bankroll: {DescribeBankrollCompact()}", ref y,
+            _bankroll.IsInitialized ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
+        DrawStatus(_activeFeature == FeatureMode.Arbitrage
+                ? $"Workflow: {DescribeWorkflowCompact()}"
+                : $"Sell sweep: {_sellSweepStatus}",
+            ref y, _bankroll.Workflow?.IsActive == true || _sellSweep?.IsActive == true
+                ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
+        DrawStatus($"Tracked order: {DescribeTrackedOrderCompact()}", ref y,
+            _trackedOrderState?.Status == TrackedOrderStatus.Ambiguous ? SharpDX.Color.OrangeRed : SharpDX.Color.Gray);
+        DrawStatus($"Calibration: picker={Ready(_pickerCalibration.IsComplete)}, " +
+            $"place={Ready(_pickerCalibration.IsPlacementComplete)}, " +
+            $"collect={Ready(_pickerCalibration.IsCollectionComplete)}, " +
+            $"cancel={Ready(_pickerCalibration.IsCancellationComplete)}, " +
+            $"return={Ready(_pickerCalibration.IsReturnCollectionComplete)}",
+            ref y, allCalibrated ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
+        if (_freshStateResetArmed)
+            DrawStatus("Fresh-state reset armed; apply within 10 seconds.", ref y, SharpDX.Color.OrangeRed);
         if (_forcedResetArmed)
         {
             DrawStatus("FORCED reset armed (apply within 15 seconds). It abandons this accounting:",
                 ref y, SharpDX.Color.Red);
             DrawStatus($"  {_forcedResetDiscardSummary}", ref y, SharpDX.Color.Red);
         }
+
+        static string Ready(bool ready) => ready ? "ready" : "missing";
 
         void DrawStatus(string text, ref float currentY, SharpDX.Color color)
         {
@@ -5969,65 +5964,55 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
-    private string DescribeBankroll()
+    private string DescribeBankrollCompact()
     {
         if (!_bankroll.IsInitialized)
         {
-            return "not initialized; spend is zero until explicitly armed and applied";
+            return "not initialized";
         }
 
         var targetAmount = _bankroll.GetAvailable(Settings.TargetCurrencyMetadata);
-        return $"{_bankroll.League}: ledger {_bankroll.AvailableChaos} Chaos/{_bankroll.AvailableDivine} Divine/" +
-            $"{targetAmount} selected target ({_bankroll.NonCoreBalances.Count} retained non-core balances); " +
-            $"I-have reads Chaos={DescribeOwned("Chaos Orb")}, Divine={DescribeOwned("Divine Orb")}; " +
-            $"seeded {_bankroll.SeededChaos}/{_bankroll.SeededDivine}";
+        var target = targetAmount > 0 ? $" | target {targetAmount}" : string.Empty;
+        return $"available {_bankroll.AvailableChaos}c/{_bankroll.AvailableDivine}d | " +
+            $"reserved {_bankroll.ReservedChaos}c/{_bankroll.ReservedDivine}d | " +
+            $"uncollected {_bankroll.CompletedUncollectedChaos}c/{_bankroll.CompletedUncollectedDivine}d{target}";
     }
 
-    private string DescribeWorkflow()
+    private string DescribeWorkflowCompact()
     {
         var workflow = _bankroll.Workflow;
-        if (workflow is null) return "none";
+        if (workflow is null)
+        {
+            if (!_fullWorkflowAuthorized) return "none";
+            return _nextWorkflowScanAtUtc is { } scan
+                ? $"waiting {Math.Max(0, (int)Math.Ceiling((scan - DateTimeOffset.UtcNow).TotalSeconds))}s"
+                : "scanning";
+        }
         var leg = workflow.CurrentLegIndex >= workflow.Legs.Count
             ? workflow.Legs.Count
             : workflow.CurrentLegIndex + 1;
-        return $"{workflow.Phase}, leg {leg}/{workflow.Legs.Count}, authorized={_fullWorkflowAuthorized}, " +
-            $"Chaos realized={workflow.PlannedRealizedChaos}, restoration={workflow.RestoredPrincipal}/" +
-            $"{workflow.RestorationPrincipal} principal, outstanding={workflow.OutstandingPrincipal}, " +
-            $"restoration spend planned/actual={workflow.PlannedRestorationSpendChaos}/" +
-            $"{workflow.CumulativeActualRestorationChaosSpent} Chaos, planned profit={workflow.PlannedProfitChaos} Chaos | " +
-            workflow.Detail;
+        var authorization = _fullWorkflowAuthorized ? "authorized" : "paused";
+        var restoration = workflow.OutstandingPrincipal > 0
+            ? $" | restore {workflow.OutstandingPrincipal} principal"
+            : string.Empty;
+        var retry = _nextWorkflowScanAtUtc is { } deadline
+            ? $" | retry {Math.Max(0, (int)Math.Ceiling((deadline - DateTimeOffset.UtcNow).TotalSeconds))}s"
+            : string.Empty;
+        return $"{workflow.Phase} | leg {leg}/{workflow.Legs.Count} | {authorization}{restoration}{retry}";
     }
 
-    private string DescribeContinuousScan()
+    private string DescribeTrackedOrderCompact()
     {
-        if (!_fullWorkflowAuthorized) return "stopped; press the workflow hotkey to authorize";
-        if (_nextWorkflowScanAtUtc is not { } deadline)
-        {
-            var blocking = DescribeActiveInputOperation();
-            if (blocking != "nothing") return $"authorized; waiting on {blocking}";
-            return _startingNewWorkflow ? "authorized; scanning for a route" : "authorized; executing the current workflow";
-        }
-
-        var remaining = deadline - DateTimeOffset.UtcNow;
-        return remaining <= TimeSpan.Zero
-            ? "authorized; retry cooldown elapsed"
-            : _startingNewWorkflow
-                ? $"authorized; no accepted route, reprobing in {(int)Math.Ceiling(remaining.TotalSeconds)}s"
-                : $"authorized; restoration unavailable, reprobing in {(int)Math.Ceiling(remaining.TotalSeconds)}s";
-    }
-
-    private string DescribeOwned(string currencyName)
-    {
-        if (_catalogue is null || !_catalogue.TryGetUniqueByName(currencyName, out var currency) || currency is null ||
-            !_liveOwnedByMetadata.TryGetValue(currency.Metadata, out var observation))
-        {
-            return "unobserved";
-        }
-
-        var age = DateTimeOffset.UtcNow - observation.ObservedAtUtc;
-        return age < TimeSpan.Zero
-            ? $"{observation.Count} (future timestamp)"
-            : $"{observation.Count} ({age.TotalSeconds:F0}s old)";
+        var tracked = _trackedOrderState;
+        if (tracked is null || tracked.Status == TrackedOrderStatus.None) return "none";
+        var id = tracked.PlayerOrderId is { } orderId ? $" | order {orderId}" : string.Empty;
+        var terminal = tracked.Status is TrackedOrderStatus.CompletedUncollected or
+            TrackedOrderStatus.CanceledUncollected
+            ? $" | proceeds {tracked.TerminalReceivedWantedAmount.GetValueOrDefault()} | " +
+                $"return {tracked.TerminalRemainingOfferedAmount.GetValueOrDefault()}"
+            : string.Empty;
+        var recovery = tracked.Status == TrackedOrderStatus.Ambiguous ? " | recovery required" : string.Empty;
+        return $"{tracked.Status}{id}{terminal}{recovery}";
     }
 
     private static string DescribeRejections(RoutePlannerResult result)

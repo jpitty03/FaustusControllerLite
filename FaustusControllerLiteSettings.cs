@@ -34,16 +34,16 @@ public sealed class FaustusControllerLiteSettings : ISettings
     public string TargetCurrencyDisplayName { get; set; } = "Orb of Alteration";
 
     [Category("Bankroll Seeds")]
-    public RangeNode<int> StartingChaos { get; set; } = new(0, 0, 1_000_000);
+    public RangeNode<int> StartingChaos { get; set; } = new(1, 1, 5_000);
 
     [Category("Bankroll Seeds")]
-    public RangeNode<int> StartingDivine { get; set; } = new(0, 0, 1_000_000);
+    public RangeNode<int> StartingDivine { get; set; } = new(1, 1, 1_000);
 
     [Category("Strategy")]
-    public RangeNode<int> MinimumProfitChaos { get; set; } = new(5, 0, 1_000_000);
+    public RangeNode<int> MinimumProfitChaos { get; set; } = new(5, 1, 5_000);
 
     [Category("Strategy")]
-    public RangeNode<int> CompetingOrderWaitMinutes { get; set; } = new(5, 1, 120);
+    public RangeNode<int> CompetingOrderWaitMinutes { get; set; } = new(5, 1, 3_600);
 
     [Category("Strategy")]
     public RangeNode<int> ContinuousWorkflowRetrySeconds { get; set; } = new(10, 2, 90);
@@ -71,11 +71,10 @@ public sealed class FaustusControllerLiteSettings : ISettings
     };
 
     /// <summary>
-    /// A holding worth less than this at the best usable rate is skipped rather than sold. Zero is
-    /// allowed and means "sell anything that has a usable quote".
+    /// A holding worth less than this at the best usable rate is skipped rather than sold.
     /// </summary>
     [Category("Strategy")]
-    public RangeNode<int> MinimumSaleChaos { get; set; } = new(10, 0, 1_000_000);
+    public RangeNode<int> MinimumSaleChaos { get; set; } = new(10, 1, 5_000);
 
     /// <summary>
     /// Reverses the sweep queue so the smallest stack is swept first. The default (largest first)

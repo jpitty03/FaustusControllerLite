@@ -35,14 +35,15 @@ normal affinity tab is not yet supported.
 
 ## Important Settings
 
-| Setting | Purpose |
-| --- | --- |
-| `StartingChaos` | Chaos committed when a fresh-state reset is applied. |
-| `StartingDivine` | Divine committed when a fresh-state reset is applied. |
-| `MinimumProfitChaos` | Minimum post-restoration profit required for a new route. |
-| `CompetingOrderWaitMinutes` | Time before a pending order becomes `TimedOut`. |
-| `ContinuousWorkflowRetrySeconds` | Delay before retrying a route or restoration. |
-| `MaximumQuoteAgeSeconds` | Maximum accepted market and ownership age. |
+| Setting | Range | Purpose |
+| --- | ---: | --- |
+| `StartingChaos` | 1-5000 | Chaos committed when a fresh-state reset is applied. |
+| `StartingDivine` | 1-1000 | Divine committed when a fresh-state reset is applied. |
+| `MinimumProfitChaos` | 1-5000 | Minimum post-restoration profit required for a new route. |
+| `CompetingOrderWaitMinutes` | 1-3600 | Time before a pending order becomes `TimedOut`. |
+| `MinimumSaleChaos` | 1-5000 | Minimum estimated Chaos value for a sell-sweep holding. |
+| `ContinuousWorkflowRetrySeconds` | 2-90 | Delay before retrying a route or restoration. |
+| `MaximumQuoteAgeSeconds` | 1-3600 | Maximum accepted market and ownership age. |
 
 Changing `StartingChaos` or `StartingDivine` does not change the current bankroll. Apply a safe
 fresh-state reset to use the new values.
