@@ -125,6 +125,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         string CandidateSignature,
         string TargetMetadata,
         long MinimumProfitChaos,
+        bool DirectDivineCyclesEnabled,
+        long MaximumDirectDivinePrincipal,
         CurrencyIdentity From,
         CurrencyIdentity To,
         QuoteExecutionIntent ExecutionIntent,
@@ -1303,6 +1305,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             SweepProbePurpose.Benchmark => AutomatedProbeController.CreateSweepBenchmarkPlans(chaos, divine),
             SweepProbePurpose.Candidate => AutomatedProbeController.CreateSweepCandidatePlans(
                 chaos, divine, targetDescriptor.Identity),
+            _ when Settings.EnableDirectDivineCycles.Value =>
+                AutomatedProbeController.CreateDirectDivineCyclePlans(chaos, divine, targetDescriptor.Identity),
             _ => AutomatedProbeController.CreateThreeMarketPlans(chaos, divine, targetDescriptor.Identity),
         };
         var sessionId = requestedSessionId ?? Guid.NewGuid();
@@ -1326,7 +1330,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             SweepProbePurpose.Benchmark => "Sweep-wide Divine/Chaos benchmark probe started.",
             SweepProbePurpose.Candidate =>
                 $"Two-market sweep probe started for {targetDescriptor.Identity.Name}/Chaos and Divine.",
-            _ => $"Automated three-market probe started for {targetDescriptor.Identity.Name}.",
+            _ => $"Automated {plans.Count}-market probe started for {targetDescriptor.Identity.Name}.",
         };
         _manualProbeSessionId = _automatedProbe.SessionId;
         _selectedCandidate = null;
@@ -1359,7 +1363,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _rateStore.StoreBatchAtomically(_latestRatePath, captures);
                 _manualProbeSessionId = captures[0].SessionId;
-                _operationStatus = $"Atomically published automated probe session {_manualProbeSessionId:D}; three canonical pairs replaced.";
+                _operationStatus = $"Atomically published automated probe session {_manualProbeSessionId:D}; {captures.Length} canonical pairs replaced.";
                 _lastFailure = "None";
                 CandidateOutcome? outcome = _activeFeature == FeatureMode.Arbitrage
                     ? CalculateCandidate()
@@ -1436,6 +1440,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 HandleSweepProbeFailure(_automatedProbe.Failure);
                 _automatedProbe.AcknowledgeCompletion();
+                return;
+            }
+            if (_fullWorkflowAuthorized &&
+                _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } closingWorkflow &&
+                closingWorkflow.Legs[closingWorkflow.CurrentLegIndex].Role == WorkflowLegRole.CycleClosure &&
+                _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
+            {
+                _lastFailure = _automatedProbe.Failure;
+                _placementPreparation = PlacementPreparationState.Idle;
+                _placementToken = null;
+                _automatedProbe.AcknowledgeCompletion();
+                ScheduleActiveWorkflowRetry();
                 return;
             }
 
@@ -2147,7 +2163,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _startingNewWorkflow = false;
         _workflowPreparedLeg = null;
         _lastFailure = "None";
-        _operationStatus = $"Exact principal restoration is unavailable; reprobing the active workflow in {seconds}s.";
+        _operationStatus = $"Active workflow closing quote is unavailable; reprobing in {seconds}s.";
     }
 
     private WorkflowRefreshResult TryRefreshWorkflowPlan(out string failure) =>
@@ -2163,22 +2179,33 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             failure = "Canonical workflow is not ready for a fresh leg plan.";
             return WorkflowRefreshResult.Failed;
         }
-        var restoration = workflow.Legs[workflow.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
+        var retryableClosing = workflow.Legs[workflow.CurrentLegIndex].Role is
+            WorkflowLegRole.PrincipalRestoration or WorkflowLegRole.CycleClosure;
         IReadOnlyCollection<DirectedExchangeEdge> edges;
-        if (restoration && restorationEdges is not null)
+        if (retryableClosing && restorationEdges is not null)
         {
             edges = restorationEdges;
         }
-        else if (!TryBuildCurrentQuoteMatrix(out var matrix, out failure) || matrix is null)
-        {
-            return restoration ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
-        }
-        else
+        else if (TryBuildCurrentQuoteMatrix(out var matrix, out failure) && matrix is not null)
         {
             edges = matrix.Edges;
         }
+        else if (workflow.ClosureMode == WorkflowClosureMode.SameAssetCycle &&
+                 TryGetDirectCycleIdentities(out var chaos, out var divine, out var target) &&
+                 TryBuildDirectDivineCycleEdges(
+                     workflow.League,
+                     GameController.Game.IngameState.ServerData.InstanceId,
+                     chaos!, divine!, target!, DateTimeOffset.UtcNow,
+                     TimeSpan.FromSeconds(Settings.MaximumQuoteAgeSeconds.Value),
+                     out edges, out failure))
+        {
+        }
+        else
+        {
+            return retryableClosing ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
+        }
         if (!TryGetWorkflowSpendCap(workflow, out var spendCap, out failure))
-            return restoration ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
+            return retryableClosing ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
         var refresh = WorkflowCoordinator.TryRefreshRemainingPlan(
             workflow,
             edges,
@@ -2213,6 +2240,21 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             failure = $"Fresh workflow plan persistence failed: {exception.Message}";
             return WorkflowRefreshResult.Failed;
         }
+    }
+
+    private bool TryGetDirectCycleIdentities(
+        out CurrencyIdentity? chaos,
+        out CurrencyIdentity? divine,
+        out CurrencyIdentity? target)
+    {
+        chaos = null;
+        divine = null;
+        target = null;
+        return _catalogue is not null &&
+            _catalogue.TryGetUniqueByName("Chaos Orb", out chaos) && chaos is not null &&
+            _catalogue.TryGetUniqueByName("Divine Orb", out divine) && divine is not null &&
+            _catalogue.TryGetTargetByMetadata(Settings.TargetCurrencyMetadata, out var descriptor) &&
+            (target = descriptor?.Identity) is not null;
     }
 
     private bool TryBuildCurrentQuoteMatrix(out CoherentQuoteMatrix? matrix, out string failure)
@@ -2470,9 +2512,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _rateStore.Save(_latestRatePath);
                 if (_fullWorkflowAuthorized)
                 {
-                    var restoration = _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
-                        ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
-                    var workflowRefresh = restoration
+                    var retryableClosing = _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
+                        ready.Legs[ready.CurrentLegIndex].Role is WorkflowLegRole.PrincipalRestoration or
+                            WorkflowLegRole.CycleClosure;
+                    var workflowRefresh = retryableClosing
                         ? TryRefreshWorkflowPlan(
                             MarketCaptureNormalizer.CreateEdges(captures[0]), out var workflowFailure)
                         : TryRefreshWorkflowPlan(out workflowFailure);
@@ -2576,6 +2619,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     GetCurrentPlacementSignature(),
                     Settings.TargetCurrencyMetadata,
                     Settings.MinimumProfitChaos.Value,
+                    Settings.EnableDirectDivineCycles.Value,
+                    Settings.MaximumDirectDivinePrincipal.Value,
                     leg.Edge.From,
                     leg.Edge.To,
                     leg.Edge.ExecutionIntent,
@@ -2602,7 +2647,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 var retryRestoration = _singleLegStaging.FreshProbeRetryRecommended &&
                     _trackedOrderState?.IsUnresolved != true &&
                     _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
-                    ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
+                    ready.Legs[ready.CurrentLegIndex].Role is WorkflowLegRole.PrincipalRestoration or
+                        WorkflowLegRole.CycleClosure;
                 if (retryRestoration)
                 {
                     ScheduleActiveWorkflowRetry();
@@ -2802,8 +2848,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
         _operationStatus = _startingNewWorkflow
-            ? "Full workflow authorized: probing all three markets before persisting an exact route."
-            : "Workflow next leg authorized: freshly probing all three markets before re-planning the remaining route.";
+            ? "Full workflow authorized: probing required markets before persisting an exact route."
+            : "Workflow next leg authorized: freshly probing required markets before re-planning the remaining route.";
     }
 
     private void StartRestorationMarketProbe(WorkflowExecutionState workflow)
@@ -2887,10 +2933,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 if (workflow is not null)
                 {
                     _operationStatus = workflow.Phase == WorkflowExecutionPhase.Completed
-                        ? $"Workflow complete: {workflow.ActualChaosRealized} Chaos realized, " +
-                            $"{workflow.CumulativeActualRestorationChaosSpent} Chaos spent restoring principal, " +
-                            $"actual profit {workflow.ActualChaosRealized - workflow.CumulativeActualRestorationChaosSpent} Chaos; " +
-                            "scanning for the next route."
+                        ? workflow.ClosureMode == WorkflowClosureMode.SameAssetCycle
+                            ? $"Workflow complete: {workflow.ActualSettlementAmount} {workflow.Legs[^1].ToName}, " +
+                                $"actual profit {workflow.ActualProfitAmount} {workflow.Legs[^1].ToName}; scanning for the next route."
+                            : $"Workflow complete: {workflow.ActualChaosRealized} Chaos realized, " +
+                                $"{workflow.CumulativeActualRestorationChaosSpent} Chaos spent restoring principal, " +
+                                $"actual profit {workflow.ActualChaosRealized - workflow.CumulativeActualRestorationChaosSpent} Chaos; " +
+                                "scanning for the next route."
                         : $"Workflow stopped safely: {workflow.Detail}; scanning for the next route.";
                 }
                 _startingNewWorkflow = true;
@@ -3097,6 +3146,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 WorkflowRestoredPrincipal = workflow?.RestoredPrincipal,
                 WorkflowOutstandingPrincipal = workflow?.OutstandingPrincipal,
                 WorkflowRestorationChaosSpent = workflow?.CumulativeActualRestorationChaosSpent,
+                WorkflowSettlementMetadata = workflow?.SettlementMetadata,
+                WorkflowPlannedSettlement = workflow?.PlannedSettlementAmount,
+                WorkflowActualSettlement = workflow?.ActualSettlementAmount,
+                WorkflowProfitMetadata = workflow?.ProfitMetadata,
+                WorkflowPlannedProfitAmount = workflow?.PlannedProfitAmount,
+                WorkflowActualProfitAmount = workflow?.ActualProfitAmount,
+                WorkflowValuedProfitChaos = workflow?.ValuedProfitChaos,
                 CandidateStatus = _lastCandidate,
                 CandidatePath = _selectedCandidate is null
                     ? null
@@ -3105,6 +3161,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 CandidateChaosRealized = _selectedCandidate?.RealizedChaos,
                 CandidateRestorationPrincipal = _selectedCandidate?.RestorationPrincipal,
                 CandidateRestorationChaosSpend = _selectedCandidate?.PlannedRestorationSpendChaos,
+                CandidateCycleKind = _selectedCandidate?.CycleKind.ToString(),
+                CandidateProfitMetadata = _selectedCandidate?.ProfitMetadata,
+                CandidateProfitAmount = _selectedCandidate?.ProfitAmount,
+                CandidateValuedProfitChaos = _selectedCandidate?.ValuedProfitChaos,
                 CandidateCompetingLegs = _selectedCandidate?.CompetingEdgeCount,
                 CandidateLegs = _selectedCandidate?.Legs.Select(leg => new
                 {
@@ -3392,7 +3452,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             var retryRestoration = _singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
                 _singleLegPlacement.FreshProbeRetryRecommended && _trackedOrderState?.IsUnresolved != true &&
                 _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
-                ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
+                ready.Legs[ready.CurrentLegIndex].Role is WorkflowLegRole.PrincipalRestoration or
+                    WorkflowLegRole.CycleClosure;
             if (retryRestoration)
             {
                 ScheduleActiveWorkflowRetry();
@@ -3417,7 +3478,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (token is null || DateTimeOffset.UtcNow > token.ExpiresAtUtc ||
             token.ProbeSessionId != _manualProbeSessionId ||
             !string.Equals(token.TargetMetadata, Settings.TargetCurrencyMetadata, StringComparison.Ordinal) ||
-            token.MinimumProfitChaos != Settings.MinimumProfitChaos.Value)
+            token.MinimumProfitChaos != Settings.MinimumProfitChaos.Value ||
+            token.DirectDivineCyclesEnabled != Settings.EnableDirectDivineCycles.Value ||
+            token.MaximumDirectDivinePrincipal != Settings.MaximumDirectDivinePrincipal.Value)
         {
             failure = "Fresh placement preparation expired or its session/settings changed; begin again.";
             return false;
@@ -4942,15 +5005,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
         stashed.StashTransferIntent = null;
+        if (!TrackedOrderLifecycle.TryResolvePostStashStatus(stashed, out var postStashStatus))
+        {
+            MarkStashTransferAmbiguous("Canonical terminal asset progress was inconsistent after verified stash transfer.");
+            return;
+        }
         var remainingToCollect = TrackedOrderLifecycle.RemainingToCollect(stashed);
-        var anotherBatchPending = stashed.PendingWantedBatchAmount > 0 || stashed.PendingReturnBatchAmount > 0;
-        var allStashed = remainingToCollect == 0 &&
-            !anotherBatchPending;
-        stashed.Status = allStashed
-            ? TrackedOrderStatus.Stashed
-            : anotherBatchPending
-                ? TrackedOrderStatus.Collected
-                : TrackedOrderStatus.CompletedUncollected;
+        var allStashed = postStashStatus == TrackedOrderStatus.Stashed;
+        stashed.Status = postStashStatus;
         var eventType = allStashed ? "TerminalAssetsStashedAndVerified" : "CollectionBatchStashProgressVerified";
         if (!PersistTrackedOrder(stashed, eventType))
         {
@@ -5040,14 +5102,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     stashed.SettledReturnAmount == TrackedOrderLifecycle.TotalOfferedReturn(stashed);
             }
             stashed.StashTransferIntent = null;
-            var allStashed = TrackedOrderLifecycle.RemainingToCollect(stashed) == 0 &&
-                stashed.PendingWantedBatchAmount == 0 && stashed.PendingReturnBatchAmount == 0;
-            var anotherBatchPending = stashed.PendingWantedBatchAmount > 0 || stashed.PendingReturnBatchAmount > 0;
-            stashed.Status = allStashed
-                ? TrackedOrderStatus.Stashed
-                : anotherBatchPending
-                    ? TrackedOrderStatus.Collected
-                    : TrackedOrderStatus.CompletedUncollected;
+            if (!TrackedOrderLifecycle.TryResolvePostStashStatus(stashed, out var postStashStatus))
+            {
+                MarkStashTransferAmbiguous(
+                    "Canonical terminal asset progress was inconsistent after recovered stash transfer.");
+                return;
+            }
+            var allStashed = postStashStatus == TrackedOrderStatus.Stashed;
+            stashed.Status = postStashStatus;
             if (!PersistTrackedOrder(stashed, allStashed
                     ? "TerminalAssetsStashRecoveredAndVerified"
                     : "CollectionBatchStashProgressRecovered"))
@@ -5567,7 +5629,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         var league = GetCurrentLeague();
-        if (!QuoteMatrixBuilder.TryBuild(
+        IReadOnlyCollection<DirectedExchangeEdge> candidateEdges;
+        var directFailure = string.Empty;
+        if (QuoteMatrixBuilder.TryBuild(
                 _rateStore.Captures,
                 league,
                 _manualProbeSessionId,
@@ -5580,7 +5644,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 out var matrix,
                 out var matrixFailure))
         {
-            _lastCandidate = $"Blocked: {matrixFailure}";
+            candidateEdges = matrix!.Edges;
+        }
+        else if (Settings.EnableDirectDivineCycles.Value &&
+                 TryBuildDirectDivineCycleEdges(
+                     league, area, chaos, divine, targetDescriptor.Identity, now, maximumAge,
+                     out candidateEdges, out directFailure))
+        {
+            matrixFailure = string.Empty;
+        }
+        else
+        {
+            _lastCandidate = $"Blocked: {(Settings.EnableDirectDivineCycles.Value ? directFailure : matrixFailure)}";
             return CandidateOutcome.Blocked;
         }
 
@@ -5592,12 +5667,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 targetDescriptor.Identity,
                 new CurrencyBankroll(_bankroll.AvailableChaos, chaosOwnership.Count),
                 new CurrencyBankroll(_bankroll.AvailableDivine, divineOwnership.Count),
-                matrix!.Edges,
+                candidateEdges,
                 now,
                 maximumAge,
                 _manualProbeSessionId.ToString("D"),
                 area.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                Settings.MinimumProfitChaos.Value));
+                Settings.MinimumProfitChaos.Value,
+                EnableDirectDivineCycles: Settings.EnableDirectDivineCycles.Value,
+                MaximumDirectDivinePrincipal: Settings.MaximumDirectDivinePrincipal.Value,
+                PrioritizeValuedProfit: Settings.EnableDirectDivineCycles.Value));
             var best = result.Best;
             _selectedCandidate = best;
             _lastCandidate = best is null
@@ -5606,7 +5684,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     $"Divine={Math.Min(_bankroll.AvailableDivine, divineOwnership.Count)} " +
                     $"(ledger {_bankroll.AvailableDivine}, live {divineOwnership.Count}); " +
                     $"reasons {DescribeRejections(result)}"
-                : $"{DescribeCandidatePath(best)}; realized {best.RealizedChaos} Chaos before restoration, " +
+                : best.CycleKind == RouteCycleKind.SameAssetDivineCycle
+                    ? $"{DescribeCandidatePath(best)}; profit {best.ProfitAmount} Divine, valued " +
+                        $"{best.ValuedProfitChaos} Chaos; residuals " +
+                        string.Join(", ", best.Remainders.Select(item => $"{item.Value} {item.Key.Name}")) +
+                        $"; competing legs {best.CompetingEdgeCount}; expected gold " +
+                        (best.ExpectedGold?.ToString() ?? "unknown")
+                    : $"{DescribeCandidatePath(best)}; realized {best.RealizedChaos} Chaos before restoration, " +
                     $"restores {best.RestorationPrincipal} Divine for {best.PlannedRestorationSpendChaos} Chaos, " +
                     $"post-restoration profit {best.ProfitChaos} Chaos; residuals " +
                     string.Join(", ", best.Remainders.Select(item => $"{item.Value} {item.Key.Name}")) +
@@ -5618,6 +5702,56 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _lastCandidate = $"Calculation blocked: {exception.Message}";
             return CandidateOutcome.Blocked;
+        }
+    }
+
+    private bool TryBuildDirectDivineCycleEdges(
+        string league,
+        int area,
+        CurrencyIdentity chaos,
+        CurrencyIdentity divine,
+        CurrencyIdentity target,
+        DateTimeOffset now,
+        TimeSpan maximumAge,
+        out IReadOnlyCollection<DirectedExchangeEdge> edges,
+        out string failure)
+    {
+        var captures = _rateStore.Captures.Where(capture =>
+            capture.SessionId == _manualProbeSessionId && capture.League == league &&
+            capture.AreaInstanceId == area && now - capture.CapturedAtUtc is { } age &&
+            age >= TimeSpan.Zero && age <= maximumAge &&
+            (capture.Pair.Equals(new CurrencyPairKey(divine, chaos)) ||
+             capture.Pair.Equals(new CurrencyPairKey(divine, target)))).ToArray();
+        if (captures.Length != 2)
+        {
+            edges = Array.Empty<DirectedExchangeEdge>();
+            failure = $"Direct Divine cycle requires exactly Divine/Chaos and Divine/{target.Name} captures in one fresh session.";
+            return false;
+        }
+        try
+        {
+            var normalized = captures.SelectMany(MarketCaptureNormalizer.CreateEdges).ToArray();
+            var complete = normalized.Any(edge => edge.From.Equals(divine) && edge.To.Equals(chaos) &&
+                    edge.ExecutionIntent == QuoteExecutionIntent.Immediate) &&
+                normalized.Any(edge => edge.From.Equals(divine) && edge.To.Equals(target) &&
+                    edge.ExecutionIntent == QuoteExecutionIntent.Competing) &&
+                normalized.Any(edge => edge.From.Equals(target) && edge.To.Equals(divine) &&
+                    edge.ExecutionIntent == QuoteExecutionIntent.Competing);
+            if (!complete)
+            {
+                edges = Array.Empty<DirectedExchangeEdge>();
+                failure = "Direct Divine cycle requires readable competing heads in both Divine/target directions and Immediate Divine/Chaos valuation.";
+                return false;
+            }
+            edges = normalized;
+            failure = string.Empty;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            edges = Array.Empty<DirectedExchangeEdge>();
+            failure = $"Direct Divine cycle normalization failed: {exception.Message}";
+            return false;
         }
     }
 
@@ -5995,10 +6129,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var restoration = workflow.OutstandingPrincipal > 0
             ? $" | restore {workflow.OutstandingPrincipal} principal"
             : string.Empty;
+        var sameAssetProfit = workflow.ClosureMode == WorkflowClosureMode.SameAssetCycle
+            ? $" | profit {workflow.PlannedProfitAmount} {workflow.Legs[^1].ToName}"
+            : string.Empty;
         var retry = _nextWorkflowScanAtUtc is { } deadline
             ? $" | retry {Math.Max(0, (int)Math.Ceiling((deadline - DateTimeOffset.UtcNow).TotalSeconds))}s"
             : string.Empty;
-        return $"{workflow.Phase} | leg {leg}/{workflow.Legs.Count} | {authorization}{restoration}{retry}";
+        return $"{workflow.Phase} | leg {leg}/{workflow.Legs.Count} | {authorization}{restoration}{sameAssetProfit}{retry}";
     }
 
     private string DescribeTrackedOrderCompact()

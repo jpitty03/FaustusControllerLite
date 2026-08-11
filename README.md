@@ -41,6 +41,8 @@ normal affinity tab is not yet supported.
 | `StartingDivine` | 1-1000 | Divine committed when a fresh-state reset is applied. |
 | `MinimumProfitChaos` | 1-5000 | Minimum post-restoration profit required for a new route. |
 | `CompetingOrderWaitMinutes` | 1-3600 | Time before a pending order becomes `TimedOut`. |
+| `EnableDirectDivineCycles` | on/off | Opts into two-competing-leg Divine-to-target-to-Divine cycles. |
+| `MaximumDirectDivinePrincipal` | 1-1000 | Maximum Divine that one direct cycle may lock. |
 | `MinimumSaleChaos` | 1-5000 | Minimum estimated Chaos value for a sell-sweep holding. |
 | `ContinuousWorkflowRetrySeconds` | 2-90 | Delay before retrying a route or restoration. |
 | `MaximumQuoteAgeSeconds` | 1-3600 | Maximum accepted market and ownership age. |
@@ -236,6 +238,25 @@ Before starting, verify the exchange, stash, and inventory are visible; the pick
 closed; all calibration is ready; and `Last failure` is `None`.
 
 Press `FullWorkflowHotkey` once to start.
+
+## Direct Divine Cycles
+
+Enable `EnableDirectDivineCycles` to probe and prioritize routes such as:
+
+`739 Divine -> 1 Mirror of Kalandra -> 740 Divine`
+
+Direct mode probes only Divine/Chaos and Divine/target. The Divine/Chaos quote values the profit for
+`MinimumProfitChaos`; it is not an execution leg. Actual workflow profit remains denominated in
+Divine.
+
+Set `MaximumDirectDivinePrincipal` to the most Divine the plugin may commit. The opening and closing
+orders are both competing limits and execute sequentially. If the closing order times out with the
+target returned, the same durable workflow waits, reprobes, and retries closure instead of starting
+an unrelated route.
+
+Use a suitably long `CompetingOrderWaitMinutes` for low-volume currencies and ensure enough exchange
+gold is available. Disable direct mode to restore normal three-market Chaos-cycle probing and
+competing-leg-first ranking.
 
 ## Stop and Resume
 

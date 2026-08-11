@@ -42,6 +42,45 @@ public static class TrackedOrderLifecycle
     public static long RemainingToCollect(TrackedOrderState tracked) =>
         RemainingWantedToCollect(tracked) + RemainingReturnToCollect(tracked);
 
+    public static bool TryResolvePostStashStatus(
+        TrackedOrderState tracked,
+        out TrackedOrderStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(tracked);
+        status = TrackedOrderStatus.Ambiguous;
+        if (tracked.TerminalReceivedWantedAmount is not { } totalWanted || totalWanted < 0 ||
+            tracked.TerminalRemainingOfferedAmount is not { } totalReturn || totalReturn < 0 ||
+            tracked.SettledWantedAmount < 0 || tracked.PendingWantedBatchAmount < 0 ||
+            tracked.SettledReturnAmount < 0 || tracked.PendingReturnBatchAmount < 0)
+        {
+            return false;
+        }
+
+        long remainingWanted;
+        long remainingReturn;
+        try
+        {
+            remainingWanted = checked(totalWanted -
+                checked(tracked.SettledWantedAmount + tracked.PendingWantedBatchAmount));
+            remainingReturn = checked(totalReturn -
+                checked(tracked.SettledReturnAmount + tracked.PendingReturnBatchAmount));
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+        if (remainingWanted < 0 || remainingReturn < 0) return false;
+
+        status = tracked.PendingWantedBatchAmount > 0 || tracked.PendingReturnBatchAmount > 0
+            ? TrackedOrderStatus.Collected
+            : remainingWanted > 0
+                ? TrackedOrderStatus.CompletedUncollected
+                : remainingReturn > 0
+                    ? TrackedOrderStatus.CanceledUncollected
+                    : TrackedOrderStatus.Stashed;
+        return true;
+    }
+
     public static void MigrateLegacyAssetProgress(TrackedOrderState tracked)
     {
         if (tracked.SchemaVersion > 3 || tracked.TerminalRemainingOfferedAmount is not { } remaining ||

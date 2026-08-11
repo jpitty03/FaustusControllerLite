@@ -32,7 +32,7 @@ public sealed class BankrollStore
             ?? throw new InvalidDataException("Bankroll state was empty.");
         var migrated = schemaVersion is 1 or 2 or 3 or 4 or 5;
         var trackedMigrated = state.TrackedOrder?.SchemaVersion is 1 or 2 or 3 or 4 or 5;
-        var workflowMigrated = state.Workflow?.SchemaVersion is 1 or 2;
+        var workflowMigrated = state.Workflow?.SchemaVersion is 1 or 2 or 3;
         if (migrated)
         {
             var targetMetadata = root.Value<string>("TargetMetadata");
@@ -70,9 +70,13 @@ public sealed class BankrollStore
         if (workflowMigrated && state.Workflow is { } migratedWorkflow)
         {
             var legacyFingerprint = migratedWorkflow.PlanFingerprint;
-            var fingerprintMatches = migratedWorkflow.SchemaVersion == 1
-                ? WorkflowCoordinator.LegacyVersionOneFingerprintMatches(migratedWorkflow)
-                : WorkflowCoordinator.LegacyVersionTwoFingerprintMatches(migratedWorkflow);
+            var fingerprintMatches = migratedWorkflow.SchemaVersion switch
+            {
+                1 => WorkflowCoordinator.LegacyVersionOneFingerprintMatches(migratedWorkflow),
+                2 => WorkflowCoordinator.LegacyVersionTwoFingerprintMatches(migratedWorkflow),
+                3 => WorkflowCoordinator.LegacyVersionThreeFingerprintMatches(migratedWorkflow),
+                _ => false,
+            };
             if (!fingerprintMatches)
             {
                 throw new InvalidDataException($"Schema-{migratedWorkflow.SchemaVersion} workflow failed legacy fingerprint authentication.");
@@ -93,7 +97,10 @@ public sealed class BankrollStore
             }
             if (string.IsNullOrWhiteSpace(migratedWorkflow.TerminalChaosMetadata) && migratedWorkflow.Legs.Count > 0)
                 migratedWorkflow.TerminalChaosMetadata = migratedWorkflow.Legs[^1].ToMetadata;
-            WorkflowCoordinator.MigrateLegacySemantics(migratedWorkflow);
+            if (migratedWorkflow.SchemaVersion == 3)
+                WorkflowCoordinator.MigrateVersionThreeUnitEconomics(migratedWorkflow);
+            else
+                WorkflowCoordinator.MigrateLegacySemantics(migratedWorkflow);
             migratedWorkflow.PlanFingerprint = WorkflowCoordinator.ComputeFingerprint(migratedWorkflow);
             if (migratedWorkflow.Phase == WorkflowExecutionPhase.LegActive && state.TrackedOrder is { } migratedActive)
                 migratedActive.CandidateSignature = migratedWorkflow.PlanFingerprint;
@@ -492,6 +499,13 @@ public sealed record WorkflowAuditEvent(
     Guid WorkflowId,
     int CompletedLegs,
     WorkflowClosureMode ClosureMode,
+    string SettlementMetadata,
+    long PlannedSettlementAmount,
+    string ProfitMetadata,
+    long PlannedProfitAmount,
+    long ValuedProfitChaos,
+    long? ActualSettlementAmount,
+    long? ActualProfitAmount,
     long PlannedRealizedChaos,
     long PlannedRestorationChaosSpent,
     long PlannedProfitChaos,
@@ -508,16 +522,24 @@ public sealed record WorkflowAuditEvent(
             workflow.Phase == WorkflowExecutionPhase.Completed
             ? tracked.TerminalReceivedWantedAmount
             : null;
-        var closedCompleted = workflow.ClosureMode == WorkflowClosureMode.ClosedCycle &&
+        var closedCompleted = (workflow.ClosureMode is WorkflowClosureMode.ClosedCycle or
+                WorkflowClosureMode.SameAssetCycle) &&
             workflow.Phase == WorkflowExecutionPhase.Completed;
         return new WorkflowAuditEvent(
-            2,
+            3,
             workflow.Phase == WorkflowExecutionPhase.Completed ? "WorkflowCompleted" : "WorkflowStopped",
             workflow.League,
             workflow.UpdatedAtUtc,
             workflow.WorkflowId,
             workflow.CurrentLegIndex,
             workflow.ClosureMode,
+            workflow.SettlementMetadata,
+            workflow.PlannedSettlementAmount,
+            workflow.ProfitMetadata,
+            workflow.PlannedProfitAmount,
+            workflow.ValuedProfitChaos,
+            closedCompleted ? workflow.ActualSettlementAmount : null,
+            closedCompleted ? workflow.ActualProfitAmount : null,
             workflow.PlannedRealizedChaos,
             workflow.PlannedRestorationSpendChaos,
             workflow.PlannedProfitChaos,
@@ -527,7 +549,7 @@ public sealed record WorkflowAuditEvent(
             closedCompleted ? workflow.RestoredPrincipal : null,
             legacyActual is not null
                 ? legacyActual.Value - workflow.BenchmarkChaos
-                : closedCompleted
+                : closedCompleted && workflow.ClosureMode == WorkflowClosureMode.ClosedCycle
                     ? workflow.ActualChaosRealized - workflow.CumulativeActualRestorationChaosSpent
                     : null,
             workflow.Detail);

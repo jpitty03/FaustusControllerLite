@@ -32,6 +32,7 @@ public enum WorkflowClosureMode
 {
     LegacyTerminalChaos = 1,
     ClosedCycle = 2,
+    SameAssetCycle = 3,
 }
 
 public enum WorkflowLegRole
@@ -39,6 +40,7 @@ public enum WorkflowLegRole
     Conversion = 1,
     ChaosRealization = 2,
     PrincipalRestoration = 3,
+    CycleClosure = 4,
 }
 
 public enum WorkflowRefreshResult
@@ -50,7 +52,7 @@ public enum WorkflowRefreshResult
 
 public sealed class WorkflowExecutionState
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public Guid WorkflowId { get; set; }
@@ -77,6 +79,16 @@ public sealed class WorkflowExecutionState
     public long PlannedRestorationSpendChaos { get; set; }
     public long CumulativeActualRestorationChaosSpent { get; set; }
     public long ActualChaosRealized { get; set; }
+    public string SettlementMetadata { get; set; } = string.Empty;
+    public long PlannedSettlementAmount { get; set; }
+    public long ActualSettlementAmount { get; set; }
+    public string ProfitMetadata { get; set; } = string.Empty;
+    public long PlannedProfitAmount { get; set; }
+    public long ActualProfitAmount { get; set; }
+    public long ValuedProfitChaos { get; set; }
+    public long ProfitValuationNumerator { get; set; }
+    public long ProfitValuationDenominator { get; set; }
+    public long CumulativeCycleSettlementAmount { get; set; }
     public List<WorkflowLegPlan> Legs { get; set; } = [];
     public DateTimeOffset StartedAtUtc { get; set; }
     public DateTimeOffset UpdatedAtUtc { get; set; }
@@ -128,9 +140,15 @@ public static class WorkflowCoordinator
             throw new ArgumentException("A workflow requires a probe session and two or three exact legs.");
         }
 
+        var directCycle = candidate.CycleKind == RouteCycleKind.SameAssetDivineCycle;
         var chaosRealizationLegIndex = candidate.ChaosRealizationLegIndex >= 0
             ? candidate.ChaosRealizationLegIndex
             : candidate.Legs.Count - 1;
+        var settlementMetadata = directCycle ? candidate.Path[^1].Metadata : candidate.Path[^1].Metadata;
+        var profitMetadata = string.IsNullOrWhiteSpace(candidate.ProfitMetadata)
+            ? candidate.Path[chaosRealizationLegIndex + 1].Metadata
+            : candidate.ProfitMetadata;
+        var valuation = candidate.ProfitValuationEdge;
 
         var state = new WorkflowExecutionState
         {
@@ -141,28 +159,46 @@ public static class WorkflowCoordinator
             Phase = WorkflowExecutionPhase.ReadyForLeg,
             CurrentLegIndex = 0,
             CurrentInputAmount = candidate.StartingPrincipal,
-            TerminalChaosMetadata = candidate.Path[chaosRealizationLegIndex + 1].Metadata,
+            TerminalChaosMetadata = directCycle
+                ? valuation?.To.Metadata ?? candidate.Path[^1].Metadata
+                : candidate.Path[chaosRealizationLegIndex + 1].Metadata,
             StartingPrincipal = candidate.StartingPrincipal,
-            BenchmarkChaos = candidate.BenchmarkChaos,
+            BenchmarkChaos = directCycle ? candidate.ValuedProfitChaos : candidate.BenchmarkChaos,
             PlannedRealizedChaos = candidate.RealizedChaos,
             PlannedProfitChaos = candidate.ProfitChaos,
-            ClosureMode = WorkflowClosureMode.ClosedCycle,
+            ClosureMode = directCycle ? WorkflowClosureMode.SameAssetCycle : WorkflowClosureMode.ClosedCycle,
             StartingMetadata = candidate.Path[0].Metadata,
-            ChaosMetadata = candidate.Path[chaosRealizationLegIndex + 1].Metadata,
-            ChaosRealizationLegIndex = chaosRealizationLegIndex,
+            ChaosMetadata = directCycle
+                ? valuation?.To.Metadata ?? candidate.Path[^1].Metadata
+                : candidate.Path[chaosRealizationLegIndex + 1].Metadata,
+            ChaosRealizationLegIndex = directCycle ? -1 : chaosRealizationLegIndex,
             RestorationPrincipal = candidate.RestorationPrincipal,
             RestoredPrincipal = 0,
             OutstandingPrincipal = candidate.RestorationPrincipal,
             PlannedRestorationSpendChaos = candidate.PlannedRestorationSpendChaos,
             CumulativeActualRestorationChaosSpent = 0,
             ActualChaosRealized = 0,
+            SettlementMetadata = settlementMetadata,
+            PlannedSettlementAmount = candidate.PlannedSettlementAmount > 0
+                ? candidate.PlannedSettlementAmount
+                : candidate.Legs[^1].Output,
+            ActualSettlementAmount = 0,
+            ProfitMetadata = profitMetadata,
+            PlannedProfitAmount = candidate.ProfitAmount > 0 ? candidate.ProfitAmount : candidate.ProfitChaos,
+            ActualProfitAmount = 0,
+            ValuedProfitChaos = candidate.ValuedProfitChaos > 0 ? candidate.ValuedProfitChaos : candidate.ProfitChaos,
+            ProfitValuationNumerator = valuation?.Rate.Numerator ?? 0,
+            ProfitValuationDenominator = valuation?.Rate.Denominator ?? 0,
+            CumulativeCycleSettlementAmount = 0,
             StartedAtUtc = now,
             UpdatedAtUtc = now,
             Detail = "Exact route snapshot persisted; current leg requires fresh probing before placement.",
             Legs = candidate.Legs.Select((leg, index) => FromRouteLeg(
                 index,
                 leg,
-                index == chaosRealizationLegIndex
+                directCycle && index == candidate.Legs.Count - 1
+                    ? WorkflowLegRole.CycleClosure
+                    : index == chaosRealizationLegIndex
                     ? WorkflowLegRole.ChaosRealization
                     : candidate.RestorationPrincipal > 0 && index == candidate.Legs.Count - 1
                         ? WorkflowLegRole.PrincipalRestoration
@@ -257,6 +293,70 @@ public static class WorkflowCoordinator
             return true;
         }
 
+        if (leg.Role == WorkflowLegRole.CycleClosure)
+        {
+            if (tracked.TerminalRemainingOfferedAmount is not { } remaining ||
+                tracked.TerminalReceivedWantedAmount is not { } received ||
+                remaining < 0 || remaining > tracked.OfferedAmount || received < 0 ||
+                received > 0 && (!tracked.WantedAssetCollected || !tracked.WantedAssetStashed) ||
+                remaining > 0 && (!tracked.OfferedReturnCollected || !tracked.OfferedReturnStashed) ||
+                tracked.PendingWantedBatchAmount != 0 || tracked.PendingReturnBatchAmount != 0)
+            {
+                failure = "Cycle-closing settlement lacked exact terminal amounts or verified stash custody.";
+                return false;
+            }
+
+            try
+            {
+                next.CumulativeCycleSettlementAmount = checked(
+                    workflow.CumulativeCycleSettlementAmount + received);
+                next.CurrentAttemptId = null;
+                next.UpdatedAtUtc = now;
+                if (remaining == 0)
+                {
+                    next.ActualSettlementAmount = next.CumulativeCycleSettlementAmount;
+                    next.ActualProfitAmount = checked(next.ActualSettlementAmount - next.StartingPrincipal);
+                    next.CurrentLegIndex++;
+                    next.CurrentInputAmount = received;
+                    next.Phase = next.ActualProfitAmount > 0
+                        ? WorkflowExecutionPhase.Completed
+                        : WorkflowExecutionPhase.Stopped;
+                    next.Detail = next.ActualProfitAmount > 0
+                        ? $"Same-asset cycle closed with actual profit {next.ActualProfitAmount} {next.ProfitMetadata}."
+                        : "Same-asset cycle closed without a positive authenticated profit.";
+                }
+                else
+                {
+                    var rate = new Rational(leg.RateNumerator, leg.RateDenominator);
+                    var conversion = rate.ConvertWholeLots(remaining);
+                    if (conversion.InputSpent != remaining || conversion.Output <= 0)
+                    {
+                        failure = "Returned cycle-closing asset is incompatible with the authenticated quote lot.";
+                        return false;
+                    }
+                    var nextLeg = next.Legs[workflow.CurrentLegIndex];
+                    nextLeg.InputAvailable = remaining;
+                    nextLeg.InputSpent = remaining;
+                    nextLeg.Output = conversion.Output;
+                    nextLeg.InputRemainder = 0;
+                    next.CurrentInputAmount = remaining;
+                    next.PlannedSettlementAmount = checked(
+                        next.CumulativeCycleSettlementAmount + conversion.Output);
+                    next.PlannedProfitAmount = checked(next.PlannedSettlementAmount - next.StartingPrincipal);
+                    next.Phase = WorkflowExecutionPhase.ReadyForLeg;
+                    next.Detail = $"Cycle-closing attempt stashed; {remaining} {leg.FromMetadata} remains for the same competing limit.";
+                }
+                next.PlanFingerprint = ComputeFingerprint(next);
+                failure = string.Empty;
+                return true;
+            }
+            catch (OverflowException exception)
+            {
+                failure = $"Cycle-closing settlement arithmetic overflowed: {exception.Message}";
+                return false;
+            }
+        }
+
         if (leg.Role == WorkflowLegRole.PrincipalRestoration)
         {
             if (tracked.TerminalRemainingOfferedAmount is not { } remaining ||
@@ -294,6 +394,9 @@ public static class WorkflowCoordinator
                     next.PlannedRestorationSpendChaos = next.CumulativeActualRestorationChaosSpent;
                     next.PlannedProfitChaos = checked(
                         next.PlannedRealizedChaos - next.PlannedRestorationSpendChaos);
+                    next.ActualSettlementAmount = next.RestoredPrincipal;
+                    next.ActualProfitAmount = checked(
+                        next.ActualChaosRealized - next.CumulativeActualRestorationChaosSpent);
                     next.Detail = $"Divine principal restored across verified attempts; actual Chaos profit " +
                         $"{next.ActualChaosRealized - next.CumulativeActualRestorationChaosSpent}.";
                 }
@@ -357,6 +460,10 @@ public static class WorkflowCoordinator
         if (next.CurrentLegIndex == next.Legs.Count)
         {
             next.Phase = WorkflowExecutionPhase.Completed;
+            next.ActualSettlementAmount = tracked.TerminalReceivedWantedAmount.GetValueOrDefault();
+            next.ActualProfitAmount = workflow.RestorationPrincipal == 0
+                ? checked(next.ActualSettlementAmount - next.StartingPrincipal)
+                : next.ActualProfitAmount;
             next.Detail = $"All {next.Legs.Count} workflow legs completed with exact verified stash custody.";
         }
         else
@@ -380,11 +487,166 @@ public static class WorkflowCoordinator
         out RouteLegResult? currentLeg,
         out string failure)
     {
-        return workflow.ClosureMode == WorkflowClosureMode.LegacyTerminalChaos
-            ? TryRefreshLegacyRemainingPlan(workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
-                now, out next, out currentLeg, out failure)
-            : TryRefreshClosedRemainingPlan(workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
-                now, out next, out currentLeg, out failure);
+        return workflow.ClosureMode switch
+        {
+            WorkflowClosureMode.LegacyTerminalChaos => TryRefreshLegacyRemainingPlan(
+                workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
+                now, out next, out currentLeg, out failure),
+            WorkflowClosureMode.SameAssetCycle => TryRefreshSameAssetCycle(
+                workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
+                now, out next, out currentLeg, out failure),
+            _ => TryRefreshClosedRemainingPlan(
+                workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
+                now, out next, out currentLeg, out failure),
+        };
+    }
+
+    private static WorkflowRefreshResult TryRefreshSameAssetCycle(
+        WorkflowExecutionState workflow,
+        IReadOnlyCollection<DirectedExchangeEdge> edges,
+        Guid probeSessionId,
+        long spendCap,
+        long minimumProfitChaos,
+        DateTimeOffset now,
+        out WorkflowExecutionState next,
+        out RouteLegResult? currentLeg,
+        out string failure)
+    {
+        next = Clone(workflow);
+        currentLeg = null;
+        if (workflow.Phase != WorkflowExecutionPhase.ReadyForLeg ||
+            workflow.CurrentLegIndex < 0 || workflow.CurrentLegIndex >= workflow.Legs.Count ||
+            probeSessionId == Guid.Empty || spendCap <= 0)
+        {
+            failure = "Same-asset workflow is not ready for a positively funded refresh.";
+            return WorkflowRefreshResult.Failed;
+        }
+
+        try
+        {
+            var amount = workflow.CurrentLegIndex == 0 ? spendCap : workflow.CurrentInputAmount;
+            if (spendCap < amount)
+            {
+                failure = "Same-asset workflow exceeded verified canonical/live funds.";
+                return workflow.CurrentLegIndex > 0
+                    ? WorkflowRefreshResult.RetryableUnavailable
+                    : WorkflowRefreshResult.Failed;
+            }
+            var refreshed = new List<(WorkflowLegPlan Plan, DirectedExchangeEdge Edge)>();
+            for (var index = workflow.CurrentLegIndex; index < workflow.Legs.Count; index++)
+            {
+                var planned = workflow.Legs[index];
+                var edge = SelectFreshEdge(planned, edges);
+                if (edge is null)
+                {
+                    failure = $"Fresh market lacked same-asset leg {planned.FromMetadata}->{planned.ToMetadata}.";
+                    return workflow.CurrentLegIndex > 0 || planned.Role == WorkflowLegRole.CycleClosure
+                        ? WorkflowRefreshResult.RetryableUnavailable
+                        : WorkflowRefreshResult.Failed;
+                }
+
+                if (index == workflow.CurrentLegIndex && planned.ExecutionIntent == QuoteExecutionIntent.Competing)
+                {
+                    if (planned.InputSpent <= 0 || planned.InputSpent > amount || planned.Output <= 0)
+                    {
+                        failure = $"Preserved same-asset competing leg {index + 1} exceeded verified funds.";
+                        return workflow.CurrentLegIndex > 0
+                            ? WorkflowRefreshResult.RetryableUnavailable
+                            : WorkflowRefreshResult.Failed;
+                    }
+                    var preservedEdge = edge with
+                    {
+                        Rate = new Rational(planned.RateNumerator, planned.RateDenominator),
+                        SourceBook = planned.SourceBook,
+                    };
+                    var plan = FromEdge(index, planned.Role, planned.ExpectedGold, preservedEdge,
+                        amount, planned.InputSpent, planned.Output, checked(amount - planned.InputSpent));
+                    refreshed.Add((plan, preservedEdge));
+                    amount = planned.Output;
+                    continue;
+                }
+
+                var conversion = edge.Rate.ConvertWholeLots(amount, edge.InputLimit);
+                if (conversion.InputSpent <= 0 || conversion.Output <= 0)
+                {
+                    failure = $"Same-asset leg {index + 1} could not form an executable lot.";
+                    return workflow.CurrentLegIndex > 0 || planned.Role == WorkflowLegRole.CycleClosure
+                        ? WorkflowRefreshResult.RetryableUnavailable
+                        : WorkflowRefreshResult.Failed;
+                }
+                var refreshedPlan = FromEdge(index, planned.Role, planned.ExpectedGold, edge,
+                    amount, conversion.InputSpent, conversion.Output, conversion.InputRemainder);
+                refreshed.Add((refreshedPlan, edge));
+                amount = conversion.Output;
+            }
+
+            var startingPrincipal = workflow.CurrentLegIndex == 0
+                ? refreshed[0].Plan.InputSpent
+                : workflow.StartingPrincipal;
+            var settlement = checked(workflow.CumulativeCycleSettlementAmount + amount);
+            var profitAmount = checked(settlement - startingPrincipal);
+            if (profitAmount <= 0)
+            {
+                failure = "Same-asset cycle no longer has a positive settlement profit.";
+                return workflow.CurrentLegIndex > 0
+                    ? WorkflowRefreshResult.RetryableUnavailable
+                    : WorkflowRefreshResult.Failed;
+            }
+
+            var valuedProfit = workflow.ValuedProfitChaos;
+            var valuationNumerator = workflow.ProfitValuationNumerator;
+            var valuationDenominator = workflow.ProfitValuationDenominator;
+            if (workflow.CurrentLegIndex == 0)
+            {
+                var valuation = edges.Where(edge =>
+                        edge.From.Metadata == workflow.ProfitMetadata &&
+                        edge.To.Metadata == workflow.ChaosMetadata &&
+                        edge.ExecutionIntent == QuoteExecutionIntent.Immediate)
+                    .OrderByDescending(edge => edge.Rate)
+                    .ThenByDescending(edge => edge.CapturedAt)
+                    .FirstOrDefault();
+                if (valuation is null)
+                {
+                    failure = "Fresh matrix lacked Immediate Divine/Chaos profit valuation.";
+                    return WorkflowRefreshResult.Failed;
+                }
+                var valued = valuation.Rate.ConvertWholeLots(profitAmount, valuation.InputLimit);
+                if (valued.InputSpent != profitAmount || valued.Output < minimumProfitChaos)
+                {
+                    failure = $"Same-asset profit is valued below {minimumProfitChaos} Chaos or lacks full valuation depth.";
+                    return WorkflowRefreshResult.Failed;
+                }
+                valuedProfit = valued.Output;
+                valuationNumerator = valuation.Rate.Numerator;
+                valuationDenominator = valuation.Rate.Denominator;
+            }
+
+            foreach (var item in refreshed) next.Legs[item.Plan.Index] = item.Plan;
+            next.StartingPrincipal = startingPrincipal;
+            next.CurrentInputAmount = workflow.CurrentLegIndex == 0
+                ? startingPrincipal
+                : refreshed[0].Plan.InputAvailable;
+            next.PlannedSettlementAmount = settlement;
+            next.PlannedProfitAmount = profitAmount;
+            next.PlannedProfitChaos = valuedProfit;
+            next.ValuedProfitChaos = valuedProfit;
+            next.ProfitValuationNumerator = valuationNumerator;
+            next.ProfitValuationDenominator = valuationDenominator;
+            next.CurrentProbeSessionId = probeSessionId;
+            next.UpdatedAtUtc = now;
+            next.Detail = $"Fresh same-asset cycle verified at {profitAmount} {workflow.ProfitMetadata} profit, valued {valuedProfit} Chaos.";
+            next.PlanFingerprint = ComputeFingerprint(next);
+            var first = refreshed[0];
+            currentLeg = new RouteLegResult(first.Edge, first.Plan.InputAvailable, first.Plan.InputSpent,
+                first.Plan.Output, first.Plan.InputRemainder, first.Plan.ExpectedGold);
+            failure = string.Empty;
+            return WorkflowRefreshResult.Refreshed;
+        }
+        catch (OverflowException exception)
+        {
+            failure = $"Same-asset refresh arithmetic overflowed: {exception.Message}";
+            return WorkflowRefreshResult.Failed;
+        }
     }
 
     private static WorkflowRefreshResult TryRefreshLegacyRemainingPlan(
@@ -548,6 +810,9 @@ public static class WorkflowCoordinator
             next.BenchmarkChaos = benchmark;
             next.PlannedRealizedChaos = amount;
             next.PlannedProfitChaos = profit;
+            next.PlannedSettlementAmount = amount;
+            next.PlannedProfitAmount = profit;
+            next.ValuedProfitChaos = profit;
             next.CurrentProbeSessionId = probeSessionId;
             next.PlanFingerprint = ComputeFingerprint(next);
             next.UpdatedAtUtc = now;
@@ -776,6 +1041,9 @@ public static class WorkflowCoordinator
             next.PlannedRealizedChaos = plannedChaosRealized;
             next.PlannedRestorationSpendChaos = plannedRestorationSpend;
             next.PlannedProfitChaos = profit;
+            next.PlannedSettlementAmount = next.Legs[^1].Output;
+            next.PlannedProfitAmount = profit;
+            next.ValuedProfitChaos = profit;
             next.CurrentProbeSessionId = probeSessionId;
             next.UpdatedAtUtc = now;
             next.Detail = restorationIndex >= 0
@@ -857,19 +1125,27 @@ public static class WorkflowCoordinator
             string.IsNullOrWhiteSpace(workflow.League) || string.IsNullOrWhiteSpace(workflow.PlanFingerprint) ||
             string.IsNullOrWhiteSpace(workflow.TerminalChaosMetadata) ||
             string.IsNullOrWhiteSpace(workflow.StartingMetadata) || string.IsNullOrWhiteSpace(workflow.ChaosMetadata) ||
-            workflow.ClosureMode is not WorkflowClosureMode.LegacyTerminalChaos and not WorkflowClosureMode.ClosedCycle ||
+            workflow.ClosureMode is not WorkflowClosureMode.LegacyTerminalChaos and not WorkflowClosureMode.ClosedCycle and
+                not WorkflowClosureMode.SameAssetCycle ||
             workflow.StartedAtUtc == default || workflow.UpdatedAtUtc == default ||
             workflow.StartingPrincipal <= 0 || workflow.BenchmarkChaos <= 0 ||
             workflow.RestorationPrincipal < 0 || workflow.RestoredPrincipal < 0 ||
             workflow.OutstandingPrincipal < 0 || workflow.PlannedRestorationSpendChaos < 0 ||
             workflow.CumulativeActualRestorationChaosSpent < 0 || workflow.ActualChaosRealized < 0 ||
+            string.IsNullOrWhiteSpace(workflow.SettlementMetadata) ||
+            string.IsNullOrWhiteSpace(workflow.ProfitMetadata) ||
+            workflow.PlannedSettlementAmount <= 0 || workflow.ActualSettlementAmount < 0 ||
+            workflow.PlannedProfitAmount <= 0 || workflow.ActualProfitAmount < 0 ||
+            workflow.ValuedProfitChaos <= 0 || workflow.ProfitValuationNumerator < 0 ||
+            workflow.ProfitValuationDenominator < 0 || workflow.CumulativeCycleSettlementAmount < 0 ||
             workflow.CurrentInputAmount <= 0 || workflow.Legs.Count is < 2 or > 3 ||
             workflow.StartingPrincipal != workflow.Legs[0].InputSpent ||
             workflow.PlanFingerprint != ComputeFingerprint(workflow))
         {
             throw new InvalidDataException("Workflow state failed identity, economics, or fingerprint validation.");
         }
-        if (workflow.ChaosRealizationLegIndex < 0 || workflow.ChaosRealizationLegIndex >= workflow.Legs.Count)
+        if (workflow.ClosureMode != WorkflowClosureMode.SameAssetCycle &&
+            (workflow.ChaosRealizationLegIndex < 0 || workflow.ChaosRealizationLegIndex >= workflow.Legs.Count))
             throw new InvalidDataException("Workflow Chaos realization cursor was invalid.");
 
         if (workflow.ClosureMode == WorkflowClosureMode.LegacyTerminalChaos)
@@ -888,15 +1164,19 @@ public static class WorkflowCoordinator
                 throw new InvalidDataException("Legacy terminal-Chaos workflow economics were invalid.");
             }
         }
-        else
+        else if (workflow.ClosureMode == WorkflowClosureMode.ClosedCycle)
         {
             ValidateClosedCycle(workflow);
+        }
+        else
+        {
+            ValidateSameAssetCycle(workflow);
         }
 
         var currentIndex = Math.Min(workflow.CurrentLegIndex, workflow.Legs.Count - 1);
         var expectedCurrentInput = workflow.CurrentLegIndex >= workflow.Legs.Count
             ? workflow.Legs[^1].Output
-            : workflow.Legs[currentIndex].Role == WorkflowLegRole.PrincipalRestoration
+            : workflow.Legs[currentIndex].Role is WorkflowLegRole.PrincipalRestoration or WorkflowLegRole.CycleClosure
                 ? workflow.Legs[currentIndex].InputAvailable
                 : workflow.CurrentLegIndex == 0
                     ? workflow.StartingPrincipal
@@ -909,7 +1189,8 @@ public static class WorkflowCoordinator
         {
             var leg = workflow.Legs[index];
             if (leg.Index != index || leg.Role is not WorkflowLegRole.Conversion and
-                    not WorkflowLegRole.ChaosRealization and not WorkflowLegRole.PrincipalRestoration ||
+                    not WorkflowLegRole.ChaosRealization and not WorkflowLegRole.PrincipalRestoration and
+                    not WorkflowLegRole.CycleClosure ||
                 leg.FromHash == 0 || leg.ToHash == 0 ||
                 string.IsNullOrWhiteSpace(leg.FromMetadata) || string.IsNullOrWhiteSpace(leg.ToMetadata) ||
                 leg.FromMetadata == leg.ToMetadata || leg.RateNumerator <= 0 || leg.RateDenominator <= 0 ||
@@ -921,7 +1202,7 @@ public static class WorkflowCoordinator
                 leg.InputSpent > SingleLegStagingController.MaximumAmount ||
                 leg.Output > SingleLegStagingController.MaximumAmount ||
                 index > 0 && (workflow.Legs[index - 1].ToMetadata != leg.FromMetadata ||
-                    leg.Role != WorkflowLegRole.PrincipalRestoration &&
+                    leg.Role is not WorkflowLegRole.PrincipalRestoration and not WorkflowLegRole.CycleClosure &&
                     workflow.Legs[index - 1].Output != leg.InputAvailable))
             {
                 throw new InvalidDataException($"Workflow leg {index + 1} failed exact plan validation.");
@@ -944,6 +1225,34 @@ public static class WorkflowCoordinator
         {
             throw new InvalidDataException("Workflow phase, leg cursor, and tracked order were inconsistent.");
         }
+    }
+
+    private static void ValidateSameAssetCycle(WorkflowExecutionState workflow)
+    {
+        var closure = workflow.Legs.Where(leg => leg.Role == WorkflowLegRole.CycleClosure).ToArray();
+        if (workflow.Legs.Count != 2 || closure.Length != 1 || closure[0].Index != workflow.Legs.Count - 1 ||
+            workflow.Legs[0].FromMetadata != workflow.StartingMetadata ||
+            workflow.Legs[^1].ToMetadata != workflow.StartingMetadata ||
+            workflow.SettlementMetadata != workflow.StartingMetadata ||
+            workflow.ProfitMetadata != workflow.StartingMetadata ||
+            workflow.ChaosRealizationLegIndex != -1 ||
+            workflow.RestorationPrincipal != 0 || workflow.RestoredPrincipal != 0 ||
+            workflow.OutstandingPrincipal != 0 || workflow.PlannedRestorationSpendChaos != 0 ||
+            workflow.CumulativeActualRestorationChaosSpent != 0 || workflow.ActualChaosRealized != 0 ||
+            workflow.Phase != WorkflowExecutionPhase.Completed &&
+                workflow.PlannedSettlementAmount != checked(
+                    workflow.CumulativeCycleSettlementAmount + closure[0].Output) ||
+            workflow.PlannedProfitAmount != checked(workflow.PlannedSettlementAmount - workflow.StartingPrincipal) ||
+            workflow.PlannedProfitAmount <= 0 || workflow.PlannedProfitChaos != workflow.ValuedProfitChaos ||
+            workflow.ProfitValuationNumerator <= 0 || workflow.ProfitValuationDenominator <= 0)
+        {
+            throw new InvalidDataException("Same-asset cycle identity or unit-aware economics were invalid.");
+        }
+        if (workflow.Phase == WorkflowExecutionPhase.Completed &&
+            (workflow.ActualSettlementAmount != workflow.CumulativeCycleSettlementAmount ||
+             workflow.ActualProfitAmount != checked(workflow.ActualSettlementAmount - workflow.StartingPrincipal) ||
+             workflow.ActualProfitAmount <= 0))
+            throw new InvalidDataException("Completed same-asset cycle lacked positive actual settlement profit.");
     }
 
     private static void ValidateClosedCycle(WorkflowExecutionState workflow)
@@ -1014,8 +1323,31 @@ public static class WorkflowCoordinator
             $"{workflow.StartingMetadata}:{workflow.ChaosMetadata}:{workflow.ChaosRealizationLegIndex}:" +
             $"{workflow.RestorationPrincipal}:{workflow.RestoredPrincipal}:{workflow.OutstandingPrincipal}:" +
             $"{workflow.PlannedRestorationSpendChaos}:{workflow.CumulativeActualRestorationChaosSpent}:" +
-            $"{workflow.ActualChaosRealized}|{legs}";
+            $"{workflow.ActualChaosRealized}:{workflow.SettlementMetadata}:{workflow.PlannedSettlementAmount}:" +
+            $"{workflow.ActualSettlementAmount}:{workflow.ProfitMetadata}:{workflow.PlannedProfitAmount}:" +
+            $"{workflow.ActualProfitAmount}:{workflow.ValuedProfitChaos}:{workflow.ProfitValuationNumerator}/" +
+            $"{workflow.ProfitValuationDenominator}:{workflow.CumulativeCycleSettlementAmount}|{legs}";
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    public static bool LegacyVersionThreeFingerprintMatches(WorkflowExecutionState workflow) =>
+        workflow.PlanFingerprint == ComputeLegacyVersionThreeFingerprint(workflow);
+
+    public static string ComputeLegacyVersionThreeFingerprint(WorkflowExecutionState workflow)
+    {
+        var legs = string.Join("|", workflow.Legs.Select(leg =>
+            $"{leg.Index}:{leg.Role}:{leg.FromMetadata}:{leg.FromHash}>{leg.ToMetadata}:{leg.ToHash}:" +
+            $"{leg.ExecutionIntent}:{leg.SourceBook}:{leg.RateNumerator}/{leg.RateDenominator}:" +
+            $"{leg.InputAvailable}:{leg.InputSpent}:{leg.Output}:{leg.InputRemainder}:{leg.ExpectedGold?.ToString() ?? "unknown"}"));
+        var canonical = $"3:{workflow.ClosureMode}:{workflow.CurrentProbeSessionId:D}:" +
+            $"{workflow.CurrentLegIndex}:{workflow.CurrentInputAmount}:" +
+            $"{workflow.TerminalChaosMetadata}:{workflow.StartingPrincipal}:" +
+            $"{workflow.BenchmarkChaos}:{workflow.PlannedRealizedChaos}:{workflow.PlannedProfitChaos}:" +
+            $"{workflow.StartingMetadata}:{workflow.ChaosMetadata}:{workflow.ChaosRealizationLegIndex}:" +
+            $"{workflow.RestorationPrincipal}:{workflow.RestoredPrincipal}:{workflow.OutstandingPrincipal}:" +
+            $"{workflow.PlannedRestorationSpendChaos}:{workflow.CumulativeActualRestorationChaosSpent}:" +
+            $"{workflow.ActualChaosRealized}|{legs}";
+        return Hash(canonical);
     }
 
     public static bool LegacyVersionTwoFingerprintMatches(WorkflowExecutionState workflow)
@@ -1100,6 +1432,41 @@ public static class WorkflowCoordinator
             : 0;
         foreach (var leg in workflow.Legs) leg.Role = WorkflowLegRole.Conversion;
         workflow.Legs[^1].Role = WorkflowLegRole.ChaosRealization;
+        ApplyUnitEconomicsForExistingWorkflow(workflow);
+    }
+
+    public static void MigrateVersionThreeUnitEconomics(WorkflowExecutionState workflow)
+    {
+        workflow.SchemaVersion = WorkflowExecutionState.CurrentSchemaVersion;
+        ApplyUnitEconomicsForExistingWorkflow(workflow);
+    }
+
+    private static void ApplyUnitEconomicsForExistingWorkflow(WorkflowExecutionState workflow)
+    {
+        workflow.SettlementMetadata = workflow.Legs[^1].ToMetadata;
+        workflow.PlannedSettlementAmount = workflow.Legs[^1].Output;
+        workflow.ProfitMetadata = workflow.ChaosMetadata;
+        workflow.PlannedProfitAmount = workflow.PlannedProfitChaos;
+        workflow.ValuedProfitChaos = workflow.PlannedProfitChaos;
+        workflow.ProfitValuationNumerator = 0;
+        workflow.ProfitValuationDenominator = 0;
+        workflow.CumulativeCycleSettlementAmount = 0;
+        if (workflow.Phase == WorkflowExecutionPhase.Completed)
+        {
+            workflow.ActualSettlementAmount = workflow.RestorationPrincipal > 0
+                ? workflow.RestorationPrincipal
+                : workflow.ActualChaosRealized > 0
+                    ? workflow.ActualChaosRealized
+                    : workflow.PlannedRealizedChaos;
+            workflow.ActualProfitAmount = workflow.RestorationPrincipal > 0
+                ? Math.Max(0, workflow.ActualChaosRealized - workflow.CumulativeActualRestorationChaosSpent)
+                : Math.Max(0, workflow.ActualSettlementAmount - workflow.StartingPrincipal);
+        }
+        else
+        {
+            workflow.ActualSettlementAmount = 0;
+            workflow.ActualProfitAmount = 0;
+        }
     }
 
     private static string Hash(string value) =>
@@ -1177,6 +1544,16 @@ public static class WorkflowCoordinator
         PlannedRestorationSpendChaos = state.PlannedRestorationSpendChaos,
         CumulativeActualRestorationChaosSpent = state.CumulativeActualRestorationChaosSpent,
         ActualChaosRealized = state.ActualChaosRealized,
+        SettlementMetadata = state.SettlementMetadata,
+        PlannedSettlementAmount = state.PlannedSettlementAmount,
+        ActualSettlementAmount = state.ActualSettlementAmount,
+        ProfitMetadata = state.ProfitMetadata,
+        PlannedProfitAmount = state.PlannedProfitAmount,
+        ActualProfitAmount = state.ActualProfitAmount,
+        ValuedProfitChaos = state.ValuedProfitChaos,
+        ProfitValuationNumerator = state.ProfitValuationNumerator,
+        ProfitValuationDenominator = state.ProfitValuationDenominator,
+        CumulativeCycleSettlementAmount = state.CumulativeCycleSettlementAmount,
         Legs = state.Legs.Select(leg => new WorkflowLegPlan
         {
             Index = leg.Index,

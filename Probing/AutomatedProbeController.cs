@@ -202,6 +202,15 @@ public sealed class AutomatedProbeController
         new ProbeMarketPlan(divine, chaos),
     ];
 
+    public static IReadOnlyList<ProbeMarketPlan> CreateDirectDivineCyclePlans(
+        CurrencyIdentity chaos,
+        CurrencyIdentity divine,
+        CurrencyIdentity target) =>
+    [
+        new ProbeMarketPlan(divine, chaos),
+        new ProbeMarketPlan(divine, target),
+    ];
+
     public static IReadOnlyList<ProbeMarketPlan> CreateSweepCandidatePlans(
         CurrencyIdentity chaos,
         CurrencyIdentity divine,

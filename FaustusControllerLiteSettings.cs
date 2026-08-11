@@ -46,6 +46,12 @@ public sealed class FaustusControllerLiteSettings : ISettings
     public RangeNode<int> CompetingOrderWaitMinutes { get; set; } = new(5, 1, 3_600);
 
     [Category("Strategy")]
+    public ToggleNode EnableDirectDivineCycles { get; set; } = new(false);
+
+    [Category("Strategy")]
+    public RangeNode<int> MaximumDirectDivinePrincipal { get; set; } = new(1_000, 1, 1_000);
+
+    [Category("Strategy")]
     public RangeNode<int> ContinuousWorkflowRetrySeconds { get; set; } = new(10, 2, 90);
 
     /// <summary>

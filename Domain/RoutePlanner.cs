@@ -50,7 +50,17 @@ public sealed record RoutePlannerRequest(
     string AreaId,
     long MinimumProfitChaos = 5,
     long? ExpectedGoldPerLeg = null,
-    int MaximumCompetingEdges = 2);
+    int MaximumCompetingEdges = 2,
+    bool EnableDirectDivineCycles = false,
+    long MaximumDirectDivinePrincipal = 1_000,
+    bool PrioritizeValuedProfit = false);
+
+public enum RouteCycleKind
+{
+    ChaosCycle = 1,
+    DivinePrincipalRestoration = 2,
+    SameAssetDivineCycle = 3,
+}
 
 public sealed record RouteLegResult(
     DirectedExchangeEdge Edge,
@@ -73,7 +83,13 @@ public sealed record RouteCandidate(
     long? ExpectedGold,
     int ChaosRealizationLegIndex = -1,
     long RestorationPrincipal = 0,
-    long PlannedRestorationSpendChaos = 0)
+    long PlannedRestorationSpendChaos = 0,
+    RouteCycleKind CycleKind = RouteCycleKind.ChaosCycle,
+    string ProfitMetadata = "",
+    long ProfitAmount = 0,
+    long ValuedProfitChaos = 0,
+    long PlannedSettlementAmount = 0,
+    DirectedExchangeEdge? ProfitValuationEdge = null)
 {
     public string Signature => string.Join(">", Path.Select(currency => currency.Metadata));
 
@@ -120,18 +136,111 @@ public static class FaustusRoutePlanner
             new[] { request.Divine, request.Target, request.Chaos, request.Divine },
         };
 
-        var evaluations = paths.SelectMany(path => EvaluatePathVariants(request, path, edgeLookup)).ToArray();
-        var candidates = evaluations
+        var evaluations = paths.SelectMany(path => EvaluatePathVariants(request, path, edgeLookup)).ToList();
+        if (request.EnableDirectDivineCycles)
+            evaluations.AddRange(EvaluateDirectDivineCycleVariants(request, edgeLookup));
+        var accepted = evaluations
             .Where(evaluation => evaluation.Candidate is not null)
-            .Select(evaluation => evaluation.Candidate!)
-            .OrderBy(candidate => candidate.CompetingEdgeCount)
-            .ThenByDescending(candidate => candidate.ProfitChaos)
-            .ThenByDescending(candidate => candidate.RealizedChaos)
-            .ThenBy(candidate => candidate.Signature, StringComparer.Ordinal)
-            .ThenBy(candidate => candidate.ExecutionSignature, StringComparer.Ordinal)
-            .ToArray();
+            .Select(evaluation => evaluation.Candidate!);
+        var candidates = request.PrioritizeValuedProfit
+            ? accepted.OrderByDescending(candidate => candidate.ValuedProfitChaos)
+                .ThenBy(candidate => candidate.CompetingEdgeCount)
+                .ThenBy(candidate => candidate.Signature, StringComparer.Ordinal)
+                .ThenBy(candidate => candidate.ExecutionSignature, StringComparer.Ordinal)
+                .ToArray()
+            : accepted.OrderBy(candidate => candidate.CompetingEdgeCount)
+                .ThenByDescending(candidate => candidate.ProfitChaos)
+                .ThenByDescending(candidate => candidate.RealizedChaos)
+                .ThenBy(candidate => candidate.Signature, StringComparer.Ordinal)
+                .ThenBy(candidate => candidate.ExecutionSignature, StringComparer.Ordinal)
+                .ToArray();
 
         return new RoutePlannerResult(candidates, evaluations);
+    }
+
+    private static IEnumerable<RouteEvaluation> EvaluateDirectDivineCycleVariants(
+        RoutePlannerRequest request,
+        IReadOnlyDictionary<(CurrencyIdentity From, CurrencyIdentity To), IReadOnlyList<DirectedExchangeEdge>> edges)
+    {
+        var path = new[] { request.Divine, request.Target, request.Divine };
+        if (!edges.TryGetValue((request.Divine, request.Target), out var openingChoices) ||
+            !edges.TryGetValue((request.Target, request.Divine), out var closingChoices))
+            return [Reject(path, RouteRejectionReason.MissingEdge, "Direct Divine cycle requires both Divine/target directions.")];
+
+        openingChoices = openingChoices.Where(edge => edge.ExecutionIntent == QuoteExecutionIntent.Competing).ToArray();
+        closingChoices = closingChoices.Where(edge => edge.ExecutionIntent == QuoteExecutionIntent.Competing).ToArray();
+        if (openingChoices.Count == 0 || closingChoices.Count == 0)
+            return [Reject(path, RouteRejectionReason.MissingEdge, "Direct Divine cycle requires competing quotes in both directions.")];
+
+        if (!edges.TryGetValue((request.Divine, request.Chaos), out var valuationChoices))
+            return [Reject(path, RouteRejectionReason.MissingDivineBenchmark, "Direct Divine profit requires an Immediate Divine/Chaos valuation.")];
+        var valuation = valuationChoices.FirstOrDefault(edge =>
+            edge.ExecutionIntent == QuoteExecutionIntent.Immediate && ValidateEdge(request, edge) == RouteRejectionReason.None);
+        if (valuation is null)
+            return [Reject(path, RouteRejectionReason.MissingDivineBenchmark, "Direct Divine profit valuation must be fresh, matching, and Immediate.")];
+
+        return openingChoices.SelectMany(
+            opening => closingChoices,
+            (opening, closing) => EvaluateDirectDivineCycle(request, path, opening, closing, valuation)).ToArray();
+    }
+
+    private static RouteEvaluation EvaluateDirectDivineCycle(
+        RoutePlannerRequest request,
+        CurrencyIdentity[] path,
+        DirectedExchangeEdge opening,
+        DirectedExchangeEdge closing,
+        DirectedExchangeEdge valuation)
+    {
+        foreach (var edge in new[] { opening, closing, valuation })
+        {
+            var validation = ValidateEdge(request, edge);
+            if (validation != RouteRejectionReason.None)
+                return Reject(path, validation, $"Invalid direct-cycle quote {edge.From.Metadata}->{edge.To.Metadata}.");
+        }
+        if (request.MaximumCompetingEdges < 2)
+            return Reject(path, RouteRejectionReason.TooManyCompetingEdges, "Direct Divine cycle requires two competing legs.");
+
+        try
+        {
+            var available = Math.Min(request.DivineBankroll.Available, request.MaximumDirectDivinePrincipal);
+            if (available <= 0) return Reject(path, RouteRejectionReason.ZeroBankroll, "No Divine principal is available.");
+            var buy = opening.Rate.ConvertWholeLots(available, opening.InputLimit);
+            if (buy.InputSpent <= 0 || buy.Output <= 0)
+                return Reject(path, RouteRejectionReason.Underfunded, "Divine principal cannot form one direct-cycle opening lot.");
+            var sell = closing.Rate.ConvertWholeLots(buy.Output, closing.InputLimit);
+            if (sell.InputSpent <= 0 || sell.Output <= buy.InputSpent)
+                return Reject(path, RouteRejectionReason.ProfitBelowMinimum, "Direct Divine cycle does not return more Divine than it spends.");
+
+            var profitDivine = checked(sell.Output - buy.InputSpent);
+            var valued = valuation.Rate.ConvertWholeLots(profitDivine, valuation.InputLimit);
+            if (valued.InputSpent != profitDivine || valued.Output <= 0)
+                return Reject(path, RouteRejectionReason.UnderLiquid, "Immediate Divine/Chaos depth cannot value the full direct-cycle profit.");
+            if (valued.Output < request.MinimumProfitChaos)
+                return Reject(path, RouteRejectionReason.ProfitBelowMinimum,
+                    $"Direct-cycle profit {profitDivine} Divine is valued at {valued.Output} Chaos, below {request.MinimumProfitChaos}.");
+
+            var remainders = new Dictionary<CurrencyIdentity, long>();
+            if (buy.InputRemainder > 0) AddRemainder(remainders, request.Divine, buy.InputRemainder);
+            if (sell.InputRemainder > 0) AddRemainder(remainders, request.Target, sell.InputRemainder);
+            var legs = new[]
+            {
+                new RouteLegResult(opening, available, buy.InputSpent, buy.Output, buy.InputRemainder, request.ExpectedGoldPerLeg),
+                new RouteLegResult(closing, buy.Output, sell.InputSpent, sell.Output, sell.InputRemainder, request.ExpectedGoldPerLeg),
+            };
+            var expectedGold = request.ExpectedGoldPerLeg is null
+                ? (long?)null
+                : checked(request.ExpectedGoldPerLeg.Value * 2);
+            var queue = checked(opening.CompetingQueueAhead + closing.CompetingQueueAhead);
+            var candidate = new RouteCandidate(
+                path, legs, buy.InputSpent, 0, 0, valued.Output, remainders, 2, queue, expectedGold,
+                -1, 0, 0, RouteCycleKind.SameAssetDivineCycle, request.Divine.Metadata,
+                profitDivine, valued.Output, sell.Output, valuation);
+            return new RouteEvaluation(path, candidate, RouteRejectionReason.None, string.Empty);
+        }
+        catch (OverflowException exception)
+        {
+            return Reject(path, RouteRejectionReason.ArithmeticOverflow, exception.Message);
+        }
     }
 
     private static IEnumerable<RouteEvaluation> EvaluatePathVariants(
@@ -348,8 +457,12 @@ public static class FaustusRoutePlanner
             var expectedGold = request.ExpectedGoldPerLeg is null
                 ? (long?)null
                 : checked(request.ExpectedGoldPerLeg.Value * pathEdges.Count);
+            var cycleKind = divineStart
+                ? RouteCycleKind.DivinePrincipalRestoration
+                : RouteCycleKind.ChaosCycle;
             var candidate = new RouteCandidate(path, legs, principal, benchmark, realizedChaos, profit, remainders,
-                competingCount, queue, expectedGold, chaosRealizationLegIndex, restorationPrincipal, restorationSpend);
+                competingCount, queue, expectedGold, chaosRealizationLegIndex, restorationPrincipal, restorationSpend,
+                cycleKind, request.Chaos.Metadata, profit, profit, realizedChaos, null);
             return new RouteEvaluation(path, candidate, RouteRejectionReason.None, string.Empty);
         }
         catch (OverflowException exception)
@@ -436,6 +549,8 @@ public static class FaustusRoutePlanner
         {
             throw new ArgumentOutOfRangeException(nameof(request.MaximumCompetingEdges));
         }
+        if (request.MaximumDirectDivinePrincipal <= 0)
+            throw new ArgumentOutOfRangeException(nameof(request.MaximumDirectDivinePrincipal));
 
         if (string.IsNullOrWhiteSpace(request.SessionId) || string.IsNullOrWhiteSpace(request.AreaId))
         {
