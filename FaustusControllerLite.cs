@@ -85,6 +85,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private DateTimeOffset? _nextWorkflowScanAtUtc;
     private PermissionSnapshot? _workflowAuthorization;
     private RouteLegResult? _workflowPreparedLeg;
+    private bool _restorationProbeActive;
     private string? _lastLoggedFailure;
     private ContinuousLoopAction? _lastLoopAction;
     private DateTimeOffset _nextLoopHeartbeatUtc;
@@ -1241,6 +1242,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void StartAutomatedProbe()
     {
+        _restorationProbeActive = false;
         if (!TryStartAutomatedProbeFor(Settings.TargetCurrencyMetadata, out var failure))
         {
             _lastFailure = failure;
@@ -1339,6 +1341,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         if (_automatedProbe.State == AutomatedProbeState.Completed)
         {
+            if (_restorationProbeActive)
+            {
+                SynchronizeCompletedRestorationProbe();
+                return;
+            }
             if (_sweepProbePurpose != SweepProbePurpose.None)
             {
                 SynchronizeCompletedSweepProbe();
@@ -1411,6 +1418,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 AutomatedProbeState.ReleasingInput &&
             !string.IsNullOrWhiteSpace(_automatedProbe.Failure))
         {
+            if (_restorationProbeActive &&
+                _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
+            {
+                _lastFailure = _automatedProbe.Failure;
+                _operationStatus = _automatedProbe.Status;
+                _placementPreparation = PlacementPreparationState.Idle;
+                _placementToken = null;
+                _restorationProbeActive = false;
+                _automatedProbe.AcknowledgeCompletion();
+                ScheduleActiveWorkflowRetry();
+                return;
+            }
             if (_sweepProbePurpose != SweepProbePurpose.None &&
                 _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
             {
@@ -1437,6 +1456,54 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _automatedProbe.AcknowledgeCompletion();
             }
         }
+    }
+
+    private void SynchronizeCompletedRestorationProbe()
+    {
+        var restageForPlacement = false;
+        try
+        {
+            var captures = _automatedProbe.CompletedCaptures.ToArray();
+            if (captures.Length != 1 || captures[0].SessionId != _manualProbeSessionId)
+                throw new InvalidDataException("Restoration refresh did not produce one capture in its authorized session.");
+
+            _rateStore.Store(captures[0]);
+            _rateStore.Save(_latestRatePath);
+            var result = TryRefreshWorkflowPlan(
+                MarketCaptureNormalizer.CreateEdges(captures[0]), out var failure);
+            if (result == WorkflowRefreshResult.Refreshed)
+            {
+                restageForPlacement = true;
+                _lastFailure = "None";
+                _operationStatus = "Fresh Divine/Chaos restoration quote persisted; validating it immediately before staging.";
+            }
+            else if (result == WorkflowRefreshResult.RetryableUnavailable)
+            {
+                _placementPreparation = PlacementPreparationState.Idle;
+                ScheduleActiveWorkflowRetry();
+            }
+            else
+            {
+                throw new InvalidOperationException(failure);
+            }
+        }
+        catch (Exception exception)
+        {
+            _placementPreparation = PlacementPreparationState.Idle;
+            _placementToken = null;
+            _lastFailure = $"Restoration market refresh failed: {exception.Message}";
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
+            _startingNewWorkflow = false;
+            _nextWorkflowScanAtUtc = null;
+        }
+        finally
+        {
+            _restorationProbeActive = false;
+            _automatedProbe.AcknowledgeCompletion();
+        }
+
+        if (restageForPlacement) StartPlacementLegRefresh();
     }
 
     private void SynchronizeCompletedSweepProbe()
@@ -2082,7 +2149,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _operationStatus = $"Exact principal restoration is unavailable; reprobing the active workflow in {seconds}s.";
     }
 
-    private WorkflowRefreshResult TryRefreshWorkflowPlan(out string failure)
+    private WorkflowRefreshResult TryRefreshWorkflowPlan(out string failure) =>
+        TryRefreshWorkflowPlan(null, out failure);
+
+    private WorkflowRefreshResult TryRefreshWorkflowPlan(
+        IReadOnlyCollection<DirectedExchangeEdge>? restorationEdges,
+        out string failure)
     {
         var workflow = _bankroll.Workflow;
         if (workflow?.Phase != WorkflowExecutionPhase.ReadyForLeg || _bankrollStore is null)
@@ -2091,14 +2163,24 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return WorkflowRefreshResult.Failed;
         }
         var restoration = workflow.Legs[workflow.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
-        if (!TryBuildCurrentQuoteMatrix(out var matrix, out failure) || matrix is null ||
-            !TryGetWorkflowSpendCap(workflow, out var spendCap, out failure))
+        IReadOnlyCollection<DirectedExchangeEdge> edges;
+        if (restoration && restorationEdges is not null)
+        {
+            edges = restorationEdges;
+        }
+        else if (!TryBuildCurrentQuoteMatrix(out var matrix, out failure) || matrix is null)
         {
             return restoration ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
         }
+        else
+        {
+            edges = matrix.Edges;
+        }
+        if (!TryGetWorkflowSpendCap(workflow, out var spendCap, out failure))
+            return restoration ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
         var refresh = WorkflowCoordinator.TryRefreshRemainingPlan(
             workflow,
-            matrix.Edges,
+            edges,
             _manualProbeSessionId,
             spendCap,
             Settings.MinimumProfitChaos.Value,
@@ -2387,7 +2469,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _rateStore.Save(_latestRatePath);
                 if (_fullWorkflowAuthorized)
                 {
-                    var workflowRefresh = TryRefreshWorkflowPlan(out var workflowFailure);
+                    var restoration = _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
+                        ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration;
+                    var workflowRefresh = restoration
+                        ? TryRefreshWorkflowPlan(
+                            MarketCaptureNormalizer.CreateEdges(captures[0]), out var workflowFailure)
+                        : TryRefreshWorkflowPlan(out workflowFailure);
                     if (workflowRefresh == WorkflowRefreshResult.RetryableUnavailable)
                     {
                         _placementPreparation = PlacementPreparationState.Idle;
@@ -2679,6 +2766,29 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
         _nextWorkflowScanAtUtc = null;
+        if (_bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
+            ready.Legs[ready.CurrentLegIndex].Role == WorkflowLegRole.PrincipalRestoration)
+        {
+            _placementRefreshAttempts = 0;
+            _placementToken = null;
+            _workflowPreparedLeg = null;
+            var cachedRefresh = TryRefreshWorkflowPlan(out var cachedFailure);
+            if (cachedRefresh == WorkflowRefreshResult.Refreshed)
+            {
+                _operationStatus = "Restoration reused the still-fresh coherent quote, then requested a one-market pre-click refresh.";
+                StartPlacementLegRefresh();
+                return;
+            }
+            if (cachedRefresh == WorkflowRefreshResult.Failed)
+            {
+                StopFullWorkflowLocal($"Restoration preparation failed: {cachedFailure}");
+                return;
+            }
+
+            StartRestorationMarketProbe(ready);
+            return;
+        }
+
         _placementPreparation = PlacementPreparationState.Probing;
         _placementRefreshAttempts = 0;
         _placementToken = null;
@@ -2693,6 +2803,35 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _operationStatus = _startingNewWorkflow
             ? "Full workflow authorized: probing all three markets before persisting an exact route."
             : "Workflow next leg authorized: freshly probing all three markets before re-planning the remaining route.";
+    }
+
+    private void StartRestorationMarketProbe(WorkflowExecutionState workflow)
+    {
+        var planned = workflow.Legs[workflow.CurrentLegIndex];
+        var offered = new CurrencyIdentity(planned.FromMetadata, planned.FromHash, planned.FromName);
+        var wanted = new CurrencyIdentity(planned.ToMetadata, planned.ToHash, planned.ToName);
+        _manualProbeSessionId = Guid.NewGuid();
+        if (!_automatedProbe.StartSingleMarketProbe(
+                GameController,
+                offered,
+                wanted,
+                _pickerCalibration,
+                ProbeInputPermissions.From(Settings),
+                IsFullFaustusControllerEnabled(),
+                Settings.CursorTweenSpeed.Value,
+                _manualProbeSessionId,
+                out var failure))
+        {
+            _placementPreparation = PlacementPreparationState.Idle;
+            _restorationProbeActive = false;
+            _lastFailure = failure;
+            ScheduleActiveWorkflowRetry();
+            return;
+        }
+
+        _restorationProbeActive = true;
+        _placementPreparation = PlacementPreparationState.Probing;
+        _operationStatus = "Principal restoration is probing only the required Chaos/Divine market.";
     }
 
     private void DriveFullWorkflow()
@@ -5053,6 +5192,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _singleLegStaging.Cancel(reason);
         }
         _placementPreparation = PlacementPreparationState.Idle;
+        _restorationProbeActive = false;
         _placementToken = null;
         _lastFailure = reason;
     }
