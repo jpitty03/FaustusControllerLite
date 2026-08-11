@@ -126,6 +126,7 @@ public sealed class AutomatedProbeController
     public AutomatedProbeState State { get; private set; } = AutomatedProbeState.Idle;
     public string Status { get; private set; } = "Idle.";
     public string Failure { get; private set; } = string.Empty;
+    public bool FreshProbeRetryRecommended { get; private set; }
     public Guid SessionId => _sessionId;
     public bool IsRunning => State is not AutomatedProbeState.Idle and
         not AutomatedProbeState.Completed and
@@ -338,6 +339,7 @@ public sealed class AutomatedProbeController
         _pairIndex = 0;
         _captures.Clear();
         _stableSamples.Reset();
+        FreshProbeRetryRecommended = false;
         _lastCommandedCursor = ExileInput.MousePositionNum;
         _overallDeadline = DateTimeOffset.UtcNow + OverallTimeout;
         Failure = string.Empty;
@@ -940,7 +942,7 @@ public sealed class AutomatedProbeController
     {
         if (now > _stepDeadline)
         {
-            Cancel("Stable book sampling timed out.");
+            CancelForFreshProbe("Stable book sampling timed out.");
             return;
         }
 
@@ -962,7 +964,7 @@ public sealed class AutomatedProbeController
         if (!CurrentMarketReader.TryCapture(gameController, _sessionId, out var capture, out var failure) ||
             capture is null)
         {
-            Cancel(failure);
+            CancelForFreshProbe(failure);
             return;
         }
 
@@ -985,7 +987,7 @@ public sealed class AutomatedProbeController
                 return;
             }
 
-            Cancel(headFailure);
+            CancelForFreshProbe(headFailure);
             return;
         }
 
@@ -1006,6 +1008,12 @@ public sealed class AutomatedProbeController
 
         Status = $"Pair {_pairIndex + 1}/{_plans.Count}: stable sample {_stableSamples.Count}/{requiredSamples}.";
         _nextActionAt = now + SampleInterval;
+    }
+
+    private void CancelForFreshProbe(string reason)
+    {
+        FreshProbeRetryRecommended = true;
+        Cancel(reason);
     }
 
     private bool ValidateOpenPicker(GameController gameController, out string failure)

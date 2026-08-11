@@ -263,6 +263,7 @@ public sealed class SingleLegPlacementController
     public string Failure { get; private set; } = string.Empty;
     public TrackedOrderState? Outcome { get; private set; }
     public bool FreshProbeRetryRecommended { get; private set; }
+    public bool FreshProbeRetryFromLiveQuoteRejection { get; private set; }
     public bool IsRunning => State is SingleLegPlacementState.MovingToPlaceOrder or
         SingleLegPlacementState.ReadyToClick or SingleLegPlacementState.WaitingForOrder or
         SingleLegPlacementState.ReleasingInput;
@@ -324,6 +325,7 @@ public sealed class SingleLegPlacementController
         _baselineOrderIds.UnionWith(orders.Select(order => order.PlayerOrderId));
         Outcome = null;
         FreshProbeRetryRecommended = false;
+        FreshProbeRetryFromLiveQuoteRejection = false;
         Failure = string.Empty;
         BeginMovement(target, cursorSpeed);
         failure = string.Empty;
@@ -531,8 +533,8 @@ public sealed class SingleLegPlacementController
                 gameController, _probeSessionId, out var capture, out failure, requireSelectedMarketHead: false) || capture is null ||
             !LiveQuoteAllowsPlacement(_leg!, capture, _quoteValidationPolicy, out failure))
         {
-            FreshProbeRetryRecommended =
-                _quoteValidationPolicy == SingleLegQuoteValidationPolicy.AggressiveImmediateLimit;
+            FreshProbeRetryRecommended = true;
+            FreshProbeRetryFromLiveQuoteRejection = true;
             FinishAmbiguousOrCancel($"Final live quote rejected placement: {failure}", clicked: false);
             return;
         }

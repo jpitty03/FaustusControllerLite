@@ -44,7 +44,7 @@ normal affinity tab is not yet supported.
 | `EnableDirectDivineCycles` | on/off | Opts into two-competing-leg Divine-to-target-to-Divine cycles. |
 | `MaximumDirectDivinePrincipal` | 1-1000 | Maximum Divine that one direct cycle may lock. |
 | `MinimumSaleChaos` | 1-5000 | Minimum estimated Chaos value for a sell-sweep holding. |
-| `ContinuousWorkflowRetrySeconds` | 2-90 | Delay before retrying a route or restoration. |
+| `ContinuousWorkflowRetrySeconds` | 2-90 | Base delay before a no-route scan or bounded transient pre-click reprobe. |
 | `MaximumQuoteAgeSeconds` | 1-3600 | Maximum accepted market and ownership age. |
 
 Changing `StartingChaos` or `StartingDivine` does not change the current bankroll. Apply a safe
@@ -239,6 +239,16 @@ closed; all calibration is ready; and `Last failure` is `None`.
 
 Press `FullWorkflowHotkey` once to start.
 
+Before any Place Order click, transient market capture, stable-book, unavailable-quote, staging-quote,
+or final live-quote failures keep authorization active and schedule a fresh coherent probe after the
+configured cooldown. The budget allows 10 reprobes for one leg's complete preparation cycle. If the
+next transient preparation also fails, authorization stops with the last reason. A new workflow
+hotkey authorization, successful placement, or planner-complete no-route scan resets the budget.
+
+Focus or modifier loss, manual cursor movement, permission or UI changes, area or target changes,
+invalid calibration, persistence failures, canonical-state disagreement, and every uncertain or
+completed click boundary still stop immediately and are never retried automatically.
+
 ## Direct Divine Cycles
 
 Enable `EnableDirectDivineCycles` to probe and prioritize routes such as:
@@ -281,7 +291,8 @@ The plugin resumes the durable workflow phase instead of creating a replacement 
 | Order never becomes `TimedOut` | Keep the row visible and verify the timeout was set before adoption. |
 | Cancel calibration finds no control | Reload schema 6 and hover directly inside the X. |
 | Calibration finds multiple controls | Reposition the cursor in the center of the X. |
-| Quote unavailable | Leave authorization active; the workflow retries safely. |
+| Transient pre-click quote unavailable | Authorization remains active for up to 10 fresh reprobes; inspect `retry N/10` in the runtime log. |
+| Retry limit exhausted | Restore stable market/UI conditions and press `FullWorkflowHotkey` for a new authorization. |
 | Ambiguous order or custody | Do not place another order or reset state. Reconcile it manually. |
 
 Diagnostics are written to:

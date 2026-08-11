@@ -42,6 +42,7 @@ public static class ContinuousWorkflowLoop
     public const int MaximumJitterSeconds = 2;
     public const int IdleHeartbeatSeconds = 30;
     public const int StalePlacementLatchSeconds = 5;
+    public const int MaximumTransientPreparationReprobes = 10;
 
     /// <summary>
     /// True when the placement latch is set while no controller owns it. Such a latch can hold no
@@ -53,6 +54,10 @@ public static class ContinuousWorkflowLoop
     /// <summary>True once an observed condition has held without interruption for the given seconds.</summary>
     public static bool HasPersistedFor(DateTimeOffset? sinceUtc, DateTimeOffset nowUtc, int seconds) =>
         sinceUtc is { } since && nowUtc - since >= TimeSpan.FromSeconds(seconds);
+
+    /// <summary>True while another bounded pre-click market reprobe may be scheduled.</summary>
+    public static bool CanRetryTransientPreparation(int reprobesScheduled) =>
+        reprobesScheduled >= 0 && reprobesScheduled < MaximumTransientPreparationReprobes;
 
     /// <summary>Whole-second retry delay for a valid probe that accepted no route.</summary>
     public static int ResolveRetrySeconds(int configuredSeconds, int jitterSeconds) =>
@@ -70,7 +75,7 @@ public static class ContinuousWorkflowLoop
             _ => WorkflowPreparationResult.Failed,
         };
 
-    /// <summary>Only a planner-complete no-route result may be retried after a cooldown.</summary>
+    /// <summary>True for planner no-route or explicitly classified transient quote unavailability.</summary>
     public static bool IsRetryable(WorkflowPreparationResult result) =>
         result is WorkflowPreparationResult.NoCandidate or WorkflowPreparationResult.RetryableUnavailable;
 

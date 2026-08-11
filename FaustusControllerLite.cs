@@ -83,6 +83,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private bool _sweepAuthorized;
     private bool _startingNewWorkflow;
     private DateTimeOffset? _nextWorkflowScanAtUtc;
+    private int _workflowPreparationRetryCount;
     private PermissionSnapshot? _workflowAuthorization;
     private RouteLegResult? _workflowPreparedLeg;
     private bool _restorationProbeActive;
@@ -502,6 +503,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _sellSweep = null;
         _startingNewWorkflow = false;
         _nextWorkflowScanAtUtc = null;
+        _workflowPreparationRetryCount = 0;
         _automatedProbe.Cancel("Plugin unloading during probing.");
         _placementLegRefresh.Cancel("Plugin unloading during leg refresh.");
         _singleLegStaging.Cancel("Plugin unloading during staging.");
@@ -522,6 +524,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _sellSweep = null;
         _startingNewWorkflow = false;
         _nextWorkflowScanAtUtc = null;
+        _workflowPreparationRetryCount = 0;
         _automatedProbe.Cancel("Plugin hot reload during probing.");
         _placementLegRefresh.Cancel("Plugin hot reload during leg refresh.");
         _singleLegStaging.Cancel("Plugin hot reload during staging.");
@@ -1383,12 +1386,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         _placementPreparation = PlacementPreparationState.Idle;
                         _placementToken = null;
                         _workflowPreparedLeg = null;
-                        if (ContinuousWorkflowLoop.IsRetryable(preparation))
+                        if (preparation == WorkflowPreparationResult.NoCandidate)
                         {
-                            if (preparation == WorkflowPreparationResult.NoCandidate)
-                                ScheduleContinuousScanRetry();
-                            else
-                                ScheduleActiveWorkflowRetry();
+                            ScheduleContinuousScanRetry();
+                        }
+                        else if (preparation == WorkflowPreparationResult.RetryableUnavailable &&
+                            TryRecoverTransientWorkflowPreparation(_lastFailure))
+                        {
                         }
                         else
                         {
@@ -1405,6 +1409,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _lastFailure = $"Automated probe publication failed; prior cache retained: {exception.Message}";
                 _operationStatus = "Probe completed but no partial snapshot was published.";
                 _placementPreparation = PlacementPreparationState.Idle;
+                if (_fullWorkflowAuthorized)
+                {
+                    StopFullWorkflowLocal(_lastFailure);
+                    RecordContinuousAuthorizationRevoked(_lastFailure);
+                }
             }
             finally
             {
@@ -1423,18 +1432,6 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 AutomatedProbeState.ReleasingInput &&
             !string.IsNullOrWhiteSpace(_automatedProbe.Failure))
         {
-            if (_restorationProbeActive &&
-                _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
-            {
-                _lastFailure = _automatedProbe.Failure;
-                _operationStatus = _automatedProbe.Status;
-                _placementPreparation = PlacementPreparationState.Idle;
-                _placementToken = null;
-                _restorationProbeActive = false;
-                _automatedProbe.AcknowledgeCompletion();
-                ScheduleActiveWorkflowRetry();
-                return;
-            }
             if (_sweepProbePurpose != SweepProbePurpose.None &&
                 _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
             {
@@ -1442,16 +1439,28 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _automatedProbe.AcknowledgeCompletion();
                 return;
             }
-            if (_fullWorkflowAuthorized &&
-                _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } closingWorkflow &&
-                closingWorkflow.Legs[closingWorkflow.CurrentLegIndex].Role == WorkflowLegRole.CycleClosure &&
+            if (_fullWorkflowAuthorized && _placementPreparation == PlacementPreparationState.Probing &&
                 _automatedProbe.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed)
             {
-                _lastFailure = _automatedProbe.Failure;
+                var reason = _automatedProbe.Failure;
+                var status = _automatedProbe.Status;
                 _placementPreparation = PlacementPreparationState.Idle;
                 _placementToken = null;
+                _restorationProbeActive = false;
                 _automatedProbe.AcknowledgeCompletion();
-                ScheduleActiveWorkflowRetry();
+                if (_automatedProbe.FreshProbeRetryRecommended &&
+                    TryRecoverTransientWorkflowPreparation(reason))
+                {
+                    return;
+                }
+
+                _lastFailure = reason;
+                _operationStatus = status;
+                _fullWorkflowAuthorized = false;
+                _workflowAuthorization = null;
+                _startingNewWorkflow = false;
+                _nextWorkflowScanAtUtc = null;
+                RecordContinuousAuthorizationRevoked($"Workflow probe stopped before placement: {reason}");
                 return;
             }
 
@@ -1497,7 +1506,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             else if (result == WorkflowRefreshResult.RetryableUnavailable)
             {
                 _placementPreparation = PlacementPreparationState.Idle;
-                ScheduleActiveWorkflowRetry();
+                if (!TryRecoverTransientWorkflowPreparation(failure))
+                    throw new InvalidOperationException(failure);
             }
             else
             {
@@ -2150,20 +2160,59 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             Random.Shared.Next(ContinuousWorkflowLoop.MinimumJitterSeconds, ContinuousWorkflowLoop.MaximumJitterSeconds + 1));
         _nextWorkflowScanAtUtc = DateTimeOffset.UtcNow.AddSeconds(seconds);
         _startingNewWorkflow = true;
+        _workflowPreparationRetryCount = 0;
         _lastFailure = "None";
         _operationStatus = $"No accepted route this scan ({_lastCandidate}); reprobing in {seconds}s.";
     }
 
-    private void ScheduleActiveWorkflowRetry()
+    private bool TryRecoverTransientWorkflowPreparation(string reason)
     {
+        var retryingNewWorkflow = _startingNewWorkflow;
+        var readyForLeg = _bankroll.Workflow?.Phase == WorkflowExecutionPhase.ReadyForLeg;
+        var canonicalStateSettled = !ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(
+            _bankroll, _trackedOrderState, out _);
+        if (!_fullWorkflowAuthorized || string.IsNullOrWhiteSpace(reason) ||
+            _trackedOrderState?.IsUnresolved == true || _bankroll.HasUnresolvedOrder ||
+            retryingNewWorkflow && !canonicalStateSettled || !retryingNewWorkflow && !readyForLeg)
+        {
+            return false;
+        }
+
+        _placementPreparation = PlacementPreparationState.Idle;
+        _placementToken = null;
+        _workflowPreparedLeg = null;
+        _placementRefreshAttempts = 0;
+        _restorationProbeActive = false;
+        _stalePlacementLatchSinceUtc = null;
+
+        if (!ContinuousWorkflowLoop.CanRetryTransientPreparation(_workflowPreparationRetryCount))
+        {
+            _nextWorkflowScanAtUtc = null;
+            _lastFailure = reason;
+            _fullWorkflowAuthorized = false;
+            _workflowAuthorization = null;
+            _startingNewWorkflow = false;
+            _operationStatus =
+                $"Transient workflow preparation retry limit exhausted after " +
+                $"{ContinuousWorkflowLoop.MaximumTransientPreparationReprobes}/" +
+                $"{ContinuousWorkflowLoop.MaximumTransientPreparationReprobes} reprobes: {reason}";
+            AppendRuntimeDiagnostic("WorkflowPreparationRetryExhausted", _operationStatus);
+            RecordContinuousAuthorizationRevoked(_operationStatus);
+            return true;
+        }
+
+        _workflowPreparationRetryCount++;
         var seconds = ContinuousWorkflowLoop.ResolveRetrySeconds(
             Settings.ContinuousWorkflowRetrySeconds.Value,
             Random.Shared.Next(ContinuousWorkflowLoop.MinimumJitterSeconds, ContinuousWorkflowLoop.MaximumJitterSeconds + 1));
         _nextWorkflowScanAtUtc = DateTimeOffset.UtcNow.AddSeconds(seconds);
-        _startingNewWorkflow = false;
-        _workflowPreparedLeg = null;
+        _startingNewWorkflow = retryingNewWorkflow;
+        _operationStatus = $"Transient pre-click market failure: {reason} Reprobing in {seconds}s; " +
+            $"retry {_workflowPreparationRetryCount}/{ContinuousWorkflowLoop.MaximumTransientPreparationReprobes}.";
+        _lastFailure = reason;
+        AppendRuntimeDiagnostic("WorkflowPreparationRetryScheduled", _operationStatus);
         _lastFailure = "None";
-        _operationStatus = $"Active workflow closing quote is unavailable; reprobing in {seconds}s.";
+        return true;
     }
 
     private WorkflowRefreshResult TryRefreshWorkflowPlan(out string failure) =>
@@ -2204,8 +2253,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             return retryableClosing ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
         }
-        if (!TryGetWorkflowSpendCap(workflow, out var spendCap, out failure))
-            return retryableClosing ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
+        if (!TryGetWorkflowSpendCap(workflow, out var spendCap, out var spendCapRetryRecommended, out failure))
+            return retryableClosing && spendCapRetryRecommended
+                ? WorkflowRefreshResult.RetryableUnavailable
+                : WorkflowRefreshResult.Failed;
         var refresh = WorkflowCoordinator.TryRefreshRemainingPlan(
             workflow,
             edges,
@@ -2282,27 +2333,48 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             out failure);
     }
 
-    private bool TryGetWorkflowSpendCap(WorkflowExecutionState workflow, out long spendCap, out string failure)
+    private bool TryGetWorkflowSpendCap(
+        WorkflowExecutionState workflow,
+        out long spendCap,
+        out bool retryRecommended,
+        out string failure)
     {
         var metadata = workflow.Legs[workflow.CurrentLegIndex].FromMetadata;
         var ledger = metadata == GetCatalogueMetadata("Chaos Orb") ||
             metadata == GetCatalogueMetadata("Divine Orb") || _bankroll.NonCoreBalances.ContainsKey(metadata)
                 ? _bankroll.GetAvailable(metadata)
                 : -1;
+        if (ledger < 0)
+        {
+            spendCap = 0;
+            retryRecommended = false;
+            failure = $"Canonical ledger has no workflow currency entry for {metadata}.";
+            return false;
+        }
+
         var now = DateTimeOffset.UtcNow;
         var area = GameController.Game.IngameState.ServerData.InstanceId;
-        if (ledger < 0 || !_liveOwnedByMetadata.TryGetValue(metadata, out var ownership) ||
+        if (!_liveOwnedByMetadata.TryGetValue(metadata, out var ownership) ||
             ownership.AreaInstanceId != area || ownership.StableReads < 2 ||
             now - ownership.ObservedAtUtc < TimeSpan.Zero ||
             now - ownership.ObservedAtUtc > TimeSpan.FromSeconds(Settings.MaximumQuoteAgeSeconds.Value))
         {
             spendCap = 0;
+            retryRecommended = true;
             failure = $"Fresh exact ledger/live ownership cap was unavailable for workflow currency {metadata}.";
             return false;
         }
         spendCap = Math.Min(ledger, ownership.Count);
+        if (spendCap <= 0)
+        {
+            retryRecommended = false;
+            failure = $"Canonical/live workflow spend cap was nonpositive for {metadata}.";
+            return false;
+        }
+
+        retryRecommended = false;
         failure = string.Empty;
-        return spendCap > 0;
+        return true;
     }
 
     private bool TryValidateWorkflowInventoryCapacity(
@@ -2465,6 +2537,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             _placementPreparation = PlacementPreparationState.Idle;
             _lastFailure = "First-leg selection changed repeatedly during refresh; preparation cancelled.";
+            if (_fullWorkflowAuthorized)
+            {
+                StopFullWorkflowLocal(_lastFailure);
+                RecordContinuousAuthorizationRevoked(_lastFailure);
+            }
             return;
         }
 
@@ -2523,7 +2600,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     {
                         _placementPreparation = PlacementPreparationState.Idle;
                         _placementToken = null;
-                        ScheduleActiveWorkflowRetry();
+                        if (!TryRecoverTransientWorkflowPreparation(workflowFailure))
+                            throw new InvalidOperationException(workflowFailure);
                         return;
                     }
                     if (workflowRefresh != WorkflowRefreshResult.Refreshed)
@@ -2580,10 +2658,17 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_placementLegRefresh.State is AutomatedProbeState.Cancelled or AutomatedProbeState.Failed &&
             _placementPreparation == PlacementPreparationState.RefreshingFirstLeg)
         {
+            var reason = _placementLegRefresh.Failure;
+            var retryRecommended = _placementLegRefresh.FreshProbeRetryRecommended;
             _placementPreparation = PlacementPreparationState.Idle;
             _placementToken = null;
-            _lastFailure = _placementLegRefresh.Failure;
             _placementLegRefresh.AcknowledgeCompletion();
+            if (retryRecommended && TryRecoverTransientWorkflowPreparation(reason))
+            {
+                return;
+            }
+
+            _lastFailure = reason;
             if (_fullWorkflowAuthorized)
             {
                 _fullWorkflowAuthorized = false;
@@ -2644,14 +2729,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 _placementPreparation = PlacementPreparationState.Idle;
                 _placementToken = null;
-                var retryRestoration = _singleLegStaging.FreshProbeRetryRecommended &&
-                    _trackedOrderState?.IsUnresolved != true &&
-                    _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
-                    ready.Legs[ready.CurrentLegIndex].Role is WorkflowLegRole.PrincipalRestoration or
-                        WorkflowLegRole.CycleClosure;
-                if (retryRestoration)
+                if (_singleLegStaging.FreshProbeRetryRecommended &&
+                    TryRecoverTransientWorkflowPreparation(_singleLegStaging.Failure))
                 {
-                    ScheduleActiveWorkflowRetry();
                 }
                 else if (_fullWorkflowAuthorized)
                 {
@@ -2781,6 +2861,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _fullWorkflowAuthorized = true;
         _workflowAuthorization = permissions;
         _workflowPreparedLeg = null;
+        _workflowPreparationRetryCount = 0;
         _lastFailure = "None";
         _lastLoggedFailure = null;
         AppendRuntimeDiagnostic("WorkflowAuthorizationStarted", "Full-workflow hotkey authorization accepted.");
@@ -2872,7 +2953,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _placementPreparation = PlacementPreparationState.Idle;
             _restorationProbeActive = false;
             _lastFailure = failure;
-            ScheduleActiveWorkflowRetry();
+            StopFullWorkflowLocal(failure);
             return;
         }
 
@@ -3126,6 +3207,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 Detail = detail,
                 OperationStatus = _operationStatus,
                 FullWorkflowAuthorized = _fullWorkflowAuthorized,
+                WorkflowPreparationRetryCount = _workflowPreparationRetryCount,
                 PlacementPreparation = _placementPreparation.ToString(),
                 AutomatedProbe = _automatedProbe.State.ToString(),
                 LegRefresh = _placementLegRefresh.State.ToString(),
@@ -3410,6 +3492,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     : _singleLegPlacement.Failure;
                 if (_singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
                     _singleLegPlacement.FreshProbeRetryRecommended &&
+                    (!_singleLegPlacement.FreshProbeRetryFromLiveQuoteRejection ||
+                        sweep.ExecutionMode == SellSweepExecutionMode.FastestFillMarketRate) &&
                     sweep.Phase == SellSweepPhase.ReadyForCandidate &&
                     _trackedOrderState?.IsUnresolved != true)
                 {
@@ -3440,6 +3524,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _operationStatus = _singleLegPlacement.Status;
         if (_singleLegPlacement.State == SingleLegPlacementState.Completed)
         {
+            _workflowPreparationRetryCount = 0;
             _lastFailure = "None";
         }
         else if (_singleLegPlacement.State is SingleLegPlacementState.Ambiguous or SingleLegPlacementState.Cancelled)
@@ -3449,14 +3534,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _lastFailure = string.IsNullOrWhiteSpace(_singleLegPlacement.Failure)
                 ? $"Placement ended {_singleLegPlacement.State} without reporting a reason."
                 : _singleLegPlacement.Failure;
-            var retryRestoration = _singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
-                _singleLegPlacement.FreshProbeRetryRecommended && _trackedOrderState?.IsUnresolved != true &&
-                _bankroll.Workflow is { Phase: WorkflowExecutionPhase.ReadyForLeg } ready &&
-                ready.Legs[ready.CurrentLegIndex].Role is WorkflowLegRole.PrincipalRestoration or
-                    WorkflowLegRole.CycleClosure;
-            if (retryRestoration)
+            if (_singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
+                _singleLegPlacement.FreshProbeRetryRecommended &&
+                TryRecoverTransientWorkflowPreparation(_lastFailure))
             {
-                ScheduleActiveWorkflowRetry();
             }
             else if (_fullWorkflowAuthorized)
             {
@@ -5869,6 +5950,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _workflowPreparedLeg = null;
         _startingNewWorkflow = false;
         _nextWorkflowScanAtUtc = null;
+        _workflowPreparationRetryCount = 0;
         _placementPreparation = PlacementPreparationState.Idle;
         _placementToken = null;
         _sweepAuthorized = false;
