@@ -58,6 +58,9 @@ public sealed class FaustusControllerLiteSettings : ISettings
     public RangeNode<int> MaximumDirectDivinePrincipal { get; set; } = new(1_000, 1, 1_000);
 
     [Category("Strategy")]
+    public ToggleNode EnableCompetingPriceImprovement { get; set; } = new(false);
+
+    [Category("Strategy")]
     public RangeNode<int> ContinuousWorkflowRetrySeconds { get; set; } = new(10, 2, 90);
 
     /// <summary>

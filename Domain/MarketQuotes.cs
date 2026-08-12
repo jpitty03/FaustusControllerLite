@@ -11,6 +11,14 @@ public enum QuoteBookSource
     Synthetic,
     WantedItemStock,
     OfferedItemStock,
+
+    /// <summary>
+    /// A competing rate the planner invented one minimum unit better than the live competing head.
+    /// It is deliberately distinct from <see cref="Synthetic"/>, which is only the neutral default
+    /// for an edge that never came from a captured book, so a leg carrying this value always means
+    /// "improved" and never merely "unattributed".
+    /// </summary>
+    ImprovedCompeting,
 }
 
 public sealed record QuoteLevel

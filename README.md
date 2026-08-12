@@ -43,6 +43,7 @@ normal affinity tab is not yet supported.
 | `CompetingOrderWaitMinutes` | 1-3600 | Production time before a pending order becomes `TimedOut`; wizard step 5 overrides this with five seconds. |
 | `EnableDirectDivineCycles` | on/off | Opts into two-competing-leg Divine-to-target-to-Divine cycles. |
 | `MaximumDirectDivinePrincipal` | 1-1000 | Maximum Divine that one direct cycle may lock. |
+| `EnableCompetingPriceImprovement` | on/off | Prices arbitrage competing legs one minimum unit ahead of the competing head. |
 | `MinimumSaleChaos` | 1-5000 | Minimum estimated Chaos value for a sell-sweep holding. |
 | `ContinuousWorkflowRetrySeconds` | 2-90 | Base delay before a no-route scan or bounded transient pre-click reprobe. |
 | `MaximumQuoteAgeSeconds` | 1-3600 | Maximum accepted market and ownership age. |
@@ -221,6 +222,30 @@ an unrelated route.
 Use a suitably long `CompetingOrderWaitMinutes` for low-volume currencies and ensure enough exchange
 gold is available. Disable direct mode to restore normal three-market Chaos-cycle probing and
 competing-leg-first ranking.
+
+## Competing Price Improvement
+
+Enable `EnableCompetingPriceImprovement` to place each arbitrage competing order one minimum unit
+better than the current competing head, so it fills from the front of the queue instead of the back.
+The checkbox is off by default and applies to every arbitrage competing leg, in both normal
+closed-cycle routes and direct Divine cycles. The sell sweep is excluded and always uses its own
+quoted rates.
+
+The improvement is the smallest one that exists: for a leg quoted as `I` offered for `O` wanted, the
+planner tries offering `I + 1` for the same `O` and wanting `O - 1` for the same `I`, then keeps
+whichever of the two sacrifices less. The chosen price must still stay strictly short of the
+immediate price, and the improved route must still clear `MinimumProfitChaos`.
+
+Any leg that cannot be improved safely keeps its original quoted rate. The planner evaluates the
+improved and original variants of a route side by side and rejects the ones that would cross the
+spread or lose money, so turning the feature on can never make a route worse than it would have been
+with the checkbox off. When more than one variant survives, the one with the most improved legs is
+ranked first, and the candidate status line reports `improved N/M competing legs`.
+
+Improved legs hold a rate that no live book row carries, so staging and placement validate them by
+bracket instead of by exact rate match: the rate must remain strictly better than the live competing
+head and strictly short of the live immediate price. If either bound closes, the market moved and the
+plugin re-probes rather than placing. Reprobing an already-improved leg does not improve it again.
 
 ## Stop and Resume
 

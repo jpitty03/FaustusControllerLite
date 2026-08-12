@@ -632,6 +632,13 @@ public sealed class SingleLegPlacementController
             return false;
         }
 
+        if (SingleLegStagingController.IsImprovedCompetingLeg(leg) &&
+            !SingleLegStagingController.TryValidateImprovedCompetingBounds(
+                leg, MarketCaptureNormalizer.CreateEdges(capture), out failure))
+        {
+            return false;
+        }
+
         failure = string.Empty;
         return true;
     }

@@ -19,6 +19,7 @@ public enum RouteRejectionReason
     UnderLiquid,
     ArithmeticOverflow,
     ProfitBelowMinimum,
+    NoPriceImprovement,
 }
 
 public sealed record CurrencyBankroll(long LedgerAmount, long LiveAmount)
@@ -53,7 +54,8 @@ public sealed record RoutePlannerRequest(
     int MaximumCompetingEdges = 2,
     bool EnableDirectDivineCycles = false,
     long MaximumDirectDivinePrincipal = 1_000,
-    bool PrioritizeValuedProfit = false);
+    bool PrioritizeValuedProfit = false,
+    bool EnableCompetingPriceImprovement = false);
 
 public enum RouteCycleKind
 {
@@ -89,7 +91,8 @@ public sealed record RouteCandidate(
     long ProfitAmount = 0,
     long ValuedProfitChaos = 0,
     long PlannedSettlementAmount = 0,
-    DirectedExchangeEdge? ProfitValuationEdge = null)
+    DirectedExchangeEdge? ProfitValuationEdge = null,
+    int ImprovedCompetingLegCount = 0)
 {
     public string Signature => string.Join(">", Path.Select(currency => currency.Metadata));
 
@@ -142,13 +145,17 @@ public static class FaustusRoutePlanner
         var accepted = evaluations
             .Where(evaluation => evaluation.Candidate is not null)
             .Select(evaluation => evaluation.Candidate!);
+        // A constant key when improvement is off leaves the established order untouched; when it is
+        // on, more improved legs win outright because queue position is the point of the feature.
+        var ranked = accepted.OrderByDescending(candidate =>
+            request.EnableCompetingPriceImprovement ? candidate.ImprovedCompetingLegCount : 0);
         var candidates = request.PrioritizeValuedProfit
-            ? accepted.OrderByDescending(candidate => candidate.ValuedProfitChaos)
+            ? ranked.ThenByDescending(candidate => candidate.ValuedProfitChaos)
                 .ThenBy(candidate => candidate.CompetingEdgeCount)
                 .ThenBy(candidate => candidate.Signature, StringComparer.Ordinal)
                 .ThenBy(candidate => candidate.ExecutionSignature, StringComparer.Ordinal)
                 .ToArray()
-            : accepted.OrderBy(candidate => candidate.CompetingEdgeCount)
+            : ranked.ThenBy(candidate => candidate.CompetingEdgeCount)
                 .ThenByDescending(candidate => candidate.ProfitChaos)
                 .ThenByDescending(candidate => candidate.RealizedChaos)
                 .ThenBy(candidate => candidate.Signature, StringComparer.Ordinal)
@@ -157,6 +164,93 @@ public static class FaustusRoutePlanner
 
         return new RoutePlannerResult(candidates, evaluations);
     }
+
+    /// <summary>
+    /// Builds the minimum one-unit price improvement for a single competing leg. The order either
+    /// offers one more input unit for the same output or wants one less output unit for the same
+    /// input; both strictly lower the rate, and a lower rate is what places the order ahead of the
+    /// competing head instead of behind it. Whichever candidate keeps the higher rate is chosen,
+    /// because that sacrifices the least. The improvement is refused unless the improved rate stays
+    /// strictly above the immediate rate for the same direction: at or below it the order would
+    /// cross the spread and merely take liquidity the immediate edge already quoted.
+    /// </summary>
+    public static bool TryImproveCompetingLeg(
+        DirectedExchangeEdge competing,
+        DirectedExchangeEdge? immediate,
+        long inputAvailable,
+        long inputSpent,
+        long output,
+        out DirectedExchangeEdge? improved,
+        out long improvedInputSpent,
+        out long improvedOutput)
+    {
+        ArgumentNullException.ThrowIfNull(competing);
+        improved = null;
+        improvedInputSpent = 0;
+        improvedOutput = 0;
+        if (competing.ExecutionIntent != QuoteExecutionIntent.Competing ||
+            inputSpent <= 0 || output <= 0 || inputAvailable < inputSpent || inputSpent == long.MaxValue)
+        {
+            return false;
+        }
+
+        if (immediate is null || immediate.ExecutionIntent != QuoteExecutionIntent.Immediate ||
+            !immediate.From.Equals(competing.From) || !immediate.To.Equals(competing.To))
+        {
+            return false;
+        }
+
+        if (immediate.Rate >= new Rational(output, inputSpent))
+        {
+            return false;
+        }
+
+        var candidates = new List<(long InputSpent, long Output)>(2);
+        if (inputSpent < inputAvailable)
+        {
+            candidates.Add((inputSpent + 1, output));
+        }
+
+        if (output > 1)
+        {
+            candidates.Add((inputSpent, output - 1));
+        }
+
+        var bestRate = default(Rational);
+        foreach (var candidate in candidates)
+        {
+            var rate = new Rational(candidate.Output, candidate.InputSpent);
+            if (rate <= immediate.Rate || improved is not null && rate <= bestRate)
+            {
+                continue;
+            }
+
+            bestRate = rate;
+            improvedInputSpent = candidate.InputSpent;
+            improvedOutput = candidate.Output;
+            improved = competing with
+            {
+                Rate = rate,
+                CompetingQueueAhead = 0,
+                SourceBook = QuoteBookSource.ImprovedCompeting,
+            };
+        }
+
+        return improved is not null;
+    }
+
+    /// <summary>
+    /// The freshest valid immediate quote for the competing leg's own direction, highest rate first
+    /// so the improvement is bounded by the strictest reading of the spread available.
+    /// </summary>
+    private static DirectedExchangeEdge? SelectImmediate(
+        RoutePlannerRequest request,
+        IReadOnlyDictionary<(CurrencyIdentity From, CurrencyIdentity To), IReadOnlyList<DirectedExchangeEdge>> edges,
+        DirectedExchangeEdge competing) =>
+        edges.TryGetValue((competing.From, competing.To), out var choices)
+            ? choices.FirstOrDefault(edge => edge.ExecutionIntent == QuoteExecutionIntent.Immediate &&
+                ValidateEdge(request, edge) == RouteRejectionReason.None)
+            : null;
 
     private static IEnumerable<RouteEvaluation> EvaluateDirectDivineCycleVariants(
         RoutePlannerRequest request,
@@ -179,9 +273,15 @@ public static class FaustusRoutePlanner
         if (valuation is null)
             return [Reject(path, RouteRejectionReason.MissingDivineBenchmark, "Direct Divine profit valuation must be fresh, matching, and Immediate.")];
 
-        return openingChoices.SelectMany(
-            opening => closingChoices,
-            (opening, closing) => EvaluateDirectDivineCycle(request, path, opening, closing, valuation)).ToArray();
+        (bool Opening, bool Closing)[] improvements = request.EnableCompetingPriceImprovement
+            ? [(false, false), (true, false), (false, true), (true, true)]
+            : [(false, false)];
+        return (from opening in openingChoices
+                from closing in closingChoices
+                from improvement in improvements
+                select EvaluateDirectDivineCycle(
+                    request, path, opening, closing, valuation, edges,
+                    improvement.Opening, improvement.Closing)).ToArray();
     }
 
     private static RouteEvaluation EvaluateDirectDivineCycle(
@@ -189,7 +289,10 @@ public static class FaustusRoutePlanner
         CurrencyIdentity[] path,
         DirectedExchangeEdge opening,
         DirectedExchangeEdge closing,
-        DirectedExchangeEdge valuation)
+        DirectedExchangeEdge valuation,
+        IReadOnlyDictionary<(CurrencyIdentity From, CurrencyIdentity To), IReadOnlyList<DirectedExchangeEdge>> edges,
+        bool improveOpening,
+        bool improveClosing)
     {
         foreach (var edge in new[] { opening, closing, valuation })
         {
@@ -207,11 +310,53 @@ public static class FaustusRoutePlanner
             var buy = opening.Rate.ConvertWholeLots(available, opening.InputLimit);
             if (buy.InputSpent <= 0 || buy.Output <= 0)
                 return Reject(path, RouteRejectionReason.Underfunded, "Divine principal cannot form one direct-cycle opening lot.");
-            var sell = closing.Rate.ConvertWholeLots(buy.Output, closing.InputLimit);
-            if (sell.InputSpent <= 0 || sell.Output <= buy.InputSpent)
-                return Reject(path, RouteRejectionReason.ProfitBelowMinimum, "Direct Divine cycle does not return more Divine than it spends.");
+            var openingEdge = opening;
+            var openingInput = buy.InputSpent;
+            var openingOutput = buy.Output;
+            var openingRemainder = buy.InputRemainder;
+            if (improveOpening)
+            {
+                if (!TryImproveCompetingLeg(
+                        opening, SelectImmediate(request, edges, opening), available, openingInput, openingOutput,
+                        out var improvedOpening, out var improvedInput, out var improvedOutput))
+                {
+                    return Reject(path, RouteRejectionReason.NoPriceImprovement,
+                        "No safe one-unit improvement for the direct-cycle opening leg.");
+                }
 
-            var profitDivine = checked(sell.Output - buy.InputSpent);
+                openingEdge = improvedOpening!;
+                openingInput = improvedInput;
+                openingOutput = improvedOutput;
+                openingRemainder = checked(available - improvedInput);
+            }
+
+            var sell = closing.Rate.ConvertWholeLots(openingOutput, closing.InputLimit);
+            if (sell.InputSpent <= 0 || sell.Output <= openingInput)
+                return Reject(path, RouteRejectionReason.ProfitBelowMinimum, "Direct Divine cycle does not return more Divine than it spends.");
+            var closingEdge = closing;
+            var closingInput = sell.InputSpent;
+            var closingOutput = sell.Output;
+            var closingRemainder = sell.InputRemainder;
+            if (improveClosing)
+            {
+                if (!TryImproveCompetingLeg(
+                        closing, SelectImmediate(request, edges, closing), openingOutput, closingInput, closingOutput,
+                        out var improvedClosing, out var improvedInput, out var improvedOutput))
+                {
+                    return Reject(path, RouteRejectionReason.NoPriceImprovement,
+                        "No safe one-unit improvement for the direct-cycle closing leg.");
+                }
+
+                closingEdge = improvedClosing!;
+                closingInput = improvedInput;
+                closingOutput = improvedOutput;
+                closingRemainder = checked(openingOutput - improvedInput);
+                if (closingOutput <= openingInput)
+                    return Reject(path, RouteRejectionReason.ProfitBelowMinimum,
+                        "The improved direct Divine cycle does not return more Divine than it spends.");
+            }
+
+            var profitDivine = checked(closingOutput - openingInput);
             var valued = valuation.Rate.ConvertWholeLots(profitDivine, valuation.InputLimit);
             if (valued.InputSpent != profitDivine || valued.Output <= 0)
                 return Reject(path, RouteRejectionReason.UnderLiquid, "Immediate Divine/Chaos depth cannot value the full direct-cycle profit.");
@@ -220,21 +365,22 @@ public static class FaustusRoutePlanner
                     $"Direct-cycle profit {profitDivine} Divine is valued at {valued.Output} Chaos, below {request.MinimumProfitChaos}.");
 
             var remainders = new Dictionary<CurrencyIdentity, long>();
-            if (buy.InputRemainder > 0) AddRemainder(remainders, request.Divine, buy.InputRemainder);
-            if (sell.InputRemainder > 0) AddRemainder(remainders, request.Target, sell.InputRemainder);
+            if (openingRemainder > 0) AddRemainder(remainders, request.Divine, openingRemainder);
+            if (closingRemainder > 0) AddRemainder(remainders, request.Target, closingRemainder);
             var legs = new[]
             {
-                new RouteLegResult(opening, available, buy.InputSpent, buy.Output, buy.InputRemainder, request.ExpectedGoldPerLeg),
-                new RouteLegResult(closing, buy.Output, sell.InputSpent, sell.Output, sell.InputRemainder, request.ExpectedGoldPerLeg),
+                new RouteLegResult(openingEdge, available, openingInput, openingOutput, openingRemainder, request.ExpectedGoldPerLeg),
+                new RouteLegResult(closingEdge, openingOutput, closingInput, closingOutput, closingRemainder, request.ExpectedGoldPerLeg),
             };
             var expectedGold = request.ExpectedGoldPerLeg is null
                 ? (long?)null
                 : checked(request.ExpectedGoldPerLeg.Value * 2);
-            var queue = checked(opening.CompetingQueueAhead + closing.CompetingQueueAhead);
+            var queue = checked(openingEdge.CompetingQueueAhead + closingEdge.CompetingQueueAhead);
             var candidate = new RouteCandidate(
-                path, legs, buy.InputSpent, 0, 0, valued.Output, remainders, 2, queue, expectedGold,
+                path, legs, openingInput, 0, 0, valued.Output, remainders, 2, queue, expectedGold,
                 -1, 0, 0, RouteCycleKind.SameAssetDivineCycle, request.Divine.Metadata,
-                profitDivine, valued.Output, sell.Output, valuation);
+                profitDivine, valued.Output, closingOutput, valuation,
+                (improveOpening ? 1 : 0) + (improveClosing ? 1 : 0));
             return new RouteEvaluation(path, candidate, RouteRejectionReason.None, string.Empty);
         }
         catch (OverflowException exception)
@@ -285,14 +431,66 @@ public static class FaustusRoutePlanner
                 (selected, choice) => (IReadOnlyList<DirectedExchangeEdge>)selected.Append(choice).ToArray());
         }
 
-        return combinations.Select(pathEdges => EvaluatePath(request, path, pathEdges, edges)).ToArray();
+        return combinations
+            .SelectMany(pathEdges => EvaluateImprovementVariants(request, path, pathEdges, edges))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// One evaluation per independent choice of which competing legs are improved. The all-original
+    /// variant is always produced, so a variant whose improvement is unsafe or unprofitable is only
+    /// outranked by that fallback rather than costing the route entirely.
+    /// </summary>
+    private static IEnumerable<RouteEvaluation> EvaluateImprovementVariants(
+        RoutePlannerRequest request,
+        CurrencyIdentity[] path,
+        IReadOnlyList<DirectedExchangeEdge> pathEdges,
+        IReadOnlyDictionary<(CurrencyIdentity From, CurrencyIdentity To), IReadOnlyList<DirectedExchangeEdge>> edges)
+    {
+        var original = EvaluatePath(request, path, pathEdges, edges, improvementMask: 0);
+        if (!request.EnableCompetingPriceImprovement)
+        {
+            return [original];
+        }
+
+        var competingIndices = new List<int>(pathEdges.Count);
+        for (var index = 0; index < pathEdges.Count; index++)
+        {
+            if (pathEdges[index].ExecutionIntent == QuoteExecutionIntent.Competing)
+            {
+                competingIndices.Add(index);
+            }
+        }
+
+        if (competingIndices.Count == 0)
+        {
+            return [original];
+        }
+
+        var variants = new List<RouteEvaluation>(1 << competingIndices.Count) { original };
+        for (var subset = 1; subset < 1 << competingIndices.Count; subset++)
+        {
+            var improvementMask = 0;
+            for (var bit = 0; bit < competingIndices.Count; bit++)
+            {
+                if ((subset & 1 << bit) != 0)
+                {
+                    improvementMask |= 1 << competingIndices[bit];
+                }
+            }
+
+            variants.Add(EvaluatePath(request, path, pathEdges, edges, improvementMask));
+        }
+
+        return variants;
     }
 
     private static RouteEvaluation EvaluatePath(
         RoutePlannerRequest request,
         CurrencyIdentity[] path,
         IReadOnlyList<DirectedExchangeEdge> pathEdges,
-        IReadOnlyDictionary<(CurrencyIdentity From, CurrencyIdentity To), IReadOnlyList<DirectedExchangeEdge>> edges)
+        IReadOnlyDictionary<(CurrencyIdentity From, CurrencyIdentity To), IReadOnlyList<DirectedExchangeEdge>> edges,
+        int improvementMask)
     {
         foreach (var edge in pathEdges)
         {
@@ -386,19 +584,39 @@ public static class FaustusRoutePlanner
                     return Reject(path, RouteRejectionReason.NoWholeLot, $"No whole lot for {edge.From.Metadata}->{edge.To.Metadata}.");
                 }
 
-                if (conversion.InputRemainder > 0)
+                var legEdge = edge;
+                var legInput = conversion.InputSpent;
+                var legOutput = conversion.Output;
+                var legRemainder = conversion.InputRemainder;
+                if ((improvementMask & 1 << edgeIndex) != 0)
                 {
-                    AddRemainder(remainders, edge.From, conversion.InputRemainder);
+                    if (!TryImproveCompetingLeg(
+                            edge, SelectImmediate(request, edges, edge), amount, legInput, legOutput,
+                            out var improvedEdge, out var improvedInput, out var improvedOutput))
+                    {
+                        return Reject(path, RouteRejectionReason.NoPriceImprovement,
+                            $"No safe one-unit improvement for {edge.From.Metadata}->{edge.To.Metadata}.");
+                    }
+
+                    legEdge = improvedEdge!;
+                    legInput = improvedInput;
+                    legOutput = improvedOutput;
+                    legRemainder = checked(amount - improvedInput);
+                }
+
+                if (legRemainder > 0)
+                {
+                    AddRemainder(remainders, edge.From, legRemainder);
                 }
 
                 legs.Add(new RouteLegResult(
-                    edge,
+                    legEdge,
                     amount,
-                    conversion.InputSpent,
-                    conversion.Output,
-                    conversion.InputRemainder,
+                    legInput,
+                    legOutput,
+                    legRemainder,
                     request.ExpectedGoldPerLeg));
-                amount = conversion.Output;
+                amount = legOutput;
             }
 
             var principal = legs[0].InputSpent;
@@ -451,9 +669,11 @@ public static class FaustusRoutePlanner
                     $"Realized profit {profit} is below {request.MinimumProfitChaos} Chaos.");
             }
 
-            var queue = pathEdges
-                .Where(edge => edge.ExecutionIntent == QuoteExecutionIntent.Competing)
-                .Aggregate(0L, (total, edge) => checked(total + edge.CompetingQueueAhead));
+            // Improved legs rest ahead of the whole queue, so the aggregate reads the legs that were
+            // actually planned rather than the quoted heads they were derived from.
+            var queue = legs
+                .Where(leg => leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing)
+                .Aggregate(0L, (total, leg) => checked(total + leg.Edge.CompetingQueueAhead));
             var expectedGold = request.ExpectedGoldPerLeg is null
                 ? (long?)null
                 : checked(request.ExpectedGoldPerLeg.Value * pathEdges.Count);
@@ -462,7 +682,8 @@ public static class FaustusRoutePlanner
                 : RouteCycleKind.ChaosCycle;
             var candidate = new RouteCandidate(path, legs, principal, benchmark, realizedChaos, profit, remainders,
                 competingCount, queue, expectedGold, chaosRealizationLegIndex, restorationPrincipal, restorationSpend,
-                cycleKind, request.Chaos.Metadata, profit, profit, realizedChaos, null);
+                cycleKind, request.Chaos.Metadata, profit, profit, realizedChaos, null,
+                BitOperations.PopCount((uint)improvementMask));
             return new RouteEvaluation(path, candidate, RouteRejectionReason.None, string.Empty);
         }
         catch (OverflowException exception)

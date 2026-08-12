@@ -485,8 +485,23 @@ public static class WorkflowCoordinator
         DateTimeOffset now,
         out WorkflowExecutionState next,
         out RouteLegResult? currentLeg,
-        out string failure)
+        out string failure,
+        bool enableCompetingPriceImprovement = false)
     {
+        // Improvement is attempted as a whole alternative plan. If any part of it fails - spread,
+        // depth, lot alignment, or profit - the original-rate refresh runs instead, so enabling the
+        // feature can never cost a workflow a leg it would otherwise have been able to place.
+        if (enableCompetingPriceImprovement &&
+            workflow.ClosureMode is WorkflowClosureMode.SameAssetCycle or WorkflowClosureMode.ClosedCycle &&
+            TryRefreshImprovedPlan(workflow, edges, probeSessionId, spendCap, minimumProfitChaos, now,
+                out var improvedNext, out var improvedLeg))
+        {
+            next = improvedNext;
+            currentLeg = improvedLeg;
+            failure = string.Empty;
+            return WorkflowRefreshResult.Refreshed;
+        }
+
         return workflow.ClosureMode switch
         {
             WorkflowClosureMode.LegacyTerminalChaos => TryRefreshLegacyRemainingPlan(
@@ -494,11 +509,75 @@ public static class WorkflowCoordinator
                 now, out next, out currentLeg, out failure),
             WorkflowClosureMode.SameAssetCycle => TryRefreshSameAssetCycle(
                 workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
-                now, out next, out currentLeg, out failure),
+                now, out next, out currentLeg, out failure, improve: false),
             _ => TryRefreshClosedRemainingPlan(
                 workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
-                now, out next, out currentLeg, out failure),
+                now, out next, out currentLeg, out failure, improve: false),
         };
+    }
+
+    private static bool TryRefreshImprovedPlan(
+        WorkflowExecutionState workflow,
+        IReadOnlyCollection<DirectedExchangeEdge> edges,
+        Guid probeSessionId,
+        long spendCap,
+        long minimumProfitChaos,
+        DateTimeOffset now,
+        out WorkflowExecutionState next,
+        out RouteLegResult? currentLeg)
+    {
+        var result = workflow.ClosureMode == WorkflowClosureMode.SameAssetCycle
+            ? TryRefreshSameAssetCycle(workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
+                now, out next, out currentLeg, out _, improve: true)
+            : TryRefreshClosedRemainingPlan(workflow, edges, probeSessionId, spendCap, minimumProfitChaos,
+                now, out next, out currentLeg, out _, improve: true);
+        return result == WorkflowRefreshResult.Refreshed && currentLeg is not null;
+    }
+
+    /// <summary>
+    /// Replaces one competing leg with its minimum one-unit improvement when the fresh book still
+    /// leaves room for it, falling back to the caller's amounts otherwise. A leg that is already
+    /// marked improved is left exactly as planned: re-improving it on every reprobe would walk the
+    /// resting price away from the quote one unit at a time.
+    /// </summary>
+    private static bool TryImproveRefreshedLeg(
+        bool improve,
+        DirectedExchangeEdge competing,
+        IEnumerable<DirectedExchangeEdge> edges,
+        long inputAvailable,
+        long inputSpent,
+        long output,
+        out DirectedExchangeEdge legEdge,
+        out long legInputSpent,
+        out long legOutput)
+    {
+        legEdge = competing;
+        legInputSpent = inputSpent;
+        legOutput = output;
+        if (!improve || competing.ExecutionIntent != QuoteExecutionIntent.Competing ||
+            competing.SourceBook == QuoteBookSource.ImprovedCompeting)
+        {
+            return false;
+        }
+
+        var immediate = edges
+            .Where(candidate => candidate.From.Metadata == competing.From.Metadata &&
+                candidate.To.Metadata == competing.To.Metadata &&
+                candidate.From.Hash == competing.From.Hash && candidate.To.Hash == competing.To.Hash &&
+                candidate.ExecutionIntent == QuoteExecutionIntent.Immediate)
+            .OrderByDescending(candidate => candidate.Rate)
+            .ThenByDescending(candidate => candidate.CapturedAt)
+            .FirstOrDefault();
+        if (!FaustusRoutePlanner.TryImproveCompetingLeg(competing, immediate, inputAvailable, inputSpent, output,
+                out var improvedEdge, out var improvedInputSpent, out var improvedOutput))
+        {
+            return false;
+        }
+
+        legEdge = improvedEdge!;
+        legInputSpent = improvedInputSpent;
+        legOutput = improvedOutput;
+        return true;
     }
 
     private static WorkflowRefreshResult TryRefreshSameAssetCycle(
@@ -510,7 +589,8 @@ public static class WorkflowCoordinator
         DateTimeOffset now,
         out WorkflowExecutionState next,
         out RouteLegResult? currentLeg,
-        out string failure)
+        out string failure,
+        bool improve)
     {
         next = Clone(workflow);
         currentLeg = null;
@@ -559,10 +639,13 @@ public static class WorkflowCoordinator
                         Rate = new Rational(planned.RateNumerator, planned.RateDenominator),
                         SourceBook = planned.SourceBook,
                     };
-                    var plan = FromEdge(index, planned.Role, planned.ExpectedGold, preservedEdge,
-                        amount, planned.InputSpent, planned.Output, checked(amount - planned.InputSpent));
-                    refreshed.Add((plan, preservedEdge));
-                    amount = planned.Output;
+                    TryImproveRefreshedLeg(improve, preservedEdge, edges, amount,
+                        planned.InputSpent, planned.Output,
+                        out var currentEdge, out var currentInput, out var currentOutput);
+                    var plan = FromEdge(index, planned.Role, planned.ExpectedGold, currentEdge,
+                        amount, currentInput, currentOutput, checked(amount - currentInput));
+                    refreshed.Add((plan, currentEdge));
+                    amount = currentOutput;
                     continue;
                 }
 
@@ -574,10 +657,13 @@ public static class WorkflowCoordinator
                         ? WorkflowRefreshResult.RetryableUnavailable
                         : WorkflowRefreshResult.Failed;
                 }
-                var refreshedPlan = FromEdge(index, planned.Role, planned.ExpectedGold, edge,
-                    amount, conversion.InputSpent, conversion.Output, conversion.InputRemainder);
-                refreshed.Add((refreshedPlan, edge));
-                amount = conversion.Output;
+                TryImproveRefreshedLeg(improve, edge, edges, amount,
+                    conversion.InputSpent, conversion.Output,
+                    out var legEdge, out var legInput, out var legOutput);
+                var refreshedPlan = FromEdge(index, planned.Role, planned.ExpectedGold, legEdge,
+                    amount, legInput, legOutput, checked(amount - legInput));
+                refreshed.Add((refreshedPlan, legEdge));
+                amount = legOutput;
             }
 
             var startingPrincipal = workflow.CurrentLegIndex == 0
@@ -844,7 +930,8 @@ public static class WorkflowCoordinator
         DateTimeOffset now,
         out WorkflowExecutionState next,
         out RouteLegResult? currentLeg,
-        out string failure)
+        out string failure,
+        bool improve)
     {
         ArgumentNullException.ThrowIfNull(workflow);
         ArgumentNullException.ThrowIfNull(edges);
@@ -984,18 +1071,17 @@ public static class WorkflowCoordinator
                         failure = $"Preserved competing workflow leg {index + 1} exceeded current verified funds.";
                         return WorkflowRefreshResult.Failed;
                     }
-                    var preserved = FromEdge(index, planned.Role, planned.ExpectedGold,
-                        edge with
-                        {
-                            Rate = new Rational(planned.RateNumerator, planned.RateDenominator),
-                            SourceBook = planned.SourceBook,
-                        },
-                        amount, planned.InputSpent, planned.Output, checked(amount - planned.InputSpent));
-                    refreshed.Add((preserved, edge with
+                    var preservedEdge = edge with
                     {
                         Rate = new Rational(planned.RateNumerator, planned.RateDenominator),
                         SourceBook = planned.SourceBook,
-                    }));
+                    };
+                    TryImproveRefreshedLeg(improve, preservedEdge, edges, amount,
+                        planned.InputSpent, planned.Output,
+                        out var currentEdge, out var currentInput, out var currentOutput);
+                    var preserved = FromEdge(index, planned.Role, planned.ExpectedGold, currentEdge,
+                        amount, currentInput, currentOutput, checked(amount - currentInput));
+                    refreshed.Add((preserved, currentEdge));
                     amount = preserved.Output;
                 }
                 else
@@ -1006,10 +1092,13 @@ public static class WorkflowCoordinator
                         failure = $"Fresh workflow leg {index + 1} produced no executable whole lot.";
                         return WorkflowRefreshResult.Failed;
                     }
-                    var plan = FromEdge(index, planned.Role, planned.ExpectedGold, edge,
-                        amount, conversion.InputSpent, conversion.Output, conversion.InputRemainder);
-                    refreshed.Add((plan, edge));
-                    amount = conversion.Output;
+                    TryImproveRefreshedLeg(improve, edge, edges, amount,
+                        conversion.InputSpent, conversion.Output,
+                        out var legEdge, out var legInput, out var legOutput);
+                    var plan = FromEdge(index, planned.Role, planned.ExpectedGold, legEdge,
+                        amount, legInput, legOutput, checked(amount - legInput));
+                    refreshed.Add((plan, legEdge));
+                    amount = legOutput;
                 }
 
                 if (planned.Role == WorkflowLegRole.ChaosRealization)

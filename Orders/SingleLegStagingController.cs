@@ -772,6 +772,60 @@ public sealed class SingleLegStagingController
             leg, MarketCaptureNormalizer.CreateEdges(capture), out failure, _quoteValidationPolicy);
     }
 
+    /// <summary>
+    /// True when the planner deliberately priced this leg one minimum unit better than the quoted
+    /// competing head, which is the only case where the staged rate is expected to match no live row.
+    /// </summary>
+    public static bool IsImprovedCompetingLeg(RouteLegResult leg)
+    {
+        ArgumentNullException.ThrowIfNull(leg);
+        return leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing &&
+            leg.Edge.SourceBook == QuoteBookSource.ImprovedCompeting;
+    }
+
+    /// <summary>
+    /// Validates an improved leg against the live books by bracket rather than by exact rate: it must
+    /// still sit strictly better than the competing head it is jumping and strictly short of crossing
+    /// the immediate price. Either bound closing is a market move, so callers re-probe.
+    /// </summary>
+    public static bool TryValidateImprovedCompetingBounds(
+        RouteLegResult leg,
+        IEnumerable<DirectedExchangeEdge> liveEdges,
+        out string failure)
+    {
+        ArgumentNullException.ThrowIfNull(leg);
+        ArgumentNullException.ThrowIfNull(liveEdges);
+        var directed = liveEdges
+            .Where(edge => edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To))
+            .ToArray();
+        var immediate = directed
+            .Where(edge => edge.ExecutionIntent == QuoteExecutionIntent.Immediate)
+            .OrderByDescending(edge => edge.Rate)
+            .FirstOrDefault();
+        var competing = directed
+            .Where(edge => edge.ExecutionIntent == QuoteExecutionIntent.Competing)
+            .OrderBy(edge => edge.Rate)
+            .FirstOrDefault();
+        if (immediate is null || competing is null)
+        {
+            failure = "The live books no longer publish both sides needed to bracket the improved rate.";
+            return false;
+        }
+        if (leg.Edge.Rate <= immediate.Rate)
+        {
+            failure = "The improved competing rate would now meet or cross the live immediate price.";
+            return false;
+        }
+        if (leg.Edge.Rate >= competing.Rate)
+        {
+            failure = "The live competing head now matches or beats the improved rate.";
+            return false;
+        }
+
+        failure = string.Empty;
+        return true;
+    }
+
     public static bool TryValidateLiveEdge(
         RouteLegResult leg,
         IEnumerable<DirectedExchangeEdge> liveEdges,
@@ -783,6 +837,10 @@ public sealed class SingleLegStagingController
         if (!TryValidatePolicy(leg, policy, out failure))
         {
             return false;
+        }
+        if (IsImprovedCompetingLeg(leg))
+        {
+            return TryValidateImprovedCompetingBounds(leg, liveEdges, out failure);
         }
         var matching = liveEdges.FirstOrDefault(edge =>
             edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
@@ -833,7 +891,9 @@ public sealed class SingleLegStagingController
         }
         var edges = MarketCaptureNormalizer.CreateEdges(capture);
         DirectedExchangeEdge? matching;
-        if (policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit)
+        // An improved leg holds a rate no live row carries, so it samples the competing head it is
+        // jumping and is validated by the bracket check instead of by an exact rate match.
+        if (policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit || IsImprovedCompetingLeg(leg))
         {
             matching = edges.FirstOrDefault(edge =>
                 edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
@@ -842,6 +902,11 @@ public sealed class SingleLegStagingController
             {
                 sample = default;
                 failure = "The competing limit pair or readable book head disappeared during staging.";
+                return false;
+            }
+            if (IsImprovedCompetingLeg(leg) && !TryValidateImprovedCompetingBounds(leg, edges, out failure))
+            {
+                sample = default;
                 return false;
             }
         }
@@ -877,7 +942,7 @@ public sealed class SingleLegStagingController
         RouteLegResult leg,
         MarketCapture capture,
         SingleLegQuoteValidationPolicy policy) =>
-        policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit &&
+        (policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit || IsImprovedCompetingLeg(leg)) &&
         leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing &&
         capture.Pair.Equals(leg.Edge.Pair);
 

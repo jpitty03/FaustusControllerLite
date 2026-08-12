@@ -129,6 +129,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         long MinimumProfitChaos,
         bool DirectDivineCyclesEnabled,
         long MaximumDirectDivinePrincipal,
+        bool CompetingPriceImprovementEnabled,
         CurrencyIdentity From,
         CurrencyIdentity To,
         QuoteExecutionIntent ExecutionIntent,
@@ -2380,7 +2381,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             DateTimeOffset.UtcNow,
             out var refreshed,
             out var currentLeg,
-            out failure);
+            out failure,
+            enableCompetingPriceImprovement: Settings.EnableCompetingPriceImprovement.Value);
         if (refresh != WorkflowRefreshResult.Refreshed || currentLeg is null) return refresh;
         if (!TryValidateWorkflowInventoryCapacity(
                 refreshed.Legs.Skip(refreshed.CurrentLegIndex).Select(leg =>
@@ -2825,6 +2827,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     Settings.MinimumProfitChaos.Value,
                     Settings.EnableDirectDivineCycles.Value,
                     Settings.MaximumDirectDivinePrincipal.Value,
+                    Settings.EnableCompetingPriceImprovement.Value,
                     leg.Edge.From,
                     leg.Edge.To,
                     leg.Edge.ExecutionIntent,
@@ -3690,7 +3693,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             !string.Equals(token.TargetMetadata, Settings.TargetCurrencyMetadata, StringComparison.Ordinal) ||
             token.MinimumProfitChaos != Settings.MinimumProfitChaos.Value ||
             token.DirectDivineCyclesEnabled != Settings.EnableDirectDivineCycles.Value ||
-            token.MaximumDirectDivinePrincipal != Settings.MaximumDirectDivinePrincipal.Value)
+            token.MaximumDirectDivinePrincipal != Settings.MaximumDirectDivinePrincipal.Value ||
+            token.CompetingPriceImprovementEnabled != Settings.EnableCompetingPriceImprovement.Value)
         {
             failure = "Fresh placement preparation expired or its session/settings changed; begin again.";
             return false;
@@ -5921,7 +5925,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 Settings.MinimumProfitChaos.Value,
                 EnableDirectDivineCycles: Settings.EnableDirectDivineCycles.Value,
                 MaximumDirectDivinePrincipal: Settings.MaximumDirectDivinePrincipal.Value,
-                PrioritizeValuedProfit: Settings.EnableDirectDivineCycles.Value));
+                PrioritizeValuedProfit: Settings.EnableDirectDivineCycles.Value,
+                EnableCompetingPriceImprovement: Settings.EnableCompetingPriceImprovement.Value));
             var best = result.Best;
             _selectedCandidate = best;
             _lastCandidate = best is null
@@ -5942,6 +5947,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     string.Join(", ", best.Remainders.Select(item => $"{item.Value} {item.Key.Name}")) +
                     $"; competing legs {best.CompetingEdgeCount}; " +
                     $"expected gold {(best.ExpectedGold?.ToString() ?? "unknown")}";
+            if (best is { ImprovedCompetingLegCount: > 0 })
+            {
+                _lastCandidate +=
+                    $"; improved {best.ImprovedCompetingLegCount}/{best.CompetingEdgeCount} competing legs";
+            }
             return best is null ? CandidateOutcome.NoneAccepted : CandidateOutcome.Accepted;
         }
         catch (Exception exception)
