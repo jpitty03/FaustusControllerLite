@@ -169,10 +169,26 @@ public static class MarketSweepScore
     }
 
     /// <summary>
-    /// Longest currency name the board prints before truncating. The overlay font is proportional and the
-    /// columns are fixed pixel offsets, so a long name has to be cut or it runs into the next column.
+    /// Longest currency name <see cref="Abbreviate"/> emits. Sized for the overlay's single-line workflow
+    /// path, where four hops and their amounts share one row, so a name has to be cut to fit.
     /// </summary>
+    /// <remarks>
+    /// The sweep board deliberately does not use this. It gets a column of its own and prints names in full -
+    /// see <see cref="BoardPairLength"/>.
+    /// </remarks>
     public const int BoardNameLength = 14;
+
+    /// <summary>
+    /// Widest pair cell the board prints, in characters. The columns are fixed pixel offsets, so an
+    /// over-long cell overlaps the next column rather than wrapping.
+    /// </summary>
+    /// <remarks>
+    /// Sized so it never fires on real data: a sweep only ever captures hub-to-spoke, and the longest
+    /// tradable name (39) against the longer bankroll name (10) is exactly 50. It is a guard for pairs the
+    /// sweep does not produce - spoke to spoke - which degrade to a clipped cell instead of printing over
+    /// the margin column.
+    /// </remarks>
+    public const int BoardPairLength = 50;
 
     public static IReadOnlyList<string> ColumnHeadings { get; } =
         ["pair", "margin%", "imm", "queue", "tradable", "churn/min", "turn/min", "fills:no", "min", "score"];
@@ -231,7 +247,7 @@ public static class MarketSweepScore
         ArgumentNullException.ThrowIfNull(row);
         return
         [
-            $"{Abbreviate(row.From.Name)}>{Abbreviate(row.To.Name)}",
+            FormatPair(row.From, row.To),
             (row.MarginFraction * 100).ToString("0.0", CultureInfo.InvariantCulture),
             row.ImmediateInputDepth.ToString(CultureInfo.InvariantCulture),
             row.CompetingQueueAhead.ToString(CultureInfo.InvariantCulture),
@@ -242,6 +258,23 @@ public static class MarketSweepScore
             row.ExpectedMinutes.ToString("0.0", CultureInfo.InvariantCulture),
             row.Score.ToString("0.000", CultureInfo.InvariantCulture),
         ];
+    }
+
+    /// <summary>
+    /// The pair cell, both names in full.
+    /// </summary>
+    /// <remarks>
+    /// Names are not abbreviated here even though the column is fixed-width, because tradable names share
+    /// long prefixes: twenty essences begin "Deafening Essence of" and seven scarabs begin "Horned Scarab
+    /// of". A clip short enough to keep the column narrow collapses each of those families into one
+    /// indistinguishable string, which defeats the point of ranking them against each other.
+    /// </remarks>
+    public static string FormatPair(CurrencyIdentity from, CurrencyIdentity to)
+    {
+        ArgumentNullException.ThrowIfNull(from);
+        ArgumentNullException.ThrowIfNull(to);
+        var pair = $"{from.Name}>{to.Name}";
+        return pair.Length <= BoardPairLength ? pair : pair[..(BoardPairLength - 1)] + "~";
     }
 
     public static string Abbreviate(string name)

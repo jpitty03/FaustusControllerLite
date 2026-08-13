@@ -280,7 +280,7 @@ not resolve so the file can be corrected.
 
 | Column | Meaning |
 | --- | --- |
-| `pair` | Direction, `from>to`. Names longer than 14 characters are truncated with `~`. |
+| `pair` | Direction, `from>to`, with both names in full. Scarab and essence names share long prefixes - twenty essences begin `Deafening Essence of` - so an abbreviated cell would collapse a whole family into one indistinguishable string. |
 | `margin%` | `(competing head - immediate) / immediate`. The maker edge, computed exactly and converted to a percentage only for display. |
 | `imm` | Immediate input depth: how much is available to take right now. |
 | `queue` | How much is already queued ahead of the competing head. |

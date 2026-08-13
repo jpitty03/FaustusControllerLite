@@ -27,8 +27,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private readonly CanceledReturnCollectionController _canceledReturnCollection = new();
     private readonly AutomatedProbeController _collectionOwnershipSelector = new();
     private readonly Dictionary<string, OwnershipObservation> _liveOwnedByMetadata = new(StringComparer.Ordinal);
+    // The pair column carries two full names. The overlay font runs about 8.6px per character at this size
+    // (the nine numeric columns behind it are sized on the same ratio), and the widest cell the sweep can
+    // produce is 50 characters - the longest scarab name against "Divine Orb" - so 440px covers it with a
+    // little slack. Every later column shifted by the same amount; the headings ride the same offsets.
     private static readonly float[] BoardColumnOffsets =
-        [0f, 250f, 310f, 360f, 415f, 490f, 570f, 650f, 710f, 760f];
+        [0f, 440f, 500f, 550f, 605f, 680f, 760f, 840f, 900f, 950f];
 
     private readonly AutomatedProbeController _marketSweepProbe = new();
     private readonly MarketSweepQueue _marketSweepQueue = new();
