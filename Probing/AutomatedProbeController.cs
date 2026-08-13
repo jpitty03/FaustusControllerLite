@@ -1305,7 +1305,7 @@ public sealed class AutomatedProbeController
     private static bool ModifiersHeld() =>
         ExileInput.IsKeyDown(Keys.ControlKey) || ExileInput.IsKeyDown(Keys.ShiftKey) || ExileInput.IsKeyDown(Keys.Menu);
 
-    private static bool CanType(char character) =>
+    public static bool CanType(char character) =>
         character is >= 'a' and <= 'z' or >= '0' and <= '9' or ' ' or '\'' or '-' or '"';
 
     private static Keys KeyFor(char character) => character switch

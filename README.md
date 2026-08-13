@@ -47,6 +47,14 @@ normal affinity tab is not yet supported.
 | `MinimumSaleChaos` | 1-5000 | Minimum estimated Chaos value for a sell-sweep holding. |
 | `ContinuousWorkflowRetrySeconds` | 2-90 | Base delay before a no-route scan or bounded transient pre-click reprobe. |
 | `MaximumQuoteAgeSeconds` | 1-3600 | Maximum accepted market and ownership age. |
+| `EnableMarketSweepBoard` | on/off | Draws the advisory market sweep board and allows sweep captures. |
+| `SweepWhileIdle` | on/off | Lets the sweep probe one pair per idle window when nothing else is running. |
+| `IdleSweepIntervalSeconds` | 5-600 | Delay between idle sweep captures. One pair per window, never a burst. |
+| `SweepBoardRowCount` | 5-40 | Rows drawn on the board. |
+| `VelocityHistoryDays` | 1-30 | Observation retention. Older records are pruned on load. |
+| `ChurnIntervalCapMinutes` | 5-240 | Longest gap between two observations that still counts as a churn interval. Must stay **above** `SweepStalePairMinutes` or every idle-generated interval is discarded. |
+| `SweepStalePairMinutes` | 5-1440 | Age at which a pair becomes eligible for an idle re-sweep. Must stay **below** `ChurnIntervalCapMinutes`. |
+| `SweepDepthCap` | 1-100000 | Upper bound on tradable depth in the score, so one very deep book cannot dominate. |
 
 Changing `StartingChaos` or `StartingDivine` does not change the current bankroll. Apply a safe
 fresh-state reset to use the new values.
@@ -65,6 +73,8 @@ All hotkeys are unbound by default.
 | `CancelTimedOutOrderHotkey` | Cancels the exact tracked timed-out order. |
 | `FullWorkflowHotkey` | Starts, stops, or resumes arbitrage automation. |
 | `DumpSdkReadsHotkey` | Writes a diagnostic dump. |
+| `MarketSweepHotkey` | Starts or stops a full sweep of the enabled categories. |
+| `MarketSweepBoardSortHotkey` | Cycles the board sort column. |
 
 ## Seed a Test Bankroll
 
@@ -246,6 +256,117 @@ Improved legs hold a rate that no live book row carries, so staging and placemen
 bracket instead of by exact rate match: the rate must remain strictly better than the live competing
 head and strictly short of the live immediate price. If either bound closes, the market moved and the
 plugin re-probes rather than placing. Reprobing an already-improved leg does not improve it again.
+
+## Market Sweep Board
+
+The board is a survey, not an automation. It walks `tradables.json`, records what each book looked
+like at the time, and ranks the pairs so you can see which are both wide and moving. It never places
+an order, never writes `latest-rates.json`, and never feeds the route planner. You read the board and
+set `TargetCurrency` yourself.
+
+Enable `EnableMarketSweepBoard` to draw it. Press `MarketSweepHotkey` to sweep every enabled
+category, or enable `SweepWhileIdle` to have the plugin probe the single stalest pair whenever it is
+genuinely idle. The sweep always loses the exchange panel: it refuses to start while any workflow,
+sell sweep, placement or collection is active, and abandons a capture already in flight the moment
+one of them wants the panel.
+
+Categories map one to one onto the keys in `tradables.json`. `SweepCurrency` is on by default and the
+rest are off, because a full sweep of all 263 resolvable names is roughly 526 captures and 16-20
+minutes. Chaos Orb and Divine Orb are excluded as the bankroll currencies, and a handful of names in
+the file are not exchangeable at all; the board reports `resolved N/M` and lists whatever it could
+not resolve so the file can be corrected.
+
+### Columns
+
+| Column | Meaning |
+| --- | --- |
+| `pair` | Direction, `from>to`. Names longer than 14 characters are truncated with `~`. |
+| `margin%` | `(competing head - immediate) / immediate`. The maker edge, computed exactly and converted to a percentage only for display. |
+| `imm` | Immediate input depth: how much is available to take right now. |
+| `queue` | How much is already queued ahead of the competing head. |
+| `tradable` | `min(imm, queue)`. Depth on one side only is not tradable depth. |
+| `churn/min` | Head-rate moves per minute between consecutive observations. `-` means the pair has been observed once and has no measurable velocity. |
+| `turn/min` | Units of depth appearing or disappearing per minute, across both sides of the direction. The finer of the two velocity signals: a book can be traded steadily without its head price ever moving, and that reads as `0.00` churn but non-zero turnover. |
+| `fills:no` | Measured fills and no-fills for this pair from `execution-audit-<league>.jsonl`. `-` means never traded. |
+| `min` | Expected minutes to fill. The measured median wins where there is one; failing that, `queue / turn per minute` — how long the queue in front of you takes to drain at the observed flow; failing that, head churn; failing everything, `ChurnIntervalCapMinutes`. |
+| `score` | `margin x tradable depth x fill confidence / expected minutes`. |
+
+Every factor of the score has its own column on purpose. A wide margin on a book one unit deep and a
+narrow margin on a deep fast book both show why they scored what they scored, so a ranking can be
+argued with rather than trusted.
+
+`MarketSweepBoardSortHotkey` cycles the sort column: score, margin, tradable depth, churn, depth
+turnover, traded history. Sorting only reorders what is on screen; it never changes what was
+measured. An unknown churn or turnover sorts last rather than as zero, so a pair swept once is never
+mistaken for a dead one.
+
+### What velocity can and cannot see
+
+The plugin never observes trades, only book snapshots. Churn is inferred from how the head rate and
+the depths move between two consecutive observations of the same pair, which has two honest limits: a
+long gap undercounts, because several moves collapse into one observation, and a pair observed once
+has no value at all. Intervals longer than `ChurnIntervalCapMinutes` are therefore excluded rather
+than averaged in, and shorter intervals are weighted more heavily.
+
+The two signals answer different questions and both are on the board. Churn says how often the price
+is being rewritten; turnover says how much is actually changing hands. A book quietly consumed at an
+unchanged price is invisible to the first and obvious to the second, which is why the fill estimate
+prefers turnover: the queue in front of a maker order is what has to drain before the order is
+reached, and turnover measures that draining in the same units as the queue. It is an approximation
+worth being honest about — turnover sums both sides of the direction and counts rows being *added*
+the same as rows being consumed, so it runs optimistic on a book that is filling up.
+
+**Two settings that can silently cancel each other out.** Idle sweeping revisits a pair no sooner
+than `SweepStalePairMinutes`, and any interval longer than `ChurnIntervalCapMinutes` is discarded
+rather than averaged in. If the stale threshold is at or above the cap, every measurement an idle
+sweep produces is thrown away and both velocity columns stay `-` forever. The defaults (cap 90, stale
+30) are set well apart, but a settings file saved before this was fixed keeps its old values — the
+board draws a yellow warning line when it sees the two the wrong way round.
+
+Measured fill history from the audit log is a confidence multiplier on the inferred signal, never the
+ranking on its own; it exists only for pairs you have actually traded. If the audit log cannot be
+read the board still ranks, on the inferred signal alone.
+
+Observations are appended to `market-observations-<league>.jsonl` in the plugin config directory, one
+line per capture, pruned to `VelocityHistoryDays` on load. A corrupt file blocks that league's sweep
+and is left on disk untouched rather than being silently overwritten.
+
+## Reading the Overlay
+
+Two lines in the status block describe what a run is actually doing.
+
+**`Path:`** is the trade itself, hop by hop, drawn only when there is something to draw:
+
+```
+Workflow: LegActive | leg 2/3 | authorized
+Path: 2 Divine Orb > 1520 Primal Crysta~ > [720 Chaos Orb] > 4 Divine Orb
+```
+
+The brackets mark the hop in flight, so it should always agree with the leg number on the
+`Workflow:` line, and it advances as each leg settles. Amounts come off the live leg plans rather than
+the original quote, so a leg that refreshes onto a moved book updates its number here. Names are
+clipped to 14 characters (`Primal Crysta~`) so a full cycle fits one line.
+
+The line is cyan while a workflow is running. With no workflow but a route the planner has accepted, it
+reads `Path: planned ...` in gray. With neither, it is not drawn at all.
+
+Note that the path in `workflow-runtime.log` is deliberately *not* the same string: logs keep full,
+unabbreviated names and the `->` separator. Do not expect the two to match character for character.
+
+**`Tracked order:`** gains a `| timeout m:ss` countdown while an order is `Pending`, running against
+`CompetingOrderWaitMinutes`:
+
+```
+Tracked order: Pending | order 41 | timeout 3:41
+```
+
+Only `Pending` counts down. `Armed` has no deadline yet - it is written the moment a placement matches
+a real order - and terminal statuses only carry the field forward as history.
+
+Past the deadline the line reads `| timeout expired` in yellow rather than a negative clock. That is a
+real state, not a rounding artifact: the flip to `TimedOut` happens on the next lifecycle observation,
+which needs a readable exchange panel, so the deadline can pass while the status has not yet caught up.
+If it sits at `expired`, the bot cannot see the panel.
 
 ## Stop and Resume
 

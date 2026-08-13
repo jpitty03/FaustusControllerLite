@@ -27,6 +27,28 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private readonly CanceledReturnCollectionController _canceledReturnCollection = new();
     private readonly AutomatedProbeController _collectionOwnershipSelector = new();
     private readonly Dictionary<string, OwnershipObservation> _liveOwnedByMetadata = new(StringComparer.Ordinal);
+    private static readonly float[] BoardColumnOffsets =
+        [0f, 250f, 310f, 360f, 415f, 490f, 570f, 650f, 710f, 760f];
+
+    private readonly AutomatedProbeController _marketSweepProbe = new();
+    private readonly MarketSweepQueue _marketSweepQueue = new();
+    private MarketObservationStore? _observationStore;
+    private IReadOnlyList<TradableName> _tradableNames = [];
+    private string _tradablesFailure = string.Empty;
+    private TradablesResolution? _tradablesResolution;
+    private MarketSweepStep? _marketSweepProbeStep;
+    private Guid _marketSweepSessionId = Guid.NewGuid();
+    private DateTimeOffset _nextIdleSweepUtc;
+    private DateTimeOffset _nextMarketSweepAttemptUtc;
+    private string _observationLoadBlockedLeague = string.Empty;
+    private string _marketSweepStatus = "Idle; the market sweep board is off.";
+    private IReadOnlyList<MarketSweepRow> _boardRows = [];
+    private MarketSweepBoardSort _boardSort = MarketSweepBoardSort.Score;
+    private bool _boardDirty = true;
+    private DateTimeOffset _nextBoardRefreshUtc;
+    private ExecutionHistoryStatistics _executionHistory = ExecutionHistoryStatistics.Empty;
+    private DateTimeOffset _nextExecutionHistoryRefreshUtc;
+    private string _persistenceDirectory = string.Empty;
     private CurrencyCatalogue? _catalogue;
     private BankrollStore? _bankrollStore;
     private TrackedOrderStore? _trackedOrderStore;
@@ -167,11 +189,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     {
         Name = nameof(FaustusControllerLite);
         var persistenceDirectory = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite));
+        _persistenceDirectory = persistenceDirectory;
         _bankrollStore = new BankrollStore(persistenceDirectory);
         _trackedOrderStore = new TrackedOrderStore(persistenceDirectory);
         _latestRatePath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "latest-rates.json");
         _diagnosticPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "sdk-diagnostic.txt");
         _pickerCalibrationPath = Path.Combine(ConfigDirectory, nameof(FaustusControllerLite), "picker-calibration.json");
+        _observationStore = new MarketObservationStore(persistenceDirectory);
+        LoadTradablesList(persistenceDirectory);
         Settings.ActiveFeature.Values = FeatureModeGate.Labels.ToList();
         Settings.SellSweepExecutionStrategy.Values = SellSweepExecutionModes.Labels.ToList();
         if (SellSweepExecutionModes.TryParse(
@@ -344,6 +369,17 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             {
                 HandleSellSweepHotkey();
             }
+            // No feature-scope gate: the sweep reads books and writes only its own observation file,
+            // exactly like the SDK dump hotkey. It places nothing and touches no bankroll state.
+            if (Settings.MarketSweepHotkey.PressedOnce())
+            {
+                HandleMarketSweepHotkey();
+            }
+            if (Settings.MarketSweepBoardSortHotkey.PressedOnce())
+            {
+                _boardSort = MarketSweepScore.NextSort(_boardSort);
+                _boardDirty = true;
+            }
         }
         ValidateWorkflowAuthorizationBeforeInput();
         ValidateSweepAuthorizationBeforeInput();
@@ -379,6 +415,14 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             Settings.CursorTweenSpeed.Value,
             Settings.StableRateSampleCount.Value);
         SynchronizePlacementLegRefresh();
+        _marketSweepProbe.Tick(
+            GameController,
+            _pickerCalibration,
+            ProbeInputPermissions.From(Settings),
+            IsFullFaustusControllerEnabled(),
+            Settings.CursorTweenSpeed.Value,
+            Settings.StableRateSampleCount.Value);
+        SynchronizeMarketSweepProbe();
         _singleLegStaging.Tick(
             GameController,
             _pickerCalibration,
@@ -433,6 +477,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         SynchronizeCanceledReturnCollection();
         DriveFullWorkflow();
         TickSellSweep();
+        DriveMarketSweep();
         AppendFailureDiagnosticIfNeeded();
 
         return base.Tick();
@@ -449,6 +494,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _workflowPreparationRetryCount = 0;
         _automatedProbe.Cancel("Plugin unloading during probing.");
         _placementLegRefresh.Cancel("Plugin unloading during leg refresh.");
+        StopMarketSweep("Plugin unloading during market sweep.");
         _singleLegStaging.Cancel("Plugin unloading during staging.");
         _singleLegPlacement.EmergencyStop("Plugin unloading during placement.");
         _collectionOwnershipSelector.Cancel("Plugin unloading during ownership observation.");
@@ -470,6 +516,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _workflowPreparationRetryCount = 0;
         _automatedProbe.Cancel("Plugin hot reload during probing.");
         _placementLegRefresh.Cancel("Plugin hot reload during leg refresh.");
+        StopMarketSweep("Plugin hot reload during market sweep.");
         _singleLegStaging.Cancel("Plugin hot reload during staging.");
         _singleLegPlacement.EmergencyStop("Plugin hot reload during placement.");
         _collectionOwnershipSelector.Cancel("Plugin hot reload during ownership observation.");
@@ -487,6 +534,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _sweepAuthorized = false;
         _automatedProbe.Cancel("Area changed.");
         _placementLegRefresh.Cancel("Area changed.");
+        StopMarketSweep("Area changed.");
         _singleLegStaging.Invalidate("Area changed.");
         _singleLegPlacement.Cancel("Area changed.");
         _trackedCollection.Cancel("Area changed.");
@@ -566,8 +614,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 : $"Sell sweep: {_sellSweepStatus}",
             ref y, _bankroll.Workflow?.IsActive == true || _sellSweep?.IsActive == true
                 ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
-        DrawStatus($"Tracked order: {DescribeTrackedOrderCompact()}", ref y,
-            _trackedOrderState?.Status == TrackedOrderStatus.Ambiguous ? SharpDX.Color.OrangeRed : SharpDX.Color.Gray);
+        if (_activeFeature == FeatureMode.Arbitrage && TryDescribeTradePath(out var tradePath, out var pathIsLive))
+        {
+            DrawStatus($"Path: {tradePath}", ref y, pathIsLive ? SharpDX.Color.Cyan : SharpDX.Color.Gray);
+        }
+        DrawStatus($"Tracked order: {DescribeTrackedOrderCompact()}", ref y, TrackedOrderLineColor());
         DrawStatus($"Calibration: picker={Ready(_pickerCalibration.IsComplete)}, " +
             $"place={Ready(_pickerCalibration.IsPlacementComplete)}, " +
             $"collect={Ready(_pickerCalibration.IsCollectionComplete)}, " +
@@ -616,12 +667,77 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             DrawStatus($"  {_forcedResetDiscardSummary}", ref y, SharpDX.Color.Red);
         }
 
+        if (Settings.EnableMarketSweepBoard.Value)
+        {
+            y += 10f;
+            DrawStatus(
+                $"MARKET SWEEP BOARD - sorted by {MarketSweepScore.DescribeSort(_boardSort)} - {_marketSweepStatus}",
+                ref y,
+                SharpDX.Color.Cyan);
+            if (_tradablesResolution is { } resolution)
+            {
+                DrawStatus(
+                    $"  Tradables resolved {resolution.Resolved.Count}/{resolution.RequestedCount}{DescribeUnresolved(resolution)}",
+                    ref y,
+                    resolution.Unresolved.Count == 0 ? SharpDX.Color.Gray : SharpDX.Color.Yellow);
+            }
+            else if (!string.IsNullOrEmpty(_tradablesFailure))
+            {
+                DrawStatus($"  Tradables list unavailable: {_tradablesFailure}", ref y, SharpDX.Color.OrangeRed);
+            }
+
+            // Two settings that silently cancel each other out. Idle sweeping revisits a pair no sooner than
+            // the stale threshold, and an interval longer than the churn cap is discarded rather than
+            // averaged in, so a threshold at or above the cap means every measurement is thrown away and the
+            // velocity columns stay blank forever. Changing the defaults does not rescue an already-saved
+            // configuration, which is why this is drawn rather than merely fixed.
+            if (Settings.SweepWhileIdle.Value &&
+                Settings.SweepStalePairMinutes.Value >= Settings.ChurnIntervalCapMinutes.Value)
+            {
+                DrawStatus(
+                    $"  Idle sweep revisits a pair no sooner than {Settings.SweepStalePairMinutes.Value}min, " +
+                    $"but intervals over {Settings.ChurnIntervalCapMinutes.Value}min are discarded - churn and " +
+                    "turnover will stay '-'. Raise the cap or lower the stale interval.",
+                    ref y,
+                    SharpDX.Color.Yellow);
+            }
+
+            DrawRow(MarketSweepScore.ColumnHeadings, ref y, SharpDX.Color.Gray);
+            var rowCount = Math.Min(Settings.SweepBoardRowCount.Value, _boardRows.Count);
+            for (var index = 0; index < rowCount; index++)
+            {
+                DrawRow(MarketSweepScore.FormatRow(_boardRows[index]), ref y, SharpDX.Color.White);
+            }
+
+            if (_boardRows.Count == 0)
+            {
+                DrawStatus("  No observations yet; sweep a category to fill the board.", ref y, SharpDX.Color.Gray);
+            }
+        }
+
         static string Ready(bool ready) => ready ? "ready" : "missing";
         static string EmptyAsNone(string value) => string.IsNullOrEmpty(value) ? "None" : value;
+
+        static string DescribeUnresolved(TradablesResolution resolution) =>
+            resolution.Unresolved.Count == 0
+                ? string.Empty
+                : $" - unresolved: {string.Join(", ", resolution.Unresolved.Select(entry => entry.Name))}";
 
         void DrawStatus(string text, ref float currentY, SharpDX.Color color)
         {
             Graphics.DrawText(text, new Vector2(x, currentY), color);
+            currentY += 20f;
+        }
+
+        // Fixed pixel offsets rather than padded strings: the overlay font is proportional, so a PadRight
+        // table goes ragged the moment two rows disagree on character widths.
+        void DrawRow(IReadOnlyList<string> cells, ref float currentY, SharpDX.Color color)
+        {
+            for (var index = 0; index < cells.Count && index < BoardColumnOffsets.Length; index++)
+            {
+                Graphics.DrawText(cells[index], new Vector2(x + BoardColumnOffsets[index], currentY), color);
+            }
+
             currentY += 20f;
         }
     }
@@ -4780,9 +4896,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
+    // The market sweep is in here because it really does hold the picker while it runs. A deliberate
+    // trading press during a sweep capture is refused for the second or two the capture takes rather
+    // than being allowed to drive a second controller into the same panel.
     private bool IsAnyInputOperationActive() =>
-        _automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _singleLegStaging.IsRunning ||
-        _singleLegPlacement.IsRunning || IsCollectionFlowActive() || _trackedCancellation.IsRunning ||
+        _automatedProbe.IsRunning || _placementLegRefresh.IsRunning || _marketSweepProbe.IsRunning ||
+        _singleLegStaging.IsRunning || _singleLegPlacement.IsRunning || IsCollectionFlowActive() ||
+        _trackedCancellation.IsRunning ||
         _placementPreparation != PlacementPreparationState.Idle || _sweepExecution != SweepExecutionState.Idle ||
         _calibrationObservation is not null;
 
@@ -5660,6 +5780,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             Binding(nameof(Settings.AdoptPendingOrderHotkey), Settings.AdoptPendingOrderHotkey),
             Binding(nameof(Settings.FullWorkflowHotkey), Settings.FullWorkflowHotkey),
             Binding(nameof(Settings.SellSweepHotkey), Settings.SellSweepHotkey),
+            Binding(nameof(Settings.MarketSweepHotkey), Settings.MarketSweepHotkey),
+            Binding(nameof(Settings.MarketSweepBoardSortHotkey), Settings.MarketSweepBoardSortHotkey),
         };
         var duplicate = bindings
             .Where(binding => binding.Active)
@@ -6343,6 +6465,489 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
+    // ---- Market sweep --------------------------------------------------------------------------
+    // Advisory only. The sweep reads books and appends to market-observations-<league>.jsonl. It never
+    // calls LatestRateStore.Store or Save, never reads or writes bankroll state, and never places an
+    // order, so the route planner cannot see it and a sweep capture can never age out a real quote.
+
+    private sealed record MarketSweepPlan(
+        IReadOnlyList<TradableEntry> Targets,
+        CurrencyIdentity Chaos,
+        CurrencyIdentity Divine,
+        TradablesResolution Resolution);
+
+    /// <summary>
+    /// Seeds the operator-editable tradables list once and loads it. A missing or malformed list only
+    /// disables the sweep; it must never stop the plugin from loading, because nothing else reads it.
+    /// </summary>
+    private void LoadTradablesList(string persistenceDirectory)
+    {
+        try
+        {
+            var pluginDirectory =
+                Path.GetDirectoryName(typeof(FaustusControllerLite).Assembly.Location) ?? string.Empty;
+            var path = TradablesCatalogue.EnsureOperatorCopy(persistenceDirectory, pluginDirectory);
+            if (TradablesCatalogue.TryLoad(path, out var names, out var failure))
+            {
+                _tradableNames = names;
+                _tradablesFailure = string.Empty;
+            }
+            else
+            {
+                _tradableNames = [];
+                _tradablesFailure = failure;
+            }
+        }
+        catch (Exception exception)
+        {
+            _tradableNames = [];
+            _tradablesFailure = $"Tradables list unreadable: {exception.Message}";
+        }
+    }
+
+    private void HandleMarketSweepHotkey()
+    {
+        if (_marketSweepQueue.IsRunning || _marketSweepProbeStep is not null)
+        {
+            StopMarketSweep("Market sweep stopped by hotkey.");
+            return;
+        }
+
+        if (!Settings.EnableMarketSweepBoard.Value)
+        {
+            _marketSweepStatus = "Enable the market sweep board before starting a sweep.";
+            return;
+        }
+
+        if (TryGetHotkeyConflict(out var conflict))
+        {
+            _marketSweepStatus = conflict;
+            return;
+        }
+
+        var plan = BuildMarketSweepPlan(out var planFailure);
+        if (plan is null)
+        {
+            _marketSweepStatus = planFailure;
+            return;
+        }
+
+        if (!_marketSweepQueue.TryStart(
+                plan.Targets, plan.Chaos, plan.Divine, IsAnyInputOperationActive(), out var failure))
+        {
+            _marketSweepStatus = failure;
+            return;
+        }
+
+        _marketSweepSessionId = Guid.NewGuid();
+        _nextMarketSweepAttemptUtc = DateTimeOffset.MinValue;
+        _marketSweepStatus =
+            $"Market sweep armed: {_marketSweepQueue.Steps.Count} captures queued ({plan.Resolution.Summary}).";
+    }
+
+    private void DriveMarketSweep()
+    {
+        if (!Settings.EnableMarketSweepBoard.Value)
+        {
+            if (_marketSweepQueue.IsRunning || _marketSweepProbeStep is not null)
+            {
+                StopMarketSweep("Market sweep board disabled.");
+            }
+
+            return;
+        }
+
+        // The board is refreshed before any of the yield gates below. Reading what was already recorded
+        // costs nothing in the game and takes no input, so the table stays on screen and stays sorted while
+        // trading owns the panel - it is only the capturing half of the sweep that has to stand aside.
+        var now = DateTimeOffset.UtcNow;
+        var store = LoadedObservationStore();
+        if (store is not null)
+        {
+            RefreshMarketSweepBoard(store, now);
+        }
+
+        if (_marketSweepProbeStep is not null)
+        {
+            // The sweep always loses. The moment anything else wants the panel it abandons the capture it
+            // is holding rather than finishing it, so the continuous workflow never waits on the board.
+            if (_fullWorkflowAuthorized || _sweepAuthorized || _automatedProbe.IsRunning ||
+                IsPlacementFlowActive() || IsCollectionFlowActive())
+            {
+                StopMarketSweep("Market sweep yielded the exchange panel to trading.");
+            }
+
+            return;
+        }
+
+        if (now < _nextMarketSweepAttemptUtc)
+        {
+            return;
+        }
+
+        if (_fullWorkflowAuthorized || _sweepAuthorized || IsAnyInputOperationActive())
+        {
+            _nextMarketSweepAttemptUtc = now + TimeSpan.FromSeconds(1);
+            return;
+        }
+
+        if (store is null)
+        {
+            _nextMarketSweepAttemptUtc = now + TimeSpan.FromSeconds(5);
+            return;
+        }
+
+        var step = _marketSweepQueue.Current ?? SelectIdleSweepStep(store, now);
+        if (step is null)
+        {
+            return;
+        }
+
+        if (!TryStartMarketSweepStep(step, out var failure))
+        {
+            _nextMarketSweepAttemptUtc = now + TimeSpan.FromSeconds(1);
+            _marketSweepStatus = $"{step.Describe()}: {failure}";
+        }
+    }
+
+    /// <summary>
+    /// One pair per idle window, never a burst, so the continuous workflow can always preempt the sweep
+    /// instead of competing with it.
+    /// </summary>
+    /// <summary>
+    /// Rebuilds the ranked board from what is already on disk. Ranking every pair and re-parsing the audit
+    /// log is far too expensive to do per frame, so it happens here on an interval and <c>Render</c> only
+    /// prints the cached rows. A new observation marks the board dirty so a fresh capture shows up at once
+    /// rather than waiting out the interval.
+    /// </summary>
+    private void RefreshMarketSweepBoard(MarketObservationStore store, DateTimeOffset nowUtc)
+    {
+        if (!_boardDirty && nowUtc < _nextBoardRefreshUtc)
+        {
+            return;
+        }
+
+        _boardDirty = false;
+        _nextBoardRefreshUtc = nowUtc + TimeSpan.FromSeconds(5);
+
+        if (nowUtc >= _nextExecutionHistoryRefreshUtc)
+        {
+            _nextExecutionHistoryRefreshUtc = nowUtc + TimeSpan.FromSeconds(60);
+            try
+            {
+                _executionHistory = ExecutionHistoryStatistics.Load(
+                    ExecutionHistoryStatistics.PathFor(_persistenceDirectory, store.League));
+            }
+            catch (Exception exception)
+            {
+                // Measured history is a confidence multiplier, not the ranking. An unreadable audit log
+                // degrades the board to the inferred signal rather than blanking it.
+                _executionHistory = ExecutionHistoryStatistics.Empty;
+                _marketSweepStatus = $"Execution history unreadable; ranking without it: {exception.Message}";
+            }
+        }
+
+        var ranked = MarketSweepScore.Rank(
+            store.Snapshot(),
+            _executionHistory,
+            new MarketSweepScoreSettings(
+                Settings.ChurnIntervalCapMinutes.Value, Settings.SweepDepthCap.Value));
+        _boardRows = MarketSweepScore.Sort(ranked, _boardSort);
+    }
+
+    private MarketSweepStep? SelectIdleSweepStep(MarketObservationStore store, DateTimeOffset nowUtc)
+    {
+        if (!Settings.SweepWhileIdle.Value || nowUtc < _nextIdleSweepUtc)
+        {
+            return null;
+        }
+
+        _nextIdleSweepUtc = nowUtc + TimeSpan.FromSeconds(Settings.IdleSweepIntervalSeconds.Value);
+        if (!IsMarketSweepIdle(out var busy))
+        {
+            _marketSweepStatus = busy;
+            return null;
+        }
+
+        var plan = BuildMarketSweepPlan(out var planFailure);
+        if (plan is null)
+        {
+            _marketSweepStatus = planFailure;
+            return null;
+        }
+
+        var step = MarketSweepQueue.SelectStalest(
+            MarketSweepQueue.Build(plan.Targets, plan.Chaos, plan.Divine),
+            store.Snapshot(),
+            nowUtc,
+            Settings.SweepStalePairMinutes.Value);
+        if (step is null)
+        {
+            _marketSweepStatus = $"Every enabled pair is fresh ({plan.Resolution.Summary}).";
+        }
+
+        return step;
+    }
+
+    private bool TryStartMarketSweepStep(MarketSweepStep step, out string failure)
+    {
+        if (!_marketSweepProbe.StartSingleMarketProbe(
+                GameController,
+                step.Offered,
+                step.Wanted,
+                _pickerCalibration,
+                ProbeInputPermissions.From(Settings),
+                IsFullFaustusControllerEnabled(),
+                Settings.CursorTweenSpeed.Value,
+                _marketSweepSessionId,
+                out failure))
+        {
+            return false;
+        }
+
+        _marketSweepProbeStep = step;
+        _marketSweepStatus = _marketSweepQueue.IsRunning
+            ? $"Sweeping {step.Describe()} ({_marketSweepQueue.Progress})."
+            : $"Idle sweep sampling {step.Describe()}.";
+        return true;
+    }
+
+    private void SynchronizeMarketSweepProbe()
+    {
+        if (_marketSweepProbe.State is not (AutomatedProbeState.Completed or
+            AutomatedProbeState.Cancelled or AutomatedProbeState.Failed))
+        {
+            return;
+        }
+
+        var step = _marketSweepProbeStep;
+        if (step is null)
+        {
+            // A stop already disowned this probe; still acknowledge so the controller returns to Idle.
+            _marketSweepProbe.AcknowledgeCompletion();
+            return;
+        }
+
+        var observed = false;
+        try
+        {
+            if (_marketSweepProbe.State != AutomatedProbeState.Completed)
+            {
+                _marketSweepStatus = $"{step.Describe()} did not complete: {_marketSweepProbe.Failure}";
+            }
+            else if (_marketSweepProbe.CompletedCaptures.Count != 1)
+            {
+                _marketSweepStatus =
+                    $"{step.Describe()} produced {_marketSweepProbe.CompletedCaptures.Count} captures; expected exactly one.";
+            }
+            else if (_observationStore is null)
+            {
+                _marketSweepStatus = "The market observation store is unavailable.";
+            }
+            else
+            {
+                _observationStore.Append(
+                    MarketObservation.FromCapture(_marketSweepProbe.CompletedCaptures[0]));
+                observed = true;
+                _boardDirty = true;
+                _marketSweepStatus = $"Recorded {step.Describe()} ({_observationStore.Count} observations).";
+            }
+        }
+        catch (Exception exception)
+        {
+            // A survey must not stall on one unreadable book. The sweep writes nothing else and holds no
+            // reservation, so there is no partial state to unwind: count the step skipped and move on.
+            _marketSweepStatus = $"{step.Describe()} observation rejected: {exception.Message}";
+        }
+        finally
+        {
+            _marketSweepProbeStep = null;
+            _marketSweepProbe.AcknowledgeCompletion();
+        }
+
+        if (!_marketSweepQueue.IsRunning)
+        {
+            return;
+        }
+
+        _marketSweepQueue.Advance(observed);
+        if (!_marketSweepQueue.IsRunning)
+        {
+            _marketSweepStatus =
+                $"Market sweep complete: {_marketSweepQueue.Observed} recorded, {_marketSweepQueue.Skipped} skipped.";
+        }
+    }
+
+    private void StopMarketSweep(string reason)
+    {
+        if (_marketSweepProbe.IsRunning)
+        {
+            _marketSweepProbe.Cancel(reason);
+        }
+
+        _marketSweepProbeStep = null;
+        _marketSweepQueue.Stop();
+        _marketSweepStatus = reason;
+    }
+
+    private MarketSweepPlan? BuildMarketSweepPlan(out string failure)
+    {
+        if (_catalogue is null)
+        {
+            failure = "The Currency Exchange catalogue has not been read yet.";
+            return null;
+        }
+
+        if (!_catalogue.TryGetByMetadata(BankrollState.ChaosMetadata, out var chaos) || chaos is null ||
+            !_catalogue.TryGetByMetadata(BankrollState.DivineMetadata, out var divine) || divine is null)
+        {
+            failure = "The catalogue does not expose both bankroll currencies.";
+            return null;
+        }
+
+        if (_tradableNames.Count == 0)
+        {
+            failure = _tradablesFailure.Length > 0
+                ? _tradablesFailure
+                : $"{TradablesCatalogue.FileName} lists no tradables.";
+            return null;
+        }
+
+        var categories = EnabledSweepCategories();
+        if (categories.Count == 0)
+        {
+            failure = "No tradable category is enabled for the sweep.";
+            return null;
+        }
+
+        var resolution = TradablesCatalogue.Resolve(_tradableNames, _catalogue, categories);
+        _tradablesResolution = resolution;
+        if (resolution.Resolved.Count == 0)
+        {
+            failure = $"No enabled tradable resolved to an exchange target ({resolution.Summary}).";
+            return null;
+        }
+
+        failure = string.Empty;
+        return new MarketSweepPlan(resolution.Resolved, chaos, divine, resolution);
+    }
+
+    private IReadOnlySet<TradableCategory> EnabledSweepCategories()
+    {
+        var categories = new HashSet<TradableCategory>();
+        if (Settings.SweepCurrency.Value)
+        {
+            categories.Add(TradableCategory.Currency);
+        }
+
+        if (Settings.SweepDeliriumOrbs.Value)
+        {
+            categories.Add(TradableCategory.DeliriumOrbs);
+        }
+
+        if (Settings.SweepScarabs.Value)
+        {
+            categories.Add(TradableCategory.Scarabs);
+        }
+
+        if (Settings.SweepFossils.Value)
+        {
+            categories.Add(TradableCategory.Fossils);
+        }
+
+        if (Settings.SweepEssences.Value)
+        {
+            categories.Add(TradableCategory.Essences);
+        }
+
+        return categories;
+    }
+
+    /// <summary>
+    /// The observation store for the current league, or null when it is unusable. A corrupt history file
+    /// blocks that league's sweep and is left untouched on disk — the same contract as every other store —
+    /// and the failing league is remembered so the parse is not retried on every tick.
+    /// </summary>
+    private MarketObservationStore? LoadedObservationStore()
+    {
+        var store = _observationStore;
+        if (store is null)
+        {
+            return null;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            _marketSweepStatus = "Waiting for a readable league before recording observations.";
+            return null;
+        }
+
+        if (string.Equals(store.League, league, StringComparison.Ordinal))
+        {
+            return store;
+        }
+
+        if (string.Equals(_observationLoadBlockedLeague, league, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        try
+        {
+            store.Load(
+                league, TimeSpan.FromDays(Settings.VelocityHistoryDays.Value), DateTimeOffset.UtcNow);
+            _observationLoadBlockedLeague = string.Empty;
+            _marketSweepStatus =
+                $"Loaded {store.Count} observations across {store.Pairs.Count} pairs in {league}.";
+            return store;
+        }
+        catch (Exception exception)
+        {
+            _observationLoadBlockedLeague = league;
+            _marketSweepStatus =
+                $"Market observation history unreadable and left on disk: {exception.Message}";
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The extra conditions the unattended idle sweeper needs on top of the caller's activity check: no
+    /// unresolved order, no calibration in progress, every probe permission on, and a foreground exchange
+    /// panel with the picker closed.
+    /// </summary>
+    private bool IsMarketSweepIdle(out string busy)
+    {
+        if (_bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true)
+        {
+            busy = "Idle sweep is held while an order is unresolved.";
+            return false;
+        }
+
+        if (_calibrationWizard != CalibrationWizardState.Inactive || _calibrationObservation is not null)
+        {
+            busy = "Idle sweep is held during calibration.";
+            return false;
+        }
+
+        if (!ProbeInputPermissions.From(Settings).Ready || IsFullFaustusControllerEnabled())
+        {
+            busy = "Idle sweep needs probing, movement, click, and query permission with exclusive Lite input ownership.";
+            return false;
+        }
+
+        var ui = GameController.Game.IngameState.IngameUi;
+        if (!GameController.Window.IsForeground() || !ui.CurrencyExchangePanel.IsVisible ||
+            ui.CurrencyExchangePanel.CurrencyPicker.IsVisible || ui.PopUpWindow.IsVisible)
+        {
+            busy = "Idle sweep needs a foreground exchange panel with the picker closed and no popup.";
+            return false;
+        }
+
+        busy = string.Empty;
+        return true;
+    }
+
     private string GetCurrentLeague()
     {
         try
@@ -6395,6 +7000,42 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         return $"{workflow.Phase} | leg {leg}/{workflow.Legs.Count} | {authorization}{restoration}{sameAssetProfit}{retry}";
     }
 
+    /// <summary>
+    /// The trade behind the current workflow, or the route the planner accepted but has not started yet.
+    /// Returns false when there is neither, so an idle plugin draws no path row at all.
+    /// </summary>
+    private bool TryDescribeTradePath(out string path, out bool live)
+    {
+        if (_bankroll.Workflow is { } workflow && workflow.Legs.Count > 0)
+        {
+            path = WorkflowNarrative.DescribeActivePath(workflow);
+            live = true;
+            return true;
+        }
+
+        if (_selectedCandidate is { } candidate)
+        {
+            path = $"planned {WorkflowNarrative.DescribePlannedPath(candidate)}";
+            live = false;
+            return true;
+        }
+
+        path = string.Empty;
+        live = false;
+        return false;
+    }
+
+    private SharpDX.Color TrackedOrderLineColor()
+    {
+        if (_trackedOrderState?.Status == TrackedOrderStatus.Ambiguous) return SharpDX.Color.OrangeRed;
+        // The deadline has passed but the status has not caught up: the flip to TimedOut needs a lifecycle
+        // observation, which needs a readable panel. Worth flagging, but it is not a fault.
+        return WorkflowNarrative.TryDescribeOrderTimeout(_trackedOrderState, DateTimeOffset.UtcNow, out var timeout) &&
+            timeout == "expired"
+            ? SharpDX.Color.Yellow
+            : SharpDX.Color.Gray;
+    }
+
     private string DescribeTrackedOrderCompact()
     {
         var tracked = _trackedOrderState;
@@ -6406,7 +7047,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 $"return {tracked.TerminalRemainingOfferedAmount.GetValueOrDefault()}"
             : string.Empty;
         var recovery = tracked.Status == TrackedOrderStatus.Ambiguous ? " | recovery required" : string.Empty;
-        return $"{tracked.Status}{id}{terminal}{recovery}";
+        var timeout = WorkflowNarrative.TryDescribeOrderTimeout(tracked, DateTimeOffset.UtcNow, out var remaining)
+            ? $" | timeout {remaining}"
+            : string.Empty;
+        return $"{tracked.Status}{id}{terminal}{recovery}{timeout}";
     }
 
     private static string DescribeRejections(RoutePlannerResult result)

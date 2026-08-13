@@ -1,4 +1,4 @@
-using ExileCore.Shared.Interfaces;
+﻿using ExileCore.Shared.Interfaces;
 using ExileCore.Shared.Nodes;
 using ExileCore.Shared.Attributes;
 using FaustusControllerLite.Domain;
@@ -178,6 +178,59 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Hotkeys")]
     public HotkeyNodeV2 SellSweepHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 MarketSweepHotkey { get; set; } = CreateUnboundHotkey();
+
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 MarketSweepBoardSortHotkey { get; set; } = CreateUnboundHotkey();
+
+    // The board is advisory. Nothing here feeds the route planner or latest-rates.json; the sweep only
+    // reads books and appends its own observation file, so every setting below is safe to leave on.
+    [Category("Market Sweep")]
+    public ToggleNode EnableMarketSweepBoard { get; set; } = new(false);
+
+    [Category("Market Sweep")]
+    public ToggleNode SweepCurrency { get; set; } = new(true);
+
+    [Category("Market Sweep")]
+    public ToggleNode SweepDeliriumOrbs { get; set; } = new(false);
+
+    [Category("Market Sweep")]
+    public ToggleNode SweepScarabs { get; set; } = new(false);
+
+    [Category("Market Sweep")]
+    public ToggleNode SweepFossils { get; set; } = new(false);
+
+    [Category("Market Sweep")]
+    public ToggleNode SweepEssences { get; set; } = new(false);
+
+    [Category("Market Sweep")]
+    public RangeNode<int> SweepBoardRowCount { get; set; } = new(15, 5, 40);
+
+    [Category("Market Sweep")]
+    public RangeNode<int> VelocityHistoryDays { get; set; } = new(7, 1, 30);
+
+    // Intervals longer than this are discarded, not averaged in, so this must comfortably exceed the rate at
+    // which a pair is actually revisited. It is deliberately far above SweepStalePairMinutes below: a full
+    // idle cycle takes (pairs x IdleSweepIntervalSeconds), which is well over the stale threshold itself.
+    [Category("Market Sweep")]
+    public RangeNode<int> ChurnIntervalCapMinutes { get; set; } = new(90, 5, 240);
+
+    // Must stay below ChurnIntervalCapMinutes or every idle-generated interval is thrown away and churn never
+    // appears. The board says so out loud when a saved configuration still has these two the wrong way round.
+    [Category("Market Sweep")]
+    public RangeNode<int> SweepStalePairMinutes { get; set; } = new(30, 5, 1_440);
+
+    [Category("Market Sweep")]
+    public RangeNode<int> SweepDepthCap { get; set; } = new(1_000, 1, 100_000);
+
+    // One pair per idle window, never a burst, so the continuous workflow always wins the panel.
+    [Category("Market Sweep")]
+    public ToggleNode SweepWhileIdle { get; set; } = new(false);
+
+    [Category("Market Sweep")]
+    public RangeNode<int> IdleSweepIntervalSeconds { get; set; } = new(15, 5, 600);
 
     [Category("Fresh State Reset")]
     [JsonIgnore]
