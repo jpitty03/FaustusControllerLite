@@ -25,6 +25,7 @@ public enum StashCustodyMode
 
 public static class StashCustodyPolicy
 {
+    public const string ReflectingMistMetadata = "Metadata/Items/Currency/ReflectiveMist";
     public const string CurrencyPrefix = "Metadata/Items/Currency/";
     public const string ScarabPrefix = "Metadata/Items/Scarabs/";
 
@@ -78,7 +79,42 @@ public static class StashCustodyPolicy
         mode = string.Equals(homeTabType, visibleTabType, StringComparison.Ordinal)
             ? StashCustodyMode.VisibleCurrencyStashExact
             : StashCustodyMode.AffinityAggregate;
+        if (string.Equals(metadata, ReflectingMistMetadata, StringComparison.Ordinal))
+            mode = StashCustodyMode.AffinityAggregate;
         return true;
+    }
+
+    public static bool TryResolve(
+        string metadata,
+        string visibleTabType,
+        long inventoryAmount,
+        long visibleStashAmount,
+        long aggregateOwned,
+        out StashCustodyMode mode)
+    {
+        if (!TryResolve(metadata, visibleTabType, out mode) || inventoryAmount < 0 ||
+            visibleStashAmount < 0 || aggregateOwned < 0)
+        {
+            mode = default;
+            return false;
+        }
+        try
+        {
+            var locallyAccounted = checked(inventoryAmount + visibleStashAmount);
+            if (locallyAccounted > aggregateOwned)
+            {
+                mode = default;
+                return false;
+            }
+            if (mode == StashCustodyMode.VisibleCurrencyStashExact && locallyAccounted < aggregateOwned)
+                mode = StashCustodyMode.AffinityAggregate;
+            return true;
+        }
+        catch (OverflowException)
+        {
+            mode = default;
+            return false;
+        }
     }
 
     /// <summary>
@@ -145,6 +181,7 @@ public sealed class TrackedOrderState
     public long PendingWantedBatchAmount { get; set; }
     public long SettledReturnAmount { get; set; }
     public long PendingReturnBatchAmount { get; set; }
+    public long? BulkCollectionOwnedBaseline { get; set; }
     public int OfferedMaxStackSize { get; set; }
     public int WantedMaxStackSize { get; set; }
 

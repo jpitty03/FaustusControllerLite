@@ -51,11 +51,20 @@ public sealed record RoutePlannerRequest(
     string AreaId,
     long MinimumProfitChaos = 5,
     long? ExpectedGoldPerLeg = null,
-    int MaximumCompetingEdges = 2,
+    int MaximumCompetingEdges = RoutePlannerRequest.DefaultMaximumCompetingEdges,
     bool EnableDirectDivineCycles = false,
     long MaximumDirectDivinePrincipal = 1_000,
     bool PrioritizeValuedProfit = false,
-    bool EnableCompetingPriceImprovement = false);
+    bool EnableCompetingPriceImprovement = false)
+{
+    /// <summary>
+    /// The user-approved scope of 2026-07-31: a route may contain up to two sequential competing legs.
+    /// Named rather than written as a literal because a caller that deliberately deviates - a sweep-owned
+    /// trade forces 0, so that every leg is crossed - still has to be able to say "the ordinary cap"
+    /// without restating the number and drifting from it.
+    /// </summary>
+    public const int DefaultMaximumCompetingEdges = 2;
+}
 
 public enum RouteCycleKind
 {

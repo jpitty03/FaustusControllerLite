@@ -840,6 +840,7 @@ public sealed class TrackedOrderCollectionController
         PendingWantedBatchAmount = source.PendingWantedBatchAmount,
         SettledReturnAmount = source.SettledReturnAmount,
         PendingReturnBatchAmount = source.PendingReturnBatchAmount,
+        BulkCollectionOwnedBaseline = source.BulkCollectionOwnedBaseline,
         OfferedMaxStackSize = source.OfferedMaxStackSize,
         WantedMaxStackSize = source.WantedMaxStackSize
     };

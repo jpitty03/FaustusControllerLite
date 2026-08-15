@@ -27,12 +27,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private readonly CanceledReturnCollectionController _canceledReturnCollection = new();
     private readonly AutomatedProbeController _collectionOwnershipSelector = new();
     private readonly Dictionary<string, OwnershipObservation> _liveOwnedByMetadata = new(StringComparer.Ordinal);
-    // The pair column carries two full names. The overlay font runs about 8.6px per character at this size
-    // (the nine numeric columns behind it are sized on the same ratio), and the widest cell the sweep can
-    // produce is 50 characters - the longest scarab name against "Divine Orb" - so 440px covers it with a
-    // little slack. Every later column shifted by the same amount; the headings ride the same offsets.
+    // The cycle column carries a whole loop label. The overlay font runs about 8.6px per character at this
+    // size (the columns behind it are sized on the same ratio), and MarketSweepCycle.LabelLength caps the
+    // cell at 46 characters, so 400px covers it with a little slack. "mode" is three characters and gets the
+    // narrowest slot; the two triplet columns near the end ("queues", "turn") are wider than the single
+    // numbers before them because each holds three values. The board now ends near 1130px - if that runs off
+    // the right edge at your resolution, this array is the one place to adjust.
+    // The headings ride these same offsets, so a column added to ColumnHeadings needs an offset here too.
     private static readonly float[] BoardColumnOffsets =
-        [0f, 440f, 500f, 550f, 605f, 680f, 760f, 840f, 900f, 950f];
+        [0f, 400f, 440f, 495f, 550f, 605f, 670f, 740f, 795f, 925f, 1040f];
 
     private readonly AutomatedProbeController _marketSweepProbe = new();
     private readonly MarketSweepQueue _marketSweepQueue = new();
@@ -40,14 +43,32 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private IReadOnlyList<TradableName> _tradableNames = [];
     private string _tradablesFailure = string.Empty;
     private TradablesResolution? _tradablesResolution;
+    private MarketSweepScope _marketSweepScope = MarketSweepScope.Full;
     private MarketSweepStep? _marketSweepProbeStep;
+    // Targets this sweep has already handed to the workflow. A target enters the set the moment it is
+    // picked, before the trade is even authorized, so one press of a sweep hotkey can spend on a given
+    // target at most once however that trade turns out. It is what bounds an unattended run: without it a
+    // stale row - and every row is stale the instant its own books have been traded against - would re-arm
+    // on the very next tick.
+    private readonly HashSet<string> _sweepTradeDeclined = new(StringComparer.Ordinal);
+    private bool _sweepTradeActive;
+    private string _sweepTradeLabel = string.Empty;
+    // Why nothing was traded, held until it changes. _marketSweepStatus cannot carry this: the next capture
+    // overwrites it within a tick, so a refusal there is invisible in practice and the operator is left
+    // reading "Sweeping <pair>" while every arm is being turned down for the same reason.
+    private string _sweepTradeNote = string.Empty;
+    private bool _sweepTradeNoteIsRefusal;
+    private static readonly IReadOnlySet<string> NoDeclinedTargets =
+        new HashSet<string>(StringComparer.Ordinal);
     private Guid _marketSweepSessionId = Guid.NewGuid();
     private DateTimeOffset _nextIdleSweepUtc;
     private DateTimeOffset _nextMarketSweepAttemptUtc;
     private string _observationLoadBlockedLeague = string.Empty;
     private string _marketSweepStatus = "Idle; the market sweep board is off.";
-    private IReadOnlyList<MarketSweepRow> _boardRows = [];
-    private MarketSweepBoardSort _boardSort = MarketSweepBoardSort.Score;
+    private IReadOnlyList<MarketSweepCycle> _boardRows = [];
+    private int _boardHiddenCount;
+    private string _boardEmptyNote = string.Empty;
+    private MarketSweepBoardSort _boardSort = MarketSweepBoardSort.ChaosPerHour;
     private bool _boardDirty = true;
     private DateTimeOffset _nextBoardRefreshUtc;
     private ExecutionHistoryStatistics _executionHistory = ExecutionHistoryStatistics.Empty;
@@ -156,6 +177,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         bool DirectDivineCyclesEnabled,
         long MaximumDirectDivinePrincipal,
         bool CompetingPriceImprovementEnabled,
+        int MaximumCompetingEdges,
         CurrencyIdentity From,
         CurrencyIdentity To,
         QuoteExecutionIntent ExecutionIntent,
@@ -377,7 +399,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             // exactly like the SDK dump hotkey. It places nothing and touches no bankroll state.
             if (Settings.MarketSweepHotkey.PressedOnce())
             {
-                HandleMarketSweepHotkey();
+                HandleMarketSweepHotkey(MarketSweepScope.Full);
+            }
+            if (Settings.ProfitableMarketSweepHotkey.PressedOnce())
+            {
+                HandleMarketSweepHotkey(MarketSweepScope.Profitable);
             }
             if (Settings.MarketSweepBoardSortHotkey.PressedOnce())
             {
@@ -675,7 +701,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             y += 10f;
             DrawStatus(
-                $"MARKET SWEEP BOARD - sorted by {MarketSweepScore.DescribeSort(_boardSort)} - {_marketSweepStatus}",
+                $"MARKET SWEEP BOARD - cycles by {MarketSweepScore.DescribeSort(_boardSort)} - " +
+                $"{_boardRows.Count} cycles, {DescribeHidden()} - {_marketSweepStatus}",
                 ref y,
                 SharpDX.Color.Cyan);
             if (_tradablesResolution is { } resolution)
@@ -706,6 +733,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     SharpDX.Color.Yellow);
             }
 
+            // A sweep that is allowed to trade must say why it is not trading. Silence and "nothing
+            // qualified" look identical from the overlay otherwise, and they need very different responses.
+            if (Settings.TradeDuringSweep.Value && _sweepTradeNote.Length > 0)
+            {
+                DrawStatus(
+                    $"  {_sweepTradeNote}",
+                    ref y,
+                    _sweepTradeNoteIsRefusal ? SharpDX.Color.Yellow : SharpDX.Color.Gray);
+            }
+
             DrawRow(MarketSweepScore.ColumnHeadings, ref y, SharpDX.Color.Gray);
             var rowCount = Math.Min(Settings.SweepBoardRowCount.Value, _boardRows.Count);
             for (var index = 0; index < rowCount; index++)
@@ -713,11 +750,17 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 DrawRow(MarketSweepScore.FormatRow(_boardRows[index]), ref y, SharpDX.Color.White);
             }
 
-            if (_boardRows.Count == 0)
+            // An empty board after a sweep is usually correct rather than broken - turnover needs two
+            // observations of a pair - so the note names the specific reason instead of saying "no data".
+            if (_boardRows.Count == 0 && _boardEmptyNote.Length > 0)
             {
-                DrawStatus("  No observations yet; sweep a category to fill the board.", ref y, SharpDX.Color.Gray);
+                DrawStatus($"  {_boardEmptyNote}", ref y, SharpDX.Color.Gray);
             }
         }
+
+        string DescribeHidden() => Settings.EnableCycleHealthFilter.Value
+            ? $"{_boardHiddenCount} hidden as thin or unprofitable"
+            : "health filter off";
 
         static string Ready(bool ready) => ready ? "ready" : "missing";
         static string EmptyAsNone(string value) => string.IsNullOrEmpty(value) ? "None" : value;
@@ -1333,10 +1376,29 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             : confirmation;
     }
 
+    /// <summary>
+    /// How many legs of the route being planned may rest in a queue rather than cross the spread.
+    ///
+    /// A sweep-owned trade forces zero. A <c>TTT</c> row is precisely the claim that all three legs can be
+    /// crossed this second, and it is the only kind of row the sweep arms on; a maker leg would turn that
+    /// into a queue wait with a timeout and a cancellation path, which is a different trade from the one the
+    /// board priced. With direct Divine cycles enabled those routes drop out on their own - they need two
+    /// competing legs - which is the right outcome and needs no special case.
+    ///
+    /// Read from one place because the planner, the placement token and the token's revalidation must all
+    /// agree; a token planned all-taker that is then placed under the ordinary cap is exactly the drift the
+    /// token exists to catch.
+    /// </summary>
+    private int MaximumCompetingEdgesForCurrentRoute =>
+        _sweepTradeActive ? 0 : RoutePlannerRequest.DefaultMaximumCompetingEdges;
+
     private void RefuseWizardBlockedStart(string action)
     {
-        _lastFailure = $"{action} is blocked while a calibration wizard step is active; finish all six steps or change area first.";
+        _lastFailure = DescribeWizardBlockedStart(action);
     }
+
+    private static string DescribeWizardBlockedStart(string action) =>
+        $"{action} is blocked while a calibration wizard step is active; finish all six steps or change area first.";
 
     private void ArmPickerCalibration(bool? expectedWantedSide = null)
     {
@@ -1631,10 +1693,25 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         }
                         else
                         {
+                            // Read the reason out before revoking. Later in this same tick the staging
+                            // controller - already invalidated by the recalculation above - hands its own
+                            // reason to _lastFailure, so a revocation that does not record its cause here
+                            // leaves the log naming the housekeeping instead of the failure. Workflow
+                            // 57804195 stopped between its legs on 2026-08-14 and the only thing written
+                            // was "Candidate was recalculated."
+                            var abandonment = string.IsNullOrWhiteSpace(_lastFailure) || _lastFailure == "None"
+                                ? "Workflow preparation failed after a fresh probe."
+                                : _lastFailure;
                             _fullWorkflowAuthorized = false;
                             _workflowAuthorization = null;
                             _startingNewWorkflow = false;
                             _nextWorkflowScanAtUtc = null;
+                            RecordContinuousAuthorizationRevoked(
+                                _bankroll.Workflow?.IsActive == true
+                                    ? $"Workflow {_bankroll.Workflow.WorkflowId:D} abandoned at leg " +
+                                      $"{_bankroll.Workflow.CurrentLegIndex + 1} of " +
+                                      $"{_bankroll.Workflow.Legs.Count}: {abandonment}"
+                                    : abandonment);
                         }
                     }
                 }
@@ -2488,8 +2565,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         {
             return retryableClosing ? WorkflowRefreshResult.RetryableUnavailable : WorkflowRefreshResult.Failed;
         }
+        // Retryability here follows the failure, not the leg. TryGetWorkflowSpendCap recommends a retry
+        // only for a missing or unstable live ownership read, which is a picker-timing fact about the tick
+        // and says nothing about which leg is being planned; gating it on retryableClosing turned one
+        // unlucky read on a ChaosRealization leg into a permanently abandoned workflow holding 149 scarabs.
+        // The reprobe budget in TryRecoverTransientWorkflowPreparation still bounds it.
         if (!TryGetWorkflowSpendCap(workflow, out var spendCap, out var spendCapRetryRecommended, out failure))
-            return retryableClosing && spendCapRetryRecommended
+            return spendCapRetryRecommended
                 ? WorkflowRefreshResult.RetryableUnavailable
                 : WorkflowRefreshResult.Failed;
         var refresh = WorkflowCoordinator.TryRefreshRemainingPlan(
@@ -2504,12 +2586,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             out failure,
             enableCompetingPriceImprovement: Settings.EnableCompetingPriceImprovement.Value);
         if (refresh != WorkflowRefreshResult.Refreshed || currentLeg is null) return refresh;
+        // Every way this validation says no is a fact about this tick, not about the plan: a snapshot the
+        // picker could not read, a stack still sitting in inventory from the leg that just settled, no free
+        // slot right now. Before the first leg that is a clean refusal to start. After it, the principal is
+        // already in the intermediate currency and there is no one left to drive the cycle once
+        // authorization drops, so the same momentary reading must reprobe instead of stranding the position.
         if (!TryValidateWorkflowInventoryCapacity(
                 refreshed.Legs.Skip(refreshed.CurrentLegIndex).Select(leg =>
                     (leg.FromMetadata, leg.ToMetadata, leg.InputSpent, leg.Output)),
                 out failure))
         {
-            return WorkflowRefreshResult.Failed;
+            return workflow.CurrentLegIndex > 0
+                ? WorkflowRefreshResult.RetryableUnavailable
+                : WorkflowRefreshResult.Failed;
         }
         try
         {
@@ -2948,6 +3037,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                     Settings.EnableDirectDivineCycles.Value,
                     Settings.MaximumDirectDivinePrincipal.Value,
                     Settings.EnableCompetingPriceImprovement.Value,
+                    MaximumCompetingEdgesForCurrentRoute,
                     leg.Edge.From,
                     leg.Edge.To,
                     leg.Edge.ExecutionIntent,
@@ -2966,7 +3056,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             !string.IsNullOrWhiteSpace(_singleLegStaging.Failure))
         {
             _operationStatus = _singleLegStaging.Status;
-            _lastFailure = _singleLegStaging.Failure;
+            // Dropping a staged leg because its plan was recomputed is bookkeeping, not a failure, and
+            // claiming _lastFailure for it buries whatever actually went wrong earlier in the tick.
+            if (!_singleLegStaging.FailureIsRoutineInvalidation)
+            {
+                _lastFailure = _singleLegStaging.Failure;
+            }
             if (_placementPreparation == PlacementPreparationState.Restaging)
             {
                 _placementPreparation = PlacementPreparationState.Idle;
@@ -3064,15 +3159,36 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             StopFullWorkflowLocal("Second workflow hotkey stopped local automation; any server-side order remains tracked.");
             return;
         }
+
+        if (!TryAuthorizeFullWorkflow("Full-workflow hotkey", out var failure))
+        {
+            _lastFailure = failure;
+            return;
+        }
+
+        BeginAuthorizedWorkflow();
+    }
+
+    /// <summary>
+    /// Every precondition full-workflow trading demands, followed by the authorization itself. There is
+    /// exactly one copy because there is now more than one way to reach it - the hotkey, and a sweep that
+    /// found a cycle it may trade. A second hand-written copy of these checks is a copy that silently falls
+    /// behind this one, and what it would fall behind on is whether the plugin may spend money.
+    ///
+    /// <paramref name="origin"/> only names the caller in the <c>WorkflowAuthorizationStarted</c> diagnostic,
+    /// so a run can be attributed after the fact. It never changes what is checked.
+    /// </summary>
+    private bool TryAuthorizeFullWorkflow(string origin, out string failure)
+    {
         if (CalibrationWizard.IsBlocking(_calibrationWizard))
         {
-            RefuseWizardBlockedStart("Full workflow start");
-            return;
+            failure = DescribeWizardBlockedStart("Full workflow start");
+            return false;
         }
         if (TryGetHotkeyConflict(out var conflict))
         {
-            _lastFailure = conflict;
-            return;
+            failure = conflict;
+            return false;
         }
         var permissions = PermissionSnapshot.From(Settings);
         var ui = GameController.Game.IngameState.IngameUi;
@@ -3081,33 +3197,33 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ui.CurrencyExchangePanel.CurrencyPicker.IsVisible || ui.PopUpWindow.IsVisible ||
             !ui.StashElement.IsVisible || !ui.InventoryPanel.IsVisible)
         {
-            _lastFailure = "Full workflow requires every input permission, exclusive Lite ownership, foreground exchange/stash/inventory, closed picker, and no popup.";
-            return;
+            failure = "Full workflow requires every input permission, exclusive Lite ownership, foreground exchange/stash/inventory, closed picker, and no popup.";
+            return false;
         }
         if (!_pickerCalibration.IsComplete || !_pickerCalibration.IsPlacementComplete ||
             !_pickerCalibration.IsCollectionComplete || !_pickerCalibration.IsCancellationComplete ||
             !_pickerCalibration.IsReturnCollectionComplete || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
             !_bankroll.IsInitialized || IsAnyInputOperationActive())
         {
-            _lastFailure = "Full workflow requires every picker/order calibration, readable initialized state, and no active input operation.";
-            return;
+            failure = "Full workflow requires every picker/order calibration, readable initialized state, and no active input operation.";
+            return false;
         }
         if (_bankroll.Workflow?.Phase == WorkflowExecutionPhase.LegActive &&
             _bankroll.Workflow.CurrentAttemptId != _trackedOrderState?.AttemptId)
         {
-            _lastFailure = "Active workflow and tracked-order identity disagree; manual reconciliation is required.";
-            return;
+            failure = "Active workflow and tracked-order identity disagree; manual reconciliation is required.";
+            return false;
         }
         if (_bankroll.Workflow?.IsActive == true && !WorkflowUsesCurrentCurrencies(_bankroll.Workflow))
         {
-            _lastFailure = "Persisted workflow currencies do not match the configured target; recovery is blocked.";
-            return;
+            failure = "Persisted workflow currencies do not match the configured target; recovery is blocked.";
+            return false;
         }
         if (_bankroll.Workflow?.IsActive != true &&
             (_bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true))
         {
-            _lastFailure = "A new workflow cannot start while an unrelated tracked order is unresolved.";
-            return;
+            failure = "A new workflow cannot start while an unrelated tracked order is unresolved.";
+            return false;
         }
 
         _fullWorkflowAuthorized = true;
@@ -3116,7 +3232,18 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _workflowPreparationRetryCount = 0;
         _lastFailure = "None";
         _lastLoggedFailure = null;
-        AppendRuntimeDiagnostic("WorkflowAuthorizationStarted", "Full-workflow hotkey authorization accepted.");
+        AppendRuntimeDiagnostic("WorkflowAuthorizationStarted", $"{origin} authorization accepted.");
+        failure = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// What a fresh authorization does next: resume a durable workflow, replace an unstarted leg-1 route, or
+    /// probe for a new one. Split from <see cref="TryAuthorizeFullWorkflow"/> so a caller can decide between
+    /// the two only once, and never so it can skip either.
+    /// </summary>
+    private void BeginAuthorizedWorkflow()
+    {
         if (_bankroll.Workflow?.IsActive == true)
         {
             if (WorkflowCoordinator.CanReplaceBeforeFirstPlacement(
@@ -3275,6 +3402,21 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                                 "scanning for the next route."
                         : $"Workflow stopped safely: {workflow.Detail}; scanning for the next route.";
                 }
+                // One cycle per sweep-owned trade session. Discovery belongs to the sweep, so the loop
+                // hands the panel back here instead of scanning for another route: with workflow state
+                // settled this is the only boundary at which nothing is owed and nothing is in flight.
+                //
+                // A null workflow means the scan found no acceptable route - the board estimate did not
+                // survive the exact planner. The session ends the same way rather than spending the
+                // ten-reprobe budget holding the panel for a row that has already been re-quoted once.
+                if (_sweepTradeActive)
+                {
+                    EndAuthorizedWorkflow(workflow is not null
+                        ? $"Sweep trade finished: {_sweepTradeLabel}."
+                        : $"Sweep trade for {_sweepTradeLabel} placed nothing: no route cleared the " +
+                          "planner from a fresh coherent probe.");
+                    return;
+                }
                 _startingNewWorkflow = true;
                 _workflowPreparedLeg = null;
                 StartWorkflowProbe();
@@ -3341,6 +3483,25 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     /// plugin that logged nothing is indistinguishable from one that is still working.
     /// No server-side order state is touched here.
     /// </summary>
+    /// <summary>
+    /// Ends an authorized loop that has nothing left to do, as opposed to one that has gone wrong.
+    /// <see cref="StopFullWorkflowLocal"/> records its reason as the current failure, which is right for a
+    /// stop and wrong for a finish - a finished trade must not leave a failure on screen or in the runtime
+    /// log. Nothing is aborted here because the loop only reaches this boundary with canonical state settled
+    /// and no input operation running.
+    /// </summary>
+    private void EndAuthorizedWorkflow(string reason)
+    {
+        _fullWorkflowAuthorized = false;
+        _workflowAuthorization = null;
+        _workflowPreparedLeg = null;
+        _startingNewWorkflow = false;
+        _nextWorkflowScanAtUtc = null;
+        _operationStatus = reason;
+        _lastFailure = "None";
+        RecordContinuousAuthorizationRevoked(reason);
+    }
+
     private void RecordContinuousAuthorizationRevoked(string reason)
     {
         _operationStatus = reason;
@@ -3814,7 +3975,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             token.MinimumProfitChaos != Settings.MinimumProfitChaos.Value ||
             token.DirectDivineCyclesEnabled != Settings.EnableDirectDivineCycles.Value ||
             token.MaximumDirectDivinePrincipal != Settings.MaximumDirectDivinePrincipal.Value ||
-            token.CompetingPriceImprovementEnabled != Settings.EnableCompetingPriceImprovement.Value)
+            token.CompetingPriceImprovementEnabled != Settings.EnableCompetingPriceImprovement.Value ||
+            token.MaximumCompetingEdges != MaximumCompetingEdgesForCurrentRoute)
         {
             failure = "Fresh placement preparation expired or its session/settings changed; begin again.";
             return false;
@@ -4400,6 +4562,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
+        if (_trackedOrderState.BulkCollectionOwnedBaseline is not null)
+        {
+            StartTrackedCollectionBatch(TrackedOrderLifecycle.ExpectedBulkOwned(_trackedOrderState));
+            return;
+        }
+
         StartCollectionOwnershipRead(CollectionFlowState.ReadingBaseline);
     }
 
@@ -4973,9 +5141,121 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
+        if (_trackedOrderState.Status == TrackedOrderStatus.Collected &&
+            _trackedOrderState.BulkCollectionOwnedBaseline is not null &&
+            _stashTransferMetadata == _trackedOrderState.WantedMetadata)
+        {
+            StartStashTransfer(TrackedOrderLifecycle.ExpectedBulkOwned(_trackedOrderState));
+            return;
+        }
+
         StartCollectionOwnershipRead(_trackedOrderState.Status != TrackedOrderStatus.Collected
             ? CollectionFlowState.ReadingStashRecovery
             : CollectionFlowState.ReadingStashBaseline, _stashTransferMetadata);
+    }
+
+    private void StartTrackedCollectionBatch(long aggregateOwnedBefore)
+    {
+        if (!InventoryStashTransferController.TryReadSnapshot(
+                GameController, _trackedOrderState!.WantedMetadata,
+                GetStaticMaxStackSize(_trackedOrderState.WantedMetadata), out var inventory, out var failure) ||
+            inventory.TargetInventoryAmount != 0)
+        {
+            AbortCollectionFlow(string.IsNullOrEmpty(failure)
+                ? "Collection requires zero pre-existing wanted currency in inventory for exact custody."
+                : failure);
+            return;
+        }
+        if (!InventoryTransferEvidence.TryGetConservativeCollectionCapacity(
+                inventory with
+                {
+                    TargetMaxStackSize = inventory.TargetMaxStackSize > 0
+                        ? inventory.TargetMaxStackSize
+                        : _trackedOrderState.WantedMaxStackSize
+                }, out var capacity, out failure))
+        {
+            AbortCollectionFlow(failure);
+            return;
+        }
+        var remainingProceeds = _trackedOrderState.TerminalReceivedWantedAmount is null
+            ? _trackedOrderState.WantedAmount
+            : TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState);
+        if (inventory.TargetMaxStackSize <= 0 && _trackedOrderState.WantedMaxStackSize <= 0 &&
+            remainingProceeds > capacity)
+        {
+            AbortCollectionFlow(
+                $"First acquisition of {_trackedOrderState.WantedMetadata} exceeds the {capacity}-unit " +
+                "capacity provable without trusted maximum-stack evidence.");
+            return;
+        }
+        _collectionBatchAmount = Math.Min(capacity, remainingProceeds);
+        if (_collectionBatchAmount <= 0)
+        {
+            AbortCollectionFlow("No verified free inventory capacity was available for a collection batch.");
+            return;
+        }
+        if (!_trackedCollection.Start(
+                GameController,
+                _trackedOrderState,
+                _pickerCalibration,
+                CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
+                IsFullFaustusControllerEnabled(),
+                Settings.CursorTweenSpeed.Value,
+                _collectionBatchAmount,
+                aggregateOwnedBefore,
+                PersistTrackedOrder,
+                out failure))
+        {
+            AbortCollectionFlow(failure);
+            return;
+        }
+
+        _collectionOwnedBaseline = aggregateOwnedBefore;
+        _collectionFlow = CollectionFlowState.ClickingTrackedOrder;
+        _operationStatus = $"Collecting exact batch {_collectionBatchAmount}; aggregate owned is expected to advance from {aggregateOwnedBefore}.";
+    }
+
+    private void StartStashTransfer(long aggregateOwnedBefore)
+    {
+        if (!StashCustodyPolicy.IsSupported(_stashTransferMetadata))
+        {
+            AbortCollectionFlow("Settlement asset has no supported stash custody policy.");
+            return;
+        }
+        if (!_inventoryStashTransfer.Start(
+                GameController,
+                _trackedOrderState!,
+                StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
+                IsFullFaustusControllerEnabled(),
+                Settings.CursorTweenSpeed.Value,
+                _stashTransferMetadata,
+                _stashTransferAmount,
+                aggregateOwnedBefore,
+                GetStaticMaxStackSize(_stashTransferMetadata),
+                PersistTrackedOrder,
+                out var failure))
+        {
+            AbortCollectionFlow(failure);
+            return;
+        }
+
+        _collectionOwnedBaseline = aggregateOwnedBefore;
+        _collectionFlow = CollectionFlowState.TransferringToStash;
+        _operationStatus = _inventoryStashTransfer.CustodyMode == StashCustodyMode.AffinityAggregate
+            ? $"Moving exact collected amount through configured stash affinity; aggregate expected {aggregateOwnedBefore}."
+            : $"Moving exact collected amount to the visible home stash tab; aggregate expected {aggregateOwnedBefore}.";
+    }
+
+    private bool BulkStashCompletesSettlement()
+    {
+        if (_trackedOrderState?.BulkCollectionOwnedBaseline is null ||
+            _trackedOrderState.StashTransferIntent is not { } intent ||
+            intent.Metadata != _trackedOrderState.WantedMetadata)
+        {
+            return false;
+        }
+
+        return TrackedOrderLifecycle.BulkWantedStashCompletesSettlement(_trackedOrderState);
     }
 
     private void StartCollectionOwnershipRead(CollectionFlowState phase, string? metadata = null)
@@ -5039,63 +5319,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
             if (_collectionFlow == CollectionFlowState.ReadingBaseline)
             {
-                _collectionOwnedBaseline = owned;
-                if (!InventoryStashTransferController.TryReadSnapshot(
-                        GameController, _trackedOrderState!.WantedMetadata,
-                        GetStaticMaxStackSize(_trackedOrderState.WantedMetadata), out var inventory, out failure) ||
-                    inventory.TargetInventoryAmount != 0)
+                var tracked = TrackedOrderCollectionController.CloneTracked(
+                    _trackedOrderState!, _trackedOrderState!.Status,
+                    $"Bulk collection armed from aggregate owned baseline {owned}.");
+                tracked.BulkCollectionOwnedBaseline = owned;
+                if (!PersistTrackedOrder(tracked, "BulkCollectionOwnershipBaselineVerified"))
                 {
-                    AbortCollectionFlow(string.IsNullOrEmpty(failure)
-                        ? "Simple collection requires zero pre-existing wanted currency in inventory for exact custody."
-                        : failure);
+                    AbortCollectionFlow("Could not persist the bulk collection ownership baseline.");
                     return;
                 }
-                if (!InventoryTransferEvidence.TryGetConservativeCollectionCapacity(
-                        inventory with
-                        {
-                            TargetMaxStackSize = inventory.TargetMaxStackSize > 0
-                                ? inventory.TargetMaxStackSize
-                                : _trackedOrderState.WantedMaxStackSize
-                        }, out var capacity, out failure))
-                {
-                    AbortCollectionFlow(failure);
-                    return;
-                }
-                var remainingProceeds = _trackedOrderState.TerminalReceivedWantedAmount is null
-                    ? _trackedOrderState.WantedAmount
-                    : TrackedOrderLifecycle.RemainingWantedToCollect(_trackedOrderState);
-                if (inventory.TargetMaxStackSize <= 0 && _trackedOrderState.WantedMaxStackSize <= 0 &&
-                    remainingProceeds > capacity)
-                {
-                    AbortCollectionFlow(
-                        $"First acquisition of {_trackedOrderState.WantedMetadata} exceeds the {capacity}-unit " +
-                        "capacity provable without trusted maximum-stack evidence.");
-                    return;
-                }
-                _collectionBatchAmount = Math.Min(capacity, remainingProceeds);
-                if (_collectionBatchAmount <= 0)
-                {
-                    AbortCollectionFlow("No verified free inventory capacity was available for a collection batch.");
-                    return;
-                }
-                if (!_trackedCollection.Start(
-                        GameController,
-                        _trackedOrderState!,
-                        _pickerCalibration,
-                        CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
-                        IsFullFaustusControllerEnabled(),
-                        Settings.CursorTweenSpeed.Value,
-                        _collectionBatchAmount,
-                        _collectionOwnedBaseline,
-                        PersistTrackedOrder,
-                        out failure))
-                {
-                    AbortCollectionFlow(failure);
-                    return;
-                }
-
-                _collectionFlow = CollectionFlowState.ClickingTrackedOrder;
-                _operationStatus = $"Pre-collection owned count {_collectionOwnedBaseline}; collecting one exact batch of {_collectionBatchAmount}.";
+                StartTrackedCollectionBatch(owned);
             }
             else if (_collectionFlow == CollectionFlowState.ReadingAfter)
             {
@@ -5110,33 +5343,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
             else if (_collectionFlow == CollectionFlowState.ReadingStashBaseline)
             {
-                _collectionOwnedBaseline = owned;
-                if (!StashCustodyPolicy.IsSupported(_stashTransferMetadata))
-                {
-                    AbortCollectionFlow("Settlement asset has no supported stash custody policy.");
-                    return;
-                }
-                if (!_inventoryStashTransfer.Start(
-                        GameController,
-                        _trackedOrderState!,
-                        StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
-                        IsFullFaustusControllerEnabled(),
-                        Settings.CursorTweenSpeed.Value,
-                        _stashTransferMetadata,
-                        _stashTransferAmount,
-                        owned,
-                        GetStaticMaxStackSize(_stashTransferMetadata),
-                        PersistTrackedOrder,
-                        out failure))
-                {
-                    AbortCollectionFlow(failure);
-                    return;
-                }
-
-                _collectionFlow = CollectionFlowState.TransferringToStash;
-                _operationStatus = _inventoryStashTransfer.CustodyMode == StashCustodyMode.AffinityAggregate
-                    ? $"Pre-transfer owned count {owned}; moving exact collected amount through configured stash affinity."
-                    : $"Pre-transfer owned count {owned}; moving exact collected amount to the visible home stash tab.";
+                StartStashTransfer(owned);
             }
             else if (_collectionFlow == CollectionFlowState.ReadingStashAfter)
             {
@@ -5211,7 +5418,15 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         if (_trackedCollection.State == TrackedCollectionState.CollectedEvidence)
         {
-            StartCollectionOwnershipRead(CollectionFlowState.ReadingAfter);
+            if (_trackedOrderState?.BulkCollectionOwnedBaseline is not null)
+            {
+                SettleVerifiedCollection(checked(
+                    TrackedOrderLifecycle.ExpectedBulkOwned(_trackedOrderState) + _collectionBatchAmount));
+            }
+            else
+            {
+                StartCollectionOwnershipRead(CollectionFlowState.ReadingAfter);
+            }
         }
         else if (_trackedCollection.State is TrackedCollectionState.Ambiguous or TrackedCollectionState.Cancelled)
         {
@@ -5321,7 +5536,21 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         if (_inventoryStashTransfer.State == InventoryStashTransferState.TransferEvidence)
         {
-            StartCollectionOwnershipRead(CollectionFlowState.ReadingStashAfter, _stashTransferMetadata);
+            if (_trackedOrderState?.BulkCollectionOwnedBaseline is not null)
+            {
+                if (BulkStashCompletesSettlement())
+                {
+                    StartCollectionOwnershipRead(CollectionFlowState.ReadingStashAfter, _stashTransferMetadata);
+                }
+                else
+                {
+                    SettleVerifiedStashTransfer(_collectionOwnedBaseline, aggregateOwnershipVerified: false);
+                }
+            }
+            else
+            {
+                StartCollectionOwnershipRead(CollectionFlowState.ReadingStashAfter, _stashTransferMetadata);
+            }
         }
         else if (_inventoryStashTransfer.State is InventoryStashTransferState.Ambiguous or
                  InventoryStashTransferState.Cancelled)
@@ -5330,7 +5559,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
-    private void SettleVerifiedStashTransfer(long observedOwned)
+    private void SettleVerifiedStashTransfer(long observedOwned, bool aggregateOwnershipVerified = true)
     {
         if (_trackedOrderState?.Status != TrackedOrderStatus.StashTransferArmed ||
             _trackedOrderState.StashTransferIntent is not { } intent)
@@ -5351,9 +5580,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             MarkStashTransferAmbiguous("Stash intent did not match the exact pending collection batch.");
             return;
         }
-        var custodyDetail = intent.StashCustodyMode == StashCustodyMode.AffinityAggregate
-            ? "left inventory through configured affinity while visible Currency Stash and aggregate ownership remained unchanged"
-            : "left inventory, increased visible Currency Stash exactly, and retained unchanged aggregate ownership";
+        var custodyDetail = aggregateOwnershipVerified
+            ? intent.StashCustodyMode == StashCustodyMode.AffinityAggregate
+                ? "left inventory through configured affinity and aggregate ownership remained unchanged"
+                : "left inventory, increased visible Currency Stash exactly, and retained unchanged aggregate ownership"
+            : intent.StashCustodyMode == StashCustodyMode.AffinityAggregate
+                ? "left inventory through configured affinity with exact local visible-or-hidden destination evidence"
+                : "left inventory and increased visible Currency Stash exactly";
         var stashed = TrackedOrderCollectionController.CloneTracked(
             _trackedOrderState,
             TrackedOrderStatus.Collected,
@@ -5386,6 +5619,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         var remainingToCollect = TrackedOrderLifecycle.RemainingToCollect(stashed);
         var allStashed = postStashStatus == TrackedOrderStatus.Stashed;
         stashed.Status = postStashStatus;
+        if (allStashed) stashed.BulkCollectionOwnedBaseline = null;
         var eventType = allStashed ? "TerminalAssetsStashedAndVerified" : "CollectionBatchStashProgressVerified";
         if (!PersistTrackedOrder(stashed, eventType))
         {
@@ -5483,6 +5717,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
             var allStashed = postStashStatus == TrackedOrderStatus.Stashed;
             stashed.Status = postStashStatus;
+            if (allStashed) stashed.BulkCollectionOwnedBaseline = null;
             if (!PersistTrackedOrder(stashed, allStashed
                     ? "TerminalAssetsStashRecoveredAndVerified"
                     : "CollectionBatchStashProgressRecovered"))
@@ -5786,6 +6021,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             Binding(nameof(Settings.SellSweepHotkey), Settings.SellSweepHotkey),
             Binding(nameof(Settings.MarketSweepHotkey), Settings.MarketSweepHotkey),
             Binding(nameof(Settings.MarketSweepBoardSortHotkey), Settings.MarketSweepBoardSortHotkey),
+            Binding(nameof(Settings.ProfitableMarketSweepHotkey), Settings.ProfitableMarketSweepHotkey),
         };
         var duplicate = bindings
             .Where(binding => binding.Active)
@@ -6049,6 +6285,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _manualProbeSessionId.ToString("D"),
                 area.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 Settings.MinimumProfitChaos.Value,
+                MaximumCompetingEdges: MaximumCompetingEdgesForCurrentRoute,
                 EnableDirectDivineCycles: Settings.EnableDirectDivineCycles.Value,
                 MaximumDirectDivinePrincipal: Settings.MaximumDirectDivinePrincipal.Value,
                 PrioritizeValuedProfit: Settings.EnableDirectDivineCycles.Value,
@@ -6474,6 +6711,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     // calls LatestRateStore.Store or Save, never reads or writes bankroll state, and never places an
     // order, so the route planner cannot see it and a sweep capture can never age out a real quote.
 
+    /// <summary>
+    /// How much of the tradables list a sweep walks. Both scopes run the identical queue, probe and
+    /// observation path; the scope only decides which targets <c>MarketSweepQueue.Build</c> is handed.
+    /// </summary>
+    private enum MarketSweepScope
+    {
+        Full,
+        Profitable,
+    }
+
     private sealed record MarketSweepPlan(
         IReadOnlyList<TradableEntry> Targets,
         CurrencyIdentity Chaos,
@@ -6509,11 +6756,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
     }
 
-    private void HandleMarketSweepHotkey()
+    /// <summary>
+    /// Arms a sweep, or stops the running one. Either sweep hotkey stops whatever is running rather than
+    /// switching scope mid-run: the queue is a frozen list of steps and a half-finished survey whose scope
+    /// changed underneath it would report progress against a plan that no longer exists.
+    /// </summary>
+    private void HandleMarketSweepHotkey(MarketSweepScope scope)
     {
         if (_marketSweepQueue.IsRunning || _marketSweepProbeStep is not null)
         {
-            StopMarketSweep("Market sweep stopped by hotkey.");
+            // The scope only names a queued sweep. A lone probe in flight with no queue behind it is an
+            // idle-sweep sample, which has no scope and must not inherit the last armed one.
+            var stopped = _marketSweepQueue.IsRunning ? _marketSweepScope : MarketSweepScope.Full;
+            StopMarketSweep($"{DescribeScope(stopped)} stopped by hotkey.");
             return;
         }
 
@@ -6536,18 +6791,45 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
+        // Read off the board rather than off the observation store: the board is the ranked, cycle-closed
+        // view, and a target is only worth re-observing because of the loop it completes. The set is taken
+        // once, here - TryStart copies the built steps, so captures landing during the run re-rank the
+        // board without growing or shrinking the sweep that is executing.
+        var targets = plan.Targets;
+        if (scope == MarketSweepScope.Profitable)
+        {
+            targets = MarketSweepQueue.SelectProfitableTargets(plan.Targets, _boardRows);
+            if (targets.Count == 0)
+            {
+                // TryStart would refuse this too, but as "no enabled tradable resolved", which sends the
+                // operator to the tradables list for a problem that lives on the board.
+                _marketSweepStatus =
+                    "No profitable cycle is on the board yet; run a full sweep first.";
+                return;
+            }
+        }
+
         if (!_marketSweepQueue.TryStart(
-                plan.Targets, plan.Chaos, plan.Divine, IsAnyInputOperationActive(), out var failure))
+                targets, plan.Chaos, plan.Divine, IsAnyInputOperationActive(), out var failure))
         {
             _marketSweepStatus = failure;
             return;
         }
 
+        _marketSweepScope = scope;
         _marketSweepSessionId = Guid.NewGuid();
+        _sweepTradeDeclined.Clear();
+        SetSweepTradeNote(string.Empty, isRefusal: false);
         _nextMarketSweepAttemptUtc = DateTimeOffset.MinValue;
-        _marketSweepStatus =
-            $"Market sweep armed: {_marketSweepQueue.Steps.Count} captures queued ({plan.Resolution.Summary}).";
+        _marketSweepStatus = scope == MarketSweepScope.Profitable
+            ? $"{DescribeScope(scope)} armed: {_marketSweepQueue.Steps.Count} captures over " +
+              $"{targets.Count} profitable targets."
+            : $"{DescribeScope(scope)} armed: {_marketSweepQueue.Steps.Count} captures queued " +
+              $"({plan.Resolution.Summary}).";
     }
+
+    private static string DescribeScope(MarketSweepScope scope) =>
+        scope == MarketSweepScope.Profitable ? "Profitable sweep" : "Market sweep";
 
     private void DriveMarketSweep()
     {
@@ -6571,10 +6853,23 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             RefreshMarketSweepBoard(store, now);
         }
 
+        // The one place a sweep-owned trade is observed to have ended. Authorization is cleared from more
+        // than twenty places - completion, permission change, ambiguity, recovery, reset - and every one of
+        // them means the same thing here, so the session watches the flag rather than trying to be called
+        // from each of them.
+        if (_sweepTradeActive && !_fullWorkflowAuthorized)
+        {
+            EndSweepTradeSession();
+        }
+
         if (_marketSweepProbeStep is not null)
         {
             // The sweep always loses. The moment anything else wants the panel it abandons the capture it
             // is holding rather than finishing it, so the continuous workflow never waits on the board.
+            //
+            // A sweep-owned trade never reaches this branch: it is only ever armed at a capture boundary,
+            // with no probe in flight. That is what lets the sweep be suspended rather than stopped - the
+            // queue is left exactly as it is and the gate below simply holds it.
             if (_fullWorkflowAuthorized || _sweepAuthorized || _automatedProbe.IsRunning ||
                 IsPlacementFlowActive() || IsCollectionFlowActive())
             {
@@ -6601,6 +6896,16 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             return;
         }
 
+        // Trading is considered at the capture boundary, ahead of the next step, and only for a queued
+        // sweep. Idle sweeping (SweepWhileIdle) runs unattended and never trades: unattended autonomous
+        // spending is a far larger commitment than this checkbox, and nobody ticks a box expecting the
+        // plugin to trade while they are away from the keyboard.
+        if (Settings.TradeDuringSweep.Value && _marketSweepQueue.IsRunning && !_sweepTradeActive &&
+            TryArmSweepTrade())
+        {
+            return;
+        }
+
         var step = _marketSweepQueue.Current ?? SelectIdleSweepStep(store, now);
         if (step is null)
         {
@@ -6612,6 +6917,198 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _nextMarketSweepAttemptUtc = now + TimeSpan.FromSeconds(1);
             _marketSweepStatus = $"{step.Describe()}: {failure}";
         }
+    }
+
+    /// <summary>
+    /// Hands the best tradable cycle on the board to the ordinary full workflow, or leaves the sweep alone.
+    /// Returns true only when trading was actually authorized, which is the caller's cue to skip this
+    /// window's capture.
+    ///
+    /// The board contributes a target name and nothing else. Every number it printed is discarded here: the
+    /// route is planned from a fresh coherent three-market probe in exact integers, exactly as it is when the
+    /// operator reads a row and sets the target by hand. A row that has gone stale costs a probe and is
+    /// refused, and cannot be traded on.
+    /// </summary>
+    private bool TryArmSweepTrade()
+    {
+        // The predicate is restated here rather than inherited from the board: EnableCycleHealthFilter
+        // narrows _boardRows by IsHealthy && Multiplier > 1, which this selector also demands, so the two
+        // agree today - but a display toggle must not be what makes them agree, and the sort column must
+        // never decide what is traded.
+        var cycle = MarketSweepAutoTrade.SelectTradableCycle(
+            _boardRows, Settings.MinimumProfitChaos.Value, _sweepTradeDeclined);
+        if (cycle is null)
+        {
+            // The ordinary case. Nothing is placed and nothing is revoked; the sweep just keeps sweeping.
+            SetSweepTradeNote(DescribeNoTradableCycle(), isRefusal: false);
+            return false;
+        }
+
+        // Claimed before anything can refuse it, so a target that fails for a reason the board cannot see is
+        // reported once rather than retried every window for the rest of the sweep.
+        _sweepTradeDeclined.Add(cycle.Target.Metadata);
+
+        if (!FeatureModeGate.IsAllowed(_activeFeature, FeatureActionScope.Arbitrage))
+        {
+            SetSweepTradeNote(
+                $"{cycle.Label} not traded: " +
+                FeatureModeGate.DescribeRefusal(_activeFeature, FeatureActionScope.Arbitrage),
+                isRefusal: true);
+            return false;
+        }
+
+        if (_catalogue is null ||
+            !_catalogue.TryGetTargetByMetadata(cycle.Target.Metadata, out var descriptor) || descriptor is null)
+        {
+            SetSweepTradeNote(
+                $"{cycle.Label} not traded: {cycle.Target.Name} does not resolve to a supported exchange target.",
+                isRefusal: true);
+            return false;
+        }
+
+        // The same unresolved-state facts PersistTargetSelection refuses a manual target change on. The
+        // target must not move while anything is still owed against the old one.
+        if (_bankroll.Workflow?.IsActive == true || _bankroll.HasUnresolvedOrder ||
+            _trackedOrderState?.IsUnresolved == true || _bankrollLoadBlocked || _trackedOrderLoadBlocked ||
+            _startingNewWorkflow)
+        {
+            SetSweepTradeNote(
+                $"{cycle.Label} not traded: {DescribeUnresolvedTradeBlock()}",
+                isRefusal: true);
+            return false;
+        }
+
+        if (!TryAuthorizeFullWorkflow($"Market sweep ({cycle.Label})", out var failure))
+        {
+            SetSweepTradeNote($"{cycle.Label} not traded: {failure}", isRefusal: true);
+            return false;
+        }
+
+        // Retargeting after authorization rather than before it, because a refusal above must leave the
+        // operator's configured target untouched. Nothing observes either value between these two lines -
+        // the probe that reads the target is started by BeginAuthorizedWorkflow below - and the checks
+        // authorization makes against a persisted workflow's currencies cannot fire, since an active
+        // workflow was already excluded.
+        ApplyTargetSelection(descriptor);
+        SetSweepTradeNote(string.Empty, isRefusal: false);
+        _sweepTradeActive = true;
+        _sweepTradeLabel = cycle.Label;
+        _marketSweepStatus =
+            $"Trading {cycle.Label}: {cycle.ProfitChaos:0} chaos estimated, " +
+            $"sweep held at {_marketSweepQueue.Progress}.";
+        BeginAuthorizedWorkflow();
+        return true;
+    }
+
+    private void SetSweepTradeNote(string note, bool isRefusal)
+    {
+        _sweepTradeNote = note;
+        _sweepTradeNoteIsRefusal = isRefusal;
+    }
+
+    /// <summary>
+    /// Why the board produced nothing to trade. Three different situations read identically from the
+    /// overlay - no all-taker row exists, one exists but is too small, or every one has already been spent
+    /// this sweep - and they call for three different responses from the operator, so each is named.
+    /// </summary>
+    private string DescribeNoTradableCycle()
+    {
+        var floor = Settings.MinimumProfitChaos.Value;
+        var qualifying = _boardRows.Count(
+            row => MarketSweepAutoTrade.IsTradable(row, floor, NoDeclinedTargets));
+        if (qualifying > 0)
+        {
+            return $"Trade during sweep: {qualifying} qualifying " +
+                   $"{(qualifying == 1 ? "target has" : "targets have")} already been traded or refused this " +
+                   "sweep. Press the sweep hotkey again to reconsider them.";
+        }
+
+        // Zero is the floor here, not the configured one: a row that pays nothing is not an opportunity the
+        // operator is missing, and reporting the best loser as "under the floor" would read as a near miss.
+        var executable = _boardRows
+            .Where(row => MarketSweepAutoTrade.IsTradable(row, 0, NoDeclinedTargets))
+            .ToArray();
+        if (executable.Length == 0)
+        {
+            return $"Trade during sweep: no all-taker cycle on the board ({_boardRows.Count} rows). Only a " +
+                   "TTT row with a whole lot can be traded.";
+        }
+
+        var best = executable.MaxBy(static row => row.ProfitChaos)!;
+        return $"Trade during sweep: best all-taker cycle {best.Label} estimates " +
+               $"{best.ProfitChaos:0} chaos, under the {floor} chaos floor.";
+    }
+
+    /// <summary>
+    /// Which unresolved thing is blocking a trade. "Something is unresolved" sends the operator to the
+    /// wrong file: a persisted workflow is resolved by finishing it with the full-workflow hotkey, an
+    /// unresolved order by the lifecycle hotkeys, and an unreadable file by a forced reset.
+    /// </summary>
+    private string DescribeUnresolvedTradeBlock()
+    {
+        if (_bankroll.Workflow?.IsActive == true)
+        {
+            var workflow = _bankroll.Workflow;
+            return $"workflow {workflow.WorkflowId:D} is still active at leg {workflow.CurrentLegIndex + 1} of " +
+                   $"{workflow.Legs.Count} ({workflow.Phase}). Finish or stop it with the full-workflow hotkey.";
+        }
+
+        if (_bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true)
+        {
+            return "a tracked order is still unresolved. Resolve it with the lifecycle hotkeys.";
+        }
+
+        if (_bankrollLoadBlocked || _trackedOrderLoadBlocked)
+        {
+            return "canonical state is unreadable.";
+        }
+
+        return "a new workflow scan is already starting.";
+    }
+
+    /// <summary>
+    /// Returns the panel to the sweep after a trade. The queue was never stopped, so
+    /// <c>_marketSweepQueue.Current</c> is still the step that was next when the trade armed and the next
+    /// window captures it - nothing was skipped, because <c>Advance</c> was never called.
+    ///
+    /// Unresolved canonical state is the one thing that does not resume. An ambiguous order stops everything
+    /// until the operator reconciles it, and a survey walking the picker in the meantime is exactly what they
+    /// do not need.
+    /// </summary>
+    private void EndSweepTradeSession()
+    {
+        var label = _sweepTradeLabel;
+        _sweepTradeActive = false;
+        _sweepTradeLabel = string.Empty;
+        if (ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(
+                _bankroll, _trackedOrderState, out var unsettled))
+        {
+            StopMarketSweep($"Sweep trading stopped after {label}: {unsettled}.");
+            return;
+        }
+
+        // A workflow that is still active is a half-executed cycle: legs are done, the principal is sitting
+        // in the intermediate currency, and nothing will drive it further because authorization is already
+        // gone. Canonical state calls that settled - no order is owed and no proceeds are uncollected - so
+        // the sweep used to announce the trade "finished" and carry on capturing pairs while the position
+        // sat there, which is what happened to workflow 57804195 on 2026-08-14. Stopping is the only
+        // honest response: the operator has an open position and a decision to make about it.
+        if (_bankroll.Workflow?.IsActive == true)
+        {
+            var workflow = _bankroll.Workflow;
+            StopMarketSweep(
+                $"Sweep trading stopped after {label}: workflow {workflow.WorkflowId:D} is unfinished at " +
+                $"leg {workflow.CurrentLegIndex + 1} of {workflow.Legs.Count}, holding " +
+                $"{workflow.CurrentInputAmount} {workflow.Legs[workflow.CurrentLegIndex].FromName}. " +
+                "Finish or stop it with the full-workflow hotkey before sweeping again.");
+            return;
+        }
+
+        _nextMarketSweepAttemptUtc = DateTimeOffset.MinValue;
+        _marketSweepStatus = _marketSweepQueue.IsRunning
+            ? $"{label} finished; resuming {DescribeScope(_marketSweepScope).ToLowerInvariant()} at " +
+              $"{_marketSweepQueue.Progress}."
+            : $"{label} finished; no sweep is queued.";
     }
 
     /// <summary>
@@ -6651,12 +7148,72 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
         }
 
-        var ranked = MarketSweepScore.Rank(
-            store.Snapshot(),
-            _executionHistory,
-            new MarketSweepScoreSettings(
-                Settings.ChurnIntervalCapMinutes.Value, Settings.SweepDepthCap.Value));
-        _boardRows = MarketSweepScore.Sort(ranked, _boardSort);
+        var snapshot = store.Snapshot();
+        var scoring = new MarketSweepScoreSettings(
+            Settings.ChurnIntervalCapMinutes.Value,
+            Settings.SweepDepthCap.Value,
+            _bankroll.AvailableChaos,
+            _bankroll.AvailableDivine,
+            Settings.MinCycleQueue.Value,
+            Settings.MakerSpreadThresholdPercent.Value / 100.0,
+            Settings.MakerLegMinutesCap.Value,
+            Settings.TakerLegSeconds.Value / 60.0);
+        var ranked = MarketSweepScore.Rank(snapshot, _executionHistory, scoring);
+
+        if (_catalogue is null ||
+            !_catalogue.TryGetByMetadata(BankrollState.ChaosMetadata, out var chaos) || chaos is null ||
+            !_catalogue.TryGetByMetadata(BankrollState.DivineMetadata, out var divine) || divine is null)
+        {
+            // Without both hub identities there is no loop to close, and a leg row is not something this
+            // board knows how to print any more.
+            _boardRows = [];
+            _boardHiddenCount = 0;
+            _boardEmptyNote = "The Currency Exchange catalogue has not exposed both bankroll currencies yet.";
+            return;
+        }
+
+        var cycles = MarketSweepCycleScore.Rank(ranked, chaos, divine, scoring);
+        // Allowing taker legs makes most loops executable, so executability alone no longer narrows anything:
+        // the multiplier has to clear 1.0 as well. A losing cycle still has a negative gain and a "-" in the
+        // chaos/hr column, but with 270 of them on a full sweep the header count would otherwise be noise.
+        var visible = Settings.EnableCycleHealthFilter.Value
+            ? cycles.Where(static cycle => cycle.IsHealthy && cycle.Multiplier > 1).ToArray()
+            : cycles;
+        _boardHiddenCount = cycles.Count - visible.Count;
+        _boardRows = MarketSweepScore.Sort(visible, _boardSort);
+        _boardEmptyNote = _boardRows.Count > 0
+            ? string.Empty
+            : DescribeEmptyBoard(snapshot, chaos, divine, cycles.Count);
+    }
+
+    /// <summary>
+    /// Why the board has no rows. An empty board is the expected state until the hub pair has been swept
+    /// twice - turnover needs two observations of a pair inside the churn cap - so saying "no data" would
+    /// read as a defect when it is the filter working. Each branch names the specific thing that is missing.
+    /// </summary>
+    private string DescribeEmptyBoard(
+        IReadOnlyDictionary<CurrencyPairKey, IReadOnlyList<MarketObservation>> snapshot,
+        CurrencyIdentity chaos,
+        CurrencyIdentity divine,
+        int cycleCount)
+    {
+        var hub = snapshot.TryGetValue(new CurrencyPairKey(chaos, divine), out var observations)
+            ? observations.Count
+            : 0;
+        var cap = Settings.ChurnIntervalCapMinutes.Value;
+        if (cycleCount == 0)
+        {
+            return hub == 0
+                ? $"No cycle can close: the hub leg {divine.Name}>{chaos.Name} has not been swept yet. " +
+                  "Sweep a category to fill the board."
+                : "No target is quoted against both hubs yet - a full sweep runs a Chaos pass and a Divine pass.";
+        }
+
+        return hub < 2
+            ? $"All {cycleCount} cycles read thin: the hub leg {divine.Name}>{chaos.Name} has been swept " +
+              $"once, and measured turnover needs two observations inside {cap}min."
+            : $"All {cycleCount} cycles read thin. Sweep again inside {cap}min, or lower MinCycleQueue " +
+              $"(currently {Settings.MinCycleQueue.Value}).";
     }
 
     private MarketSweepStep? SelectIdleSweepStep(MarketObservationStore store, DateTimeOffset nowUtc)
@@ -6778,7 +7335,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (!_marketSweepQueue.IsRunning)
         {
             _marketSweepStatus =
-                $"Market sweep complete: {_marketSweepQueue.Observed} recorded, {_marketSweepQueue.Skipped} skipped.";
+                $"{DescribeScope(_marketSweepScope)} complete: {_marketSweepQueue.Observed} recorded, " +
+                $"{_marketSweepQueue.Skipped} skipped.";
         }
     }
 
@@ -6791,7 +7349,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
         _marketSweepProbeStep = null;
         _marketSweepQueue.Stop();
-        _marketSweepStatus = reason;
+        // Stopping the survey does not stop a trade the survey started. Saying so here is the difference
+        // between an operator who knows an order is live and one who thinks the plugin is idle.
+        _marketSweepStatus = _sweepTradeActive
+            ? $"{reason} The {_sweepTradeLabel} trade it started is still running; stop it with the " +
+              "full-workflow hotkey if you want it to end here."
+            : reason;
     }
 
     private MarketSweepPlan? BuildMarketSweepPlan(out string failure)

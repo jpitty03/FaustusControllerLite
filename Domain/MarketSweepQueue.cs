@@ -2,14 +2,19 @@ using System.Globalization;
 
 namespace FaustusControllerLite.Domain;
 
-/// <summary>One probe: the pinned offered currency and the tradable being sampled against it.</summary>
-public sealed record MarketSweepStep(CurrencyIdentity Offered, TradableEntry Target)
+/// <summary>
+/// One probe: the pinned offered currency and the currency being sampled against it.
+///
+/// It carries the wanted identity directly rather than a <see cref="TradableEntry"/> because the hub step
+/// has no tradable entry to carry. <c>TradablesCatalogue</c> excludes Chaos Orb and Divine Orb as bankroll
+/// currencies, so the one pair that closes every cycle can never be resolved as a target - see
+/// <see cref="MarketSweepQueue.Build"/>. The name is kept alongside the identity only for display.
+/// </summary>
+public sealed record MarketSweepStep(CurrencyIdentity Offered, CurrencyIdentity Wanted, string Name)
 {
-    public CurrencyIdentity Wanted => Target.Target.Identity;
-
     public CurrencyPairKey Pair => new(Offered, Wanted);
 
-    public string Describe() => $"{Offered.Name}>{Target.Name}";
+    public string Describe() => $"{Offered.Name}>{Name}";
 }
 
 /// <summary>
@@ -50,10 +55,21 @@ public sealed class MarketSweepQueue
         $"{Math.Min(Index + (IsRunning ? 1 : 0), Steps.Count)}/{Steps.Count}");
 
     /// <summary>
-    /// Two passes over the enabled targets: every Chaos-offered pair, then every Divine-offered pair. A
-    /// target that is itself one of the two offered currencies is dropped rather than producing a
-    /// same-currency pair, even though resolution already excludes them.
+    /// The hub pair first, then two passes over the enabled targets: every Chaos-offered pair, then every
+    /// Divine-offered pair. A target that is itself one of the two hub currencies is dropped from both
+    /// passes, even though resolution already excludes them: the hub step samples that book once, and a
+    /// target pass would sample the same canonical pair a second time.
     /// </summary>
+    /// <remarks>
+    /// The leading Divine-offered hub step costs one extra offered-side selection for the whole sweep,
+    /// because it breaks the Chaos-then-Divine grouping the rest of the ordering exists to preserve. It is
+    /// worth it: the hub book closes every cycle the board scores, so a sweep abandoned partway through the
+    /// Chaos pass still yields usable cycles for the targets it reached. Captured at the start of the Divine
+    /// pass instead, an interrupted sweep would yield none at all.
+    ///
+    /// Neither hub currency is a resolvable target - <c>TradablesCatalogue</c> excludes both as bankroll
+    /// currencies - so this pair can only ever enter the sweep from here.
+    /// </remarks>
     public static IReadOnlyList<MarketSweepStep> Build(
         IReadOnlyList<TradableEntry> targets,
         CurrencyIdentity chaos,
@@ -63,19 +79,61 @@ public sealed class MarketSweepQueue
         ArgumentNullException.ThrowIfNull(chaos);
         ArgumentNullException.ThrowIfNull(divine);
 
-        var steps = new List<MarketSweepStep>(targets.Count * 2);
+        var steps = new List<MarketSweepStep>((targets.Count * 2) + 1);
+        if (!chaos.Equals(divine))
+        {
+            steps.Add(new MarketSweepStep(divine, chaos, chaos.Name));
+        }
+
         foreach (var offered in new[] { chaos, divine })
         {
             foreach (var target in targets)
             {
-                if (!target.Target.Identity.Equals(offered))
+                if (!target.Target.Identity.Equals(chaos) && !target.Target.Identity.Equals(divine))
                 {
-                    steps.Add(new MarketSweepStep(offered, target));
+                    steps.Add(new MarketSweepStep(offered, target.Target.Identity, target.Name));
                 }
             }
         }
 
         return steps;
+    }
+
+    /// <summary>
+    /// The subset of <paramref name="targets"/> that some cycle on the board currently makes money on.
+    ///
+    /// This is the same test the board's own health filter applies, restated here rather than read off
+    /// the already-filtered rows, because <c>EnableCycleHealthFilter</c> can be off - and when it is, the
+    /// board holds every losing loop too. A scoped sweep must mean the same thing either way.
+    ///
+    /// The input order is preserved, not the board's ranking. <see cref="Build"/> depends on it: the
+    /// Chaos-then-Divine grouping is what selects the offered side twice per sweep instead of twice per
+    /// pair, and that saving is the whole reason a scoped sweep is worth pressing.
+    /// </summary>
+    /// <remarks>
+    /// A target qualifies on <em>any</em> profitable cycle. The same target is scored twice - once
+    /// starting in Divine and once in Chaos (see <c>MarketSweepCycleScore.Rank</c>) - and one profitable
+    /// direction is a reason to re-observe the pair, whatever the other direction reads.
+    /// </remarks>
+    public static IReadOnlyList<TradableEntry> SelectProfitableTargets(
+        IReadOnlyList<TradableEntry> targets,
+        IReadOnlyList<MarketSweepCycle> cycles)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        ArgumentNullException.ThrowIfNull(cycles);
+
+        var profitable = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var cycle in cycles)
+        {
+            if (cycle.IsHealthy && cycle.Multiplier > 1)
+            {
+                profitable.Add(cycle.Target.Metadata);
+            }
+        }
+
+        return targets
+            .Where(target => profitable.Contains(target.Target.Identity.Metadata))
+            .ToArray();
     }
 
     public bool TryStart(
@@ -107,8 +165,10 @@ public sealed class MarketSweepQueue
             return false;
         }
 
+        // The hub step is always present, so a bare count would never be zero and a sweep with no enabled
+        // categories would quietly run one probe and stop. The refusal has to be about targets.
         var steps = Build(targets, chaos, divine);
-        if (steps.Count == 0)
+        if (steps.Count <= 1)
         {
             failure = "No enabled tradable resolved to an exchange target.";
             return false;

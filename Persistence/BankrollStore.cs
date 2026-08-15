@@ -148,6 +148,11 @@ public sealed class BankrollStore
         {
             throw new InvalidDataException("Settlement-asset progress was internally inconsistent.");
         }
+        if (state.TrackedOrder is { BulkCollectionOwnedBaseline: < 0 } or
+            { Status: TrackedOrderStatus.Stashed, BulkCollectionOwnedBaseline: not null })
+        {
+            throw new InvalidDataException("Bulk collection ownership baseline was invalid.");
+        }
         if (state.TrackedOrder is { Status: TrackedOrderStatus.Stashed } stashedState &&
             (!HasCompleteTerminalEvidence(stashedState) ||
              TrackedOrderLifecycle.CreateSettlementAssets(stashedState,

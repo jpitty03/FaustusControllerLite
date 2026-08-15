@@ -4,7 +4,13 @@ namespace FaustusControllerLite.Domain;
 
 public sealed record MarketSweepScoreSettings(
     int ChurnIntervalCapMinutes = MarketSweepScore.DefaultChurnIntervalCapMinutes,
-    long DepthCap = MarketSweepScore.DefaultDepthCap);
+    long DepthCap = MarketSweepScore.DefaultDepthCap,
+    long PrincipalChaos = 0,
+    long PrincipalDivine = 0,
+    long MinCycleQueue = MarketSweepScore.DefaultMinCycleQueue,
+    double MakerSpreadThreshold = MarketSweepScore.DefaultMakerSpreadThreshold,
+    double MakerLegMinutesCap = MarketSweepScore.DefaultMakerLegMinutesCap,
+    double TakerLegMinutes = MarketSweepScore.DefaultTakerLegMinutes);
 
 /// <summary>
 /// Movement of one direction of one book between consecutive observations. <see cref="MovesPerMinute"/> is
@@ -29,15 +35,16 @@ public sealed record MarketChurn(double? MovesPerMinute, double? DepthTurnoverPe
 
 /// <summary>
 /// Which column the board is ordered by. Every option is a column already on the row, so changing the sort
-/// only reorders what is on screen — it never changes what was measured or how the score was computed.
+/// only reorders what is on screen — it never changes what was measured or how a cycle was scored.
 /// </summary>
 public enum MarketSweepBoardSort
 {
-    Score,
-    Margin,
-    Depth,
-    Churn,
-    Turnover,
+    ChaosPerHour,
+    Multiplier,
+    Taker,
+    Gain,
+    Lot,
+    CycleMinutes,
     History,
 }
 
@@ -45,6 +52,8 @@ public sealed record MarketSweepRow(
     CurrencyPairKey Pair,
     CurrencyIdentity From,
     CurrencyIdentity To,
+    Rational? CompetingRate,
+    Rational? ImmediateRate,
     double MarginFraction,
     long ImmediateInputDepth,
     long CompetingQueueAhead,
@@ -86,6 +95,51 @@ public static class MarketSweepScore
     /// the board; it is not a claim that 1000 Chaos and 1000 Divine of depth are comparable.
     /// </summary>
     public const long DefaultDepthCap = 1000;
+
+    /// <summary>
+    /// The smallest competing queue a cycle leg may show and still be believed. It is drawn from the data
+    /// rather than picked: in the 2026-08-13 sweep the trap rows - the widest spreads on the board - carried
+    /// up-leg queues of 1, 2, 4 and 11, while the cycles that survived a second sweep carried 14, 25, 72,
+    /// 267, 409, 657 and 2281. A queue of one is one order, and one order at an absurd price is not a market.
+    /// It is a setting because that boundary moves with the league.
+    /// </summary>
+    public const long DefaultMinCycleQueue = 10;
+
+    /// <summary>
+    /// How much wider the maker rate must be than the taker rate before a leg is worth posting an order and
+    /// waiting, instead of crossing the spread immediately.
+    ///
+    /// Because each book carries only two independent prices, the maker rate is <em>always</em> at least the
+    /// taker rate on any single leg, so an all-maker cycle always shows the largest multiplier. That is why a
+    /// bare "prefer the bigger number" rule collapses into always waiting. The question a threshold answers is
+    /// the real one: is this particular leg's extra width worth its wait and its chance of never filling.
+    ///
+    /// The default is deliberately high. Across the 810 hub-touching legs of the 2026-08-13 sweep it makes
+    /// only 11 of them maker legs, which is close to "always cross" - the position the measured data supports.
+    /// A cycle executed all-taker is three clicks and about three minutes; the same cycle worked all-maker is
+    /// three queued orders at a historically ~60% fill rate, and an unfilled middle leg leaves the bankroll
+    /// stranded in a currency it never wanted. On sweep #6 the best all-taker cycle returned 3170 chaos/hour
+    /// against 846 for the best all-maker one, before any fill discount at all.
+    /// </summary>
+    public const double DefaultMakerSpreadThreshold = 2.0;
+
+    /// <summary>
+    /// A maker leg expected to take longer than this is taken instead, however wide it is. It is a separate
+    /// condition from the spread because width and speed are independent: the Regal Orb bridge leg of the
+    /// 2026-08-13 sweep carried a spread of 1.72 behind a queue of 31200 draining at 83 a minute, which is
+    /// over six hours of waiting for an edge that a single click captures most of.
+    /// </summary>
+    public const double DefaultMakerLegMinutesCap = 30;
+
+    /// <summary>
+    /// What a taker leg costs in time: the clicking, not the waiting. A taker leg has no queue to drain, so
+    /// <see cref="MarketSweepRow.ExpectedMinutes"/> - which is entirely a drain estimate - does not describe
+    /// it at all, and charging it the drain time would rank instant cycles as though they were slow ones.
+    ///
+    /// One minute is a hand-timed placeholder. It should be replaced by a measurement from
+    /// <c>execution-audit-&lt;league&gt;.jsonl</c> once enough taker legs have been executed to have a median.
+    /// </summary>
+    public const double DefaultTakerLegMinutes = 1.0;
 
     /// <summary>
     /// Measures how much one direction of a book moved. Long gaps undercount — several moves collapse into a
@@ -173,108 +227,104 @@ public static class MarketSweepScore
     /// path, where four hops and their amounts share one row, so a name has to be cut to fit.
     /// </summary>
     /// <remarks>
-    /// The sweep board deliberately does not use this. It gets a column of its own and prints names in full -
-    /// see <see cref="BoardPairLength"/>.
+    /// The sweep board deliberately does not use this. Its cycle cell prints the target's name in full and
+    /// clips per cell instead - see <see cref="MarketSweepCycle.LabelLength"/>.
     /// </remarks>
     public const int BoardNameLength = 14;
 
     /// <summary>
-    /// Widest pair cell the board prints, in characters. The columns are fixed pixel offsets, so an
-    /// over-long cell overlaps the next column rather than wrapping.
+    /// The board's column headings, in the order <see cref="FormatRow"/> emits cells.
     /// </summary>
     /// <remarks>
-    /// Sized so it never fires on real data: a sweep only ever captures hub-to-spoke, and the longest
-    /// tradable name (39) against the longer bankroll name (10) is exactly 50. It is a guard for pairs the
-    /// sweep does not produce - spoke to spoke - which degrade to a clipped cell instead of printing over
-    /// the margin column.
+    /// The last three columns carry the per-leg evidence behind the first six - one queue and one turnover
+    /// per leg, and the traded history of the pair the cycle opens with - so a ranking can be argued with
+    /// instead of trusted. That is the same principle the leg board was built on; what changed is that the
+    /// unit being argued about is now a closed loop rather than one side of a book.
     /// </remarks>
-    public const int BoardPairLength = 50;
-
     public static IReadOnlyList<string> ColumnHeadings { get; } =
-        ["pair", "margin%", "imm", "queue", "tradable", "churn/min", "turn/min", "fills:no", "min", "score"];
+        ["cycle", "mode", "mult", "take", "lot", "gain", "chaos/hr", "min", "queues", "turn", "fills:no"];
 
     public static MarketSweepBoardSort NextSort(MarketSweepBoardSort sort) => sort switch
     {
-        MarketSweepBoardSort.Score => MarketSweepBoardSort.Margin,
-        MarketSweepBoardSort.Margin => MarketSweepBoardSort.Depth,
-        MarketSweepBoardSort.Depth => MarketSweepBoardSort.Churn,
-        MarketSweepBoardSort.Churn => MarketSweepBoardSort.Turnover,
-        MarketSweepBoardSort.Turnover => MarketSweepBoardSort.History,
-        _ => MarketSweepBoardSort.Score,
+        MarketSweepBoardSort.ChaosPerHour => MarketSweepBoardSort.Multiplier,
+        MarketSweepBoardSort.Multiplier => MarketSweepBoardSort.Taker,
+        MarketSweepBoardSort.Taker => MarketSweepBoardSort.Gain,
+        MarketSweepBoardSort.Gain => MarketSweepBoardSort.Lot,
+        MarketSweepBoardSort.Lot => MarketSweepBoardSort.CycleMinutes,
+        MarketSweepBoardSort.CycleMinutes => MarketSweepBoardSort.History,
+        _ => MarketSweepBoardSort.ChaosPerHour,
     };
 
     public static string DescribeSort(MarketSweepBoardSort sort) => sort switch
     {
-        MarketSweepBoardSort.Margin => "margin",
-        MarketSweepBoardSort.Depth => "tradable depth",
-        MarketSweepBoardSort.Churn => "churn",
-        MarketSweepBoardSort.Turnover => "depth turnover",
+        MarketSweepBoardSort.Multiplier => "multiplier",
+        MarketSweepBoardSort.Taker => "instant multiplier",
+        MarketSweepBoardSort.Gain => "gain",
+        MarketSweepBoardSort.Lot => "lot",
+        MarketSweepBoardSort.CycleMinutes => "cycle minutes",
         MarketSweepBoardSort.History => "traded history",
-        _ => "score",
+        _ => "chaos/hr",
     };
 
     /// <summary>
-    /// Reorders ranked rows by one column, descending, with the same ordinal signature tie-break
-    /// <see cref="Rank"/> uses so a redraw never reshuffles equal rows. An unknown churn sorts last rather
-    /// than as zero: a pair observed once has no velocity, which is not the same as a still one.
+    /// Reorders ranked cycles by one column, descending, with the same ordinal signature tie-break
+    /// <see cref="MarketSweepCycleScore.Rank"/> uses so a redraw never reshuffles equal rows.
     /// </summary>
-    public static IReadOnlyList<MarketSweepRow> Sort(
-        IReadOnlyList<MarketSweepRow> rows,
+    /// <remarks>
+    /// <para>
+    /// <see cref="MarketSweepBoardSort.CycleMinutes"/> is negated, because every other column wants its
+    /// largest value first and this one wants its smallest: the cycle worth looking at is the one that
+    /// closes soonest.
+    /// </para>
+    /// <para>
+    /// Only <see cref="MarketSweepBoardSort.ChaosPerHour"/> ranks across denominations.
+    /// <see cref="MarketSweepBoardSort.Gain"/> and <see cref="MarketSweepBoardSort.Lot"/> are quoted in each
+    /// cycle's own starting currency, so a Divine-start row and a Chaos-start row sorted by gain are being
+    /// compared on numbers that are not in the same unit. That is deliberate - it answers "how much does
+    /// this one move" - but it is not a profitability ranking, and only chaos/hr is.
+    /// </para>
+    /// </remarks>
+    public static IReadOnlyList<MarketSweepCycle> Sort(
+        IReadOnlyList<MarketSweepCycle> cycles,
         MarketSweepBoardSort sort)
     {
-        ArgumentNullException.ThrowIfNull(rows);
-        return rows
-            .OrderByDescending(row => sort switch
+        ArgumentNullException.ThrowIfNull(cycles);
+        return cycles
+            .OrderByDescending(cycle => sort switch
             {
-                MarketSweepBoardSort.Margin => row.MarginFraction,
-                MarketSweepBoardSort.Depth => row.TradableDepth,
-                MarketSweepBoardSort.Churn => row.Churn.MovesPerMinute ?? double.NegativeInfinity,
-                MarketSweepBoardSort.Turnover => row.Churn.DepthTurnoverPerMinute ?? double.NegativeInfinity,
-                MarketSweepBoardSort.History => row.Execution.Orders,
-                _ => row.Score,
+                MarketSweepBoardSort.Multiplier => cycle.Multiplier,
+                MarketSweepBoardSort.Taker => cycle.TakerMultiplier,
+                MarketSweepBoardSort.Gain => cycle.GainStart,
+                MarketSweepBoardSort.Lot => cycle.Lot,
+                MarketSweepBoardSort.CycleMinutes => -cycle.CycleMinutes,
+                MarketSweepBoardSort.History => cycle.Execution.Orders,
+                _ => cycle.ChaosPerHour,
             })
-            .ThenBy(row => row.Signature, StringComparer.Ordinal)
+            .ThenBy(cycle => cycle.Signature, StringComparer.Ordinal)
             .ToArray();
     }
 
     /// <summary>
-    /// One row as display cells, in <see cref="ColumnHeadings"/> order. Formatting is invariant so the board
-    /// reads the same on every machine, and every factor of the score gets its own cell so a ranking can be
-    /// argued with instead of trusted.
+    /// One cycle as display cells, in <see cref="ColumnHeadings"/> order. Formatting is invariant so the
+    /// board reads the same on every machine.
     /// </summary>
-    public static IReadOnlyList<string> FormatRow(MarketSweepRow row)
+    public static IReadOnlyList<string> FormatRow(MarketSweepCycle cycle)
     {
-        ArgumentNullException.ThrowIfNull(row);
+        ArgumentNullException.ThrowIfNull(cycle);
         return
         [
-            FormatPair(row.From, row.To),
-            (row.MarginFraction * 100).ToString("0.0", CultureInfo.InvariantCulture),
-            row.ImmediateInputDepth.ToString(CultureInfo.InvariantCulture),
-            row.CompetingQueueAhead.ToString(CultureInfo.InvariantCulture),
-            row.TradableDepth.ToString(CultureInfo.InvariantCulture),
-            row.Churn.Describe(),
-            row.Churn.DescribeTurnover(),
-            row.Execution.Describe(),
-            row.ExpectedMinutes.ToString("0.0", CultureInfo.InvariantCulture),
-            row.Score.ToString("0.000", CultureInfo.InvariantCulture),
+            cycle.Label,
+            cycle.DescribeModes(),
+            cycle.Multiplier.ToString("0.000", CultureInfo.InvariantCulture),
+            cycle.TakerMultiplier.ToString("0.000", CultureInfo.InvariantCulture),
+            cycle.Lot.ToString(CultureInfo.InvariantCulture),
+            cycle.GainStart.ToString("0.0", CultureInfo.InvariantCulture),
+            cycle.ProfitChaos <= 0 ? "-" : cycle.ChaosPerHour.ToString("0.0", CultureInfo.InvariantCulture),
+            cycle.CycleMinutes.ToString("0.0", CultureInfo.InvariantCulture),
+            cycle.DescribeQueues(),
+            cycle.DescribeTurnover(),
+            cycle.Execution.Describe(),
         ];
-    }
-
-    /// <summary>
-    /// The pair cell, both names in full.
-    /// </summary>
-    /// <remarks>
-    /// Names are not abbreviated here even though the column is fixed-width, because tradable names share
-    /// long prefixes: twenty essences begin "Deafening Essence of" and seven scarabs begin "Horned Scarab
-    /// of". A clip short enough to keep the column narrow collapses each of those families into one
-    /// indistinguishable string, which defeats the point of ranking them against each other.
-    /// </remarks>
-    public static string FormatPair(CurrencyIdentity from, CurrencyIdentity to)
-    {
-        ArgumentNullException.ThrowIfNull(from);
-        ArgumentNullException.ThrowIfNull(to);
-        var pair = $"{from.Name}>{to.Name}";
-        return pair.Length <= BoardPairLength ? pair : pair[..(BoardPairLength - 1)] + "~";
     }
 
     public static string Abbreviate(string name)
@@ -334,6 +384,8 @@ public static class MarketSweepScore
             latest.Pair,
             from,
             to,
+            book.CompetingRate,
+            book.ImmediateRate,
             margin,
             book.ImmediateInputDepth,
             book.CompetingQueueAhead,

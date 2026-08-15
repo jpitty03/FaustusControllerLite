@@ -185,6 +185,12 @@ public sealed class FaustusControllerLiteSettings : ISettings
     [Category("Hotkeys")]
     public HotkeyNodeV2 MarketSweepBoardSortHotkey { get; set; } = CreateUnboundHotkey();
 
+    // The same sweep, restricted to the targets already showing a profitable cycle. It reads the board
+    // rather than the tradables list, so it is only ever as good as the last full sweep - discovery
+    // still belongs to MarketSweepHotkey and to idle sweeping.
+    [Category("Hotkeys")]
+    public HotkeyNodeV2 ProfitableMarketSweepHotkey { get; set; } = CreateUnboundHotkey();
+
     // The board is advisory. Nothing here feeds the route planner or latest-rates.json; the sweep only
     // reads books and appends its own observation file, so every setting below is safe to leave on.
     [Category("Market Sweep")]
@@ -231,6 +237,55 @@ public sealed class FaustusControllerLiteSettings : ISettings
 
     [Category("Market Sweep")]
     public RangeNode<int> IdleSweepIntervalSeconds { get; set; } = new(15, 5, 600);
+
+    // A cycle is shown only when every leg can actually be worked the way the policy assigns it: a maker leg
+    // needs real queue behind the price AND measured turnover, a taker leg only needs something resting to
+    // cross against. Cycles whose chosen mix does not clear 1.0 are hidden with them - most of the board is
+    // losing loops once taker legs are allowed, and a losing loop is not evidence of anything. Off shows
+    // everything. The hidden count stays in the board header either way, so nothing disappears silently.
+    [Category("Market Sweep")]
+    public ToggleNode EnableCycleHealthFilter { get; set; } = new(true);
+
+    // Drawn from the data rather than picked: in the 2026-08-13 sweep the widest-spread trap cycles carried
+    // up-leg queues of 1, 2, 4 and 11, while the cycles that survived a second sweep carried 14 and up. It is
+    // a setting because that boundary moves with the league.
+    [Category("Market Sweep")]
+    public RangeNode<int> MinCycleQueue { get; set; } = new((int)MarketSweepScore.DefaultMinCycleQueue, 0, 10_000);
+
+    // How much wider the maker rate must be than the taker rate before a leg is worth queueing for, in
+    // percent - 200 means the maker side must pay double. Held as an integer because every other node here
+    // is, and a spread is a threshold rather than money. The default is close to "always cross": across the
+    // 810 hub-touching legs of the 2026-08-13 sweep it makes only 11 of them maker legs. That is what the
+    // measurements support - the best all-taker cycle returned 3170 chaos/hour against 846 for the best
+    // all-maker one, before any discount for the ~60% historical fill rate.
+    [Category("Market Sweep")]
+    public RangeNode<int> MakerSpreadThresholdPercent { get; set; } =
+        new((int)(MarketSweepScore.DefaultMakerSpreadThreshold * 100), 100, 1_000);
+
+    // A maker leg whose queue takes longer than this to drain is crossed instead, however wide it is. Width
+    // and speed are independent: the Regal Orb bridge leg carried a 1.72x spread behind a queue of 31200
+    // draining at 83 a minute, which is six hours of waiting for an edge one click captures most of.
+    [Category("Market Sweep")]
+    public RangeNode<int> MakerLegMinutesCap { get; set; } =
+        new((int)MarketSweepScore.DefaultMakerLegMinutesCap, 1, 240);
+
+    // What a taker leg costs in time: the clicking, not the waiting. ExpectedMinutes is entirely a queue-drain
+    // estimate and so describes a maker leg only; charging a taker leg the drain time would rank a three-click
+    // cycle as though it were a three-hour wait. Hand-timed placeholder until enough taker legs have been
+    // executed to take a median out of the execution audit.
+    [Category("Market Sweep")]
+    public RangeNode<int> TakerLegSeconds { get; set; } =
+        new((int)(MarketSweepScore.DefaultTakerLegMinutes * 60), 5, 600);
+
+    // Lets a running sweep act on what it finds instead of only printing it. When a capture puts a
+    // profitable all-taker (TTT) cycle on the board above MinimumProfitChaos, the sweep suspends, the
+    // ordinary full workflow trades that one cycle under every permission and calibration check the
+    // workflow hotkey applies, and then the sweep resumes at the capture it abandoned.
+    //
+    // The box alone authorizes nothing: trading is armed by pressing a sweep hotkey with this on, and dies
+    // with that sweep, so a reload leaves no standing authority to spend. Idle sweeping never trades.
+    [Category("Market Sweep")]
+    public ToggleNode TradeDuringSweep { get; set; } = new(false);
 
     [Category("Fresh State Reset")]
     [JsonIgnore]

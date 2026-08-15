@@ -411,7 +411,7 @@ cd ../../Tests/FaustusControllerLite.Tests
 dotnet run --project FaustusControllerLite.Tests.csproj --no-restore
 ```
 
-Expected: `Build succeeded. 0 Warning(s) 0 Error(s)` and `126/126 tests passed`. Any warning is a
+Expected: `Build succeeded. 0 Warning(s) 0 Error(s)` and `172/172 tests passed`. Any warning is a
 regression - the project has been kept warning-clean, so a new one means something was silently
 reinterpreted.
 
@@ -673,7 +673,8 @@ first where a wrong answer costs currency. Test with a low-value scarab type and
 
 Bench first:
 
-1. Build and test. Confirm **126/126**, 0 warnings, and these new names pass:
+1. Build and test. Confirm the full count (**126/126** when this phase landed; **172/172** as of
+   the sweep mid-cycle abandonment fixes), 0 warnings, and these new names pass:
    `sweep probe plans partition benchmark once`,
    `sell planner preserves proceeds valuation rate`,
    `sell sweep placement token validates exact preparation`,

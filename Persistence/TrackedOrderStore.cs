@@ -144,6 +144,11 @@ public sealed class TrackedOrderStore
         {
             throw new InvalidDataException("Tracked settlement-asset progress was internally inconsistent.");
         }
+        if (state.BulkCollectionOwnedBaseline is < 0 ||
+            state.Status == TrackedOrderStatus.Stashed && state.BulkCollectionOwnedBaseline is not null)
+        {
+            throw new InvalidDataException("Bulk collection ownership baseline was invalid.");
+        }
         if (state.Status == TrackedOrderStatus.Stashed &&
             (state.TerminalObservedAtUtc is null || state.LedgerCommittedAtUtc is null ||
              state.TerminalRemainingOfferedAmount is not { } stashedRemaining ||

@@ -451,6 +451,7 @@ public static class WorkflowCoordinator
             next.Phase = WorkflowExecutionPhase.Stopped;
             next.Detail = $"Leg {leg.Index + 1} settled safely but did not exactly fill: " +
                 $"remaining={tracked.TerminalRemainingOfferedAmount}, received={tracked.TerminalReceivedWantedAmount}.";
+            next.PlanFingerprint = ComputeFingerprint(next);
             failure = string.Empty;
             return true;
         }
@@ -1112,6 +1113,30 @@ public static class WorkflowCoordinator
             {
                 failure = $"Refreshed closed-cycle profit {profit} is below {minimumProfitChaos} Chaos.";
                 return WorkflowRefreshResult.Failed;
+            }
+
+            // Between the first leg and the realization of Chaos the floor is zero, not minimumProfitChaos.
+            // The principal is committed to the intermediate currency by now, so refusing a thin-but-positive
+            // plan strands it for a few Chaos of ambition; refusing a negative one is the whole point,
+            // because that plan sells the position into thin depth and then spends the operator's own Chaos
+            // to close, ending the cycle poorer than it started. Immediate depth thins and refills within
+            // seconds - on 2026-08-14 a workflow holding 149 scarabs replanned against 60 lots of depth for
+            // a projected -327 Chaos, 24 seconds after the same book showed roughly 140 - so this is
+            // retryable on the same reasoning as an unavailable restoration edge above: reprobe, and let the
+            // bounded budget hand it to the operator with a named reason if the book does not come back.
+            //
+            // Past the realization leg this does not apply, and deliberately so. Restoration is not an
+            // opportunity to decline: the Chaos is already in hand against an outstanding principal debt,
+            // OutstandingPrincipal and the partial-attempt machinery exist to grind that debt down at
+            // whatever the book costs, and refusing an adverse restoration does not avoid a loss - it just
+            // leaves the principal unrestored. WorkflowRestorationRetriesUnavailableQuotes pins that.
+            if (workflow.CurrentLegIndex > 0 &&
+                workflow.CurrentLegIndex <= workflow.ChaosRealizationLegIndex &&
+                profit < 0)
+            {
+                failure = $"Refreshed closed-cycle profit {profit} Chaos is negative; the remaining plan " +
+                    "would realize and close at a loss.";
+                return WorkflowRefreshResult.RetryableUnavailable;
             }
 
             foreach (var item in refreshed) next.Legs[item.Plan.Index] = item.Plan;

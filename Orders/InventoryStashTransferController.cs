@@ -16,6 +16,7 @@ public enum InventoryStashTransferState
     Idle,
     MovingToStack,
     ReadyToClick,
+    ModifierArmed,
     WaitingForTransfer,
     ReleasingInput,
     TransferEvidence,
@@ -171,8 +172,9 @@ public static class InventoryTransferEvidence
             {
                 StashCustodyMode.VisibleCurrencyStashExact =>
                     after.TargetVisibleStashAmount == checked(before.TargetVisibleStashAmount + amount),
-                StashCustodyMode.AffinityAggregate =>
-                    after.TargetVisibleStashAmount == before.TargetVisibleStashAmount,
+                // The visible same-type tab may be stale, the affinity destination, or a different tab.
+                // Aggregate ownership is verified separately; local custody only requires inventory exit.
+                StashCustodyMode.AffinityAggregate => true,
                 _ => false,
             };
         }
@@ -233,8 +235,9 @@ public static class InventoryTransferEvidence
         long observedOwned,
         int currentAreaInstanceId)
     {
-        if (!StashCustodyPolicy.TryResolve(canonicalMetadata, current.VisibleTabType, out var canonicalMode) ||
-            intent.StashCustodyMode != canonicalMode || intent.Metadata != canonicalMetadata || intent.Amount != canonicalAmount ||
+        if (!StashCustodyPolicy.IsCustodyTabType(current.VisibleTabType) ||
+            !StashCustodyPolicy.IsResolvableCustody(canonicalMetadata, intent.StashCustodyMode) ||
+            intent.Metadata != canonicalMetadata || intent.Amount != canonicalAmount ||
             intent.InventoryAmountBefore != canonicalAmount || intent.AggregateOwnedBefore != observedOwned ||
             intent.AreaInstanceId != currentAreaInstanceId ||
             NonTargetFingerprint(current, canonicalMetadata) != intent.NonTargetInventoryFingerprint)
@@ -248,14 +251,14 @@ public static class InventoryTransferEvidence
         }
         try
         {
-            var postStashAmount = intent.StashCustodyMode switch
+            var postStashMatches = intent.StashCustodyMode switch
             {
                 StashCustodyMode.VisibleCurrencyStashExact =>
-                    checked(intent.VisibleStashAmountBefore + intent.Amount),
-                StashCustodyMode.AffinityAggregate => intent.VisibleStashAmountBefore,
-                _ => -1,
+                    current.TargetVisibleStashAmount == checked(intent.VisibleStashAmountBefore + intent.Amount),
+                StashCustodyMode.AffinityAggregate => true,
+                _ => false,
             };
-            if (current.TargetInventoryAmount == 0 && current.TargetVisibleStashAmount == postStashAmount)
+            if (current.TargetInventoryAmount == 0 && postStashMatches)
                 return RecoveryKind.PostTransfer;
         }
         catch (OverflowException)
@@ -300,7 +303,8 @@ public sealed class InventoryStashTransferController
     public string Status { get; private set; } = "Idle; inventory-to-stash transfer is disabled.";
     public string Failure { get; private set; } = string.Empty;
     public bool IsRunning => State is InventoryStashTransferState.MovingToStack or
-        InventoryStashTransferState.ReadyToClick or InventoryStashTransferState.WaitingForTransfer or
+        InventoryStashTransferState.ReadyToClick or InventoryStashTransferState.ModifierArmed or
+        InventoryStashTransferState.WaitingForTransfer or
         InventoryStashTransferState.ReleasingInput;
 
     public bool Start(
@@ -353,7 +357,13 @@ public sealed class InventoryStashTransferController
 
         // Custody is a property of the tab that is actually visible, so it can only be resolved
         // once the snapshot has observed it.
-        if (!StashCustodyPolicy.TryResolve(metadata, snapshot.VisibleTabType, out var custodyMode))
+        if (!StashCustodyPolicy.TryResolve(
+                metadata,
+                snapshot.VisibleTabType,
+                snapshot.TargetInventoryAmount,
+                snapshot.TargetVisibleStashAmount,
+                aggregateOwnedBefore,
+                out var custodyMode))
         {
             failure = "Settlement asset has no supported stash custody policy for the visible stash tab.";
             return false;
@@ -408,6 +418,9 @@ public sealed class InventoryStashTransferController
                     break;
                 case InventoryStashTransferState.ReadyToClick:
                     ClickOnce(gameController);
+                    break;
+                case InventoryStashTransferState.ModifierArmed:
+                    ClickWithModifier(gameController);
                     break;
                 case InventoryStashTransferState.WaitingForTransfer:
                     VerifyTransfer(gameController);
@@ -565,7 +578,9 @@ public sealed class InventoryStashTransferController
         out string failure)
     {
         var server = gameController.Game.IngameState.ServerData;
-        if (!permissions.Ready || conflictingControllerEnabled || ModifiersHeld() ||
+        var foreignModifierHeld = ModifiersHeld() &&
+            !(State == InventoryStashTransferState.ModifierArmed && _ownedKeys.Contains(Keys.ControlKey));
+        if (!permissions.Ready || conflictingControllerEnabled || foreignModifierHeld ||
             server.League != _league || server.InstanceId != _areaInstanceId)
         {
             failure = "Transfer permission, controller exclusion, modifier, league, or area gate failed.";
@@ -652,17 +667,32 @@ public sealed class InventoryStashTransferController
             Vector2.Distance(freshTarget, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, freshTarget) > CursorTolerance)
         {
-            var reason = string.IsNullOrEmpty(failure) ? "Transfer context changed after durable arming." : failure;
-            var disarmed = TrackedOrderCollectionController.CloneTracked(
-                _tracked, TrackedOrderStatus.Collected, $"Disarmed without input: {reason}");
-            disarmed.StashTransferIntent = null;
-            if (_persist(disarmed, "CollectedCurrencyStashTransferDisarmedBeforeClick")) _tracked = disarmed;
-            Finish(reason, clicked: false);
+            DisarmBeforeClick(string.IsNullOrEmpty(failure) ? "Transfer context changed after durable arming." : failure);
+            return;
+        }
+
+        PressKey(Keys.ControlKey);
+        _deadline = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(60);
+        State = InventoryStashTransferState.ModifierArmed;
+        Status = "Ctrl armed; waiting one input interval before the stash-transfer right-click.";
+    }
+
+    private void ClickWithModifier(GameController gameController)
+    {
+        if (DateTimeOffset.UtcNow < _deadline) return;
+        var failure = string.Empty;
+        if (!ExileInput.IsKeyDown(Keys.ControlKey) ||
+            !TryResolveUnchangedTarget(gameController, out var freshTarget, out failure) ||
+            Vector2.Distance(freshTarget, _target) > GeometryTolerance ||
+            Vector2.Distance(ExileInput.MousePositionNum, freshTarget) > CursorTolerance)
+        {
+            DisarmBeforeClick(string.IsNullOrEmpty(failure)
+                ? "Ctrl chord or transfer context was not stable before the stash-transfer click."
+                : failure);
             return;
         }
 
         _clickAttempted = true;
-        PressKey(Keys.ControlKey);
         _mouseDown = true;
         Exception? clickFailure = null;
         try
@@ -696,8 +726,17 @@ public sealed class InventoryStashTransferController
         _deadline = DateTimeOffset.UtcNow + TransferTimeout;
         State = InventoryStashTransferState.WaitingForTransfer;
         Status = _custodyMode == StashCustodyMode.AffinityAggregate
-            ? "Ctrl-right-clicked once; waiting for exact affinity movement evidence."
+            ? "Sent one exact stash-transfer click; waiting for inventory exit evidence."
             : "Ctrl-right-clicked once; waiting for exact inventory and Currency Stash totals.";
+    }
+
+    private void DisarmBeforeClick(string reason)
+    {
+        var disarmed = TrackedOrderCollectionController.CloneTracked(
+            _tracked!, TrackedOrderStatus.Collected, $"Disarmed without input: {reason}");
+        disarmed.StashTransferIntent = null;
+        if (_persist!(disarmed, "CollectedCurrencyStashTransferDisarmedBeforeClick")) _tracked = disarmed;
+        Finish(reason, clicked: false);
     }
 
     private void VerifyTransfer(GameController gameController)
@@ -705,7 +744,7 @@ public sealed class InventoryStashTransferController
         if (VerifyPostState(gameController, out var failure))
         {
             var proof = _custodyMode == StashCustodyMode.AffinityAggregate
-                ? $"Verified inventory {_amount}->0 with visible Currency Stash unchanged; non-target inventory unchanged."
+                ? $"Verified inventory {_amount}->0 with a valid visible-or-hidden affinity destination; non-target inventory unchanged."
                 : $"Verified inventory {_amount}->0 and visible Currency Stash +{_amount}; non-target inventory unchanged.";
             BeginRelease(InventoryStashTransferState.TransferEvidence, proof);
             return;
@@ -809,7 +848,12 @@ public sealed class InventoryStashTransferController
         }
         if (_mouseDown)
         {
-            try { ExileInput.RightUp(); _mouseDown = false; } catch { }
+            try
+            {
+                ExileInput.RightUp();
+                _mouseDown = false;
+            }
+            catch { }
         }
         return _ownedKeys.Count == 0 && !_mouseDown;
     }

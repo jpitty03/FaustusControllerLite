@@ -55,6 +55,12 @@ normal affinity tab is not yet supported.
 | `ChurnIntervalCapMinutes` | 5-240 | Longest gap between two observations that still counts as a churn interval. Must stay **above** `SweepStalePairMinutes` or every idle-generated interval is discarded. |
 | `SweepStalePairMinutes` | 5-1440 | Age at which a pair becomes eligible for an idle re-sweep. Must stay **below** `ChurnIntervalCapMinutes`. |
 | `SweepDepthCap` | 1-100000 | Upper bound on tradable depth in the score, so one very deep book cannot dominate. |
+| `EnableCycleHealthFilter` | on/off | Hides cycles that cannot be executed in the mode each leg was assigned, and cycles whose multiplier does not clear 1.000. The hidden count stays in the board header either way. |
+| `MinCycleQueue` | 0-10000 | Smallest competing queue a **maker** cycle leg may show and still be believed. A taker leg does not queue and is not asked. |
+| `MakerSpreadThresholdPercent` | 100-1000 | Smallest spread, as a percentage, that makes a leg worth queuing for instead of crossing. 200 = a 2.00x spread. Lower it to post more maker orders. |
+| `MakerLegMinutesCap` | 1-240 | Longest queue drain a maker leg may be worth. Past this the leg is crossed however wide its spread. |
+| `TakerLegSeconds` | 5-600 | Real click time charged to a taker leg, used in `min` and therefore in `chaos/hr`. Hand-timed at about a minute; replace it with your own median once you have run a few. |
+| `TradeDuringSweep` | on/off | Lets a sweep you started trade the profitable all-taker cycles it finds, one at a time, under `MinimumProfitChaos`. Ticking it authorizes nothing on its own. |
 
 Changing `StartingChaos` or `StartingDivine` does not change the current bankroll. Apply a safe
 fresh-state reset to use the new values.
@@ -74,6 +80,7 @@ All hotkeys are unbound by default.
 | `FullWorkflowHotkey` | Starts, stops, or resumes arbitrage automation. |
 | `DumpSdkReadsHotkey` | Writes a diagnostic dump. |
 | `MarketSweepHotkey` | Starts or stops a full sweep of the enabled categories. |
+| `ProfitableMarketSweepHotkey` | Starts or stops a sweep of only the targets currently showing a profitable cycle. |
 | `MarketSweepBoardSortHotkey` | Cycles the board sort column. |
 
 ## Seed a Test Bankroll
@@ -260,9 +267,9 @@ plugin re-probes rather than placing. Reprobing an already-improved leg does not
 ## Market Sweep Board
 
 The board is a survey, not an automation. It walks `tradables.json`, records what each book looked
-like at the time, and ranks the pairs so you can see which are both wide and moving. It never places
-an order, never writes `latest-rates.json`, and never feeds the route planner. You read the board and
-set `TargetCurrency` yourself.
+like at the time, and ranks the **complete arbitrage cycles** those books make possible. It never
+places an order, never writes `latest-rates.json`, and never feeds the route planner. You read the
+board and set `TargetCurrency` yourself.
 
 Enable `EnableMarketSweepBoard` to draw it. Press `MarketSweepHotkey` to sweep every enabled
 category, or enable `SweepWhileIdle` to have the plugin probe the single stalest pair whenever it is
@@ -274,31 +281,133 @@ Categories map one to one onto the keys in `tradables.json`. `SweepCurrency` is 
 rest are off, because a full sweep of all 263 resolvable names is roughly 526 captures and 16-20
 minutes. Chaos Orb and Divine Orb are excluded as the bankroll currencies, and a handful of names in
 the file are not exchangeable at all; the board reports `resolved N/M` and lists whatever it could
-not resolve so the file can be corrected.
+not resolve so the file can be corrected. One extra capture per sweep, `Divine Orb > Chaos Orb`, is
+taken first: it is the leg that closes every cycle on the board.
+
+### Sweeping only what pays
+
+`ProfitableMarketSweepHotkey` runs the identical sweep restricted to the targets that currently show
+a profitable cycle — a healthy cycle whose multiplier clears 1.0, the same test
+`EnableCycleHealthFilter` applies to the board. A dozen live opportunities is 25 captures and a
+minute or two, against 526 and twenty minutes, so the rows you actually trade can be refreshed as
+often as they move.
+
+Three things worth knowing:
+
+- **The set is read off the board, and frozen when you press.** Nothing is re-planned mid-run:
+  captures landing during the sweep re-rank the board, but the queue keeps walking the targets that
+  qualified at press time. With no profitable rows the hotkey refuses and says so rather than
+  starting a sweep of the hub alone.
+- **It cannot discover anything.** A target that turns profitable after its last observation is
+  invisible to it, because it was not on the board when you pressed. Discovery stays with
+  `MarketSweepHotkey` and with `SweepWhileIdle`, which keeps picking the stalest pair from the
+  *whole* enabled list for exactly this reason. Leaning only on the profitable sweep narrows the
+  board to what it already knew.
+- **The hub leg is swept too**, as with any sweep, and that is the point rather than overhead:
+  measured turnover on the closing leg needs two observations inside `ChurnIntervalCapMinutes`, and
+  that leg gates the health verdict on every row.
+
+Either hotkey stops a sweep already running; neither switches scope mid-run.
+
+### A row is a loop, not a leg
+
+Every row is a three-leg cycle that starts and ends on the same bankroll currency:
+
+```
+D>Vaal Orb>C>D     Divine -> Vaal Orb -> Chaos -> Divine
+C>Vaal Orb>D>C     Chaos  -> Vaal Orb -> Divine -> Chaos
+```
+
+Each target quoted against **both** hubs produces both directions.
+
+### Maker or taker, decided per leg
+
+A *maker* leg posts at the competing head and waits for someone to cross it. A *taker* leg crosses the
+immediate head right now. The maker rate is always the better of the two — each book carries only two
+independent prices, and the four rates the sweep stores are those two seen from both directions, exact
+reciprocals on every capture taken so far. So an all-maker loop always shows the largest `mult` on
+paper.
+
+It is on paper because it only pays if **all three** orders fill, and measured fill history sits near
+60% per order. An all-maker loop that has to wait out three queues is not competing with an all-taker
+loop of the same size; it is competing with three or four all-taker loops run back to back in the same
+hour.
+
+So the board decides each leg on its own. A leg is **made** only when all four of these hold:
+
+- its spread (maker ÷ taker) is at least `MakerSpreadThresholdPercent` (default 200%, i.e. 2.00x) —
+  the queue has to be worth standing in;
+- it passes the health filter below;
+- its expected drain is under `MakerLegMinutesCap` (default 30) — a 1.72x spread behind a queue of
+  31200 draining at 83 a minute is over six hours of waiting, and no spread pays for that;
+- it has tradable depth.
+
+Otherwise it is **taken**, at `TakerLegSeconds` (default 60) of real click time. A leg with no
+immediate quote at all, or an empty immediate side, cannot be taken and stays a maker leg whatever its
+spread.
+
+At the shipped threshold this takes nearly everything: on the 2026-08-13 sweep it made 11 of 810 legs.
+That is the intent. The best all-taker cycle that sweep returned 3170 chaos/hour against 846 for the
+best all-maker one, before any fill discount at all.
+
+### Why cycles and not legs
+
+Ranking legs individually — which is what this board used to do — cannot see a lopsided pair. It
+shows you the easy side and never checks the return. `Tainted Armourer's Scrap` had the widest edge
+on the board at 2.84x with a maker queue of **3782 in and 19 out**: easy in, stuck out. Scoring the
+closed loop makes that visible, because the loop has to pay for both sides.
+
+### The health filter
+
+A cycle is believed only when **every** leg can actually be executed in the mode it was assigned. For a
+**maker** leg that means real queue behind its price and measured turnover:
+
+- `CompetingQueueAhead >= MinCycleQueue` (default 10) — someone is already standing behind that
+  price, so it is a book rather than one troll order. The number comes from the data: the widest-spread
+  trap cycles carried up-leg queues of 1, 2, 4 and 11, while cycles that survived a second sweep
+  carried 14 and up. It is a setting because that boundary moves with the league.
+- `turn/min > 0` on that leg — **measured**, not inferred. A leg with no second observation inside
+  `ChurnIntervalCapMinutes` has no evidence that anyone traded it.
+
+For a **taker** leg neither question applies: it does not queue, so it needs only an immediate quote
+with depth behind it. Asking the maker question of a leg nobody intends to queue behind was hiding
+real money — nine executable cycles on the 2026-08-13 sweep, led by a 2.01x Kalguuran Scarab loop with
+immediate depth on all three legs.
+
+Cycles that fail, and cycles whose `mult` does not clear 1.000, are hidden and counted in the header
+(`133 cycles, 71 hidden as thin or unprofitable`), so nothing disappears silently. Turn
+`EnableCycleHealthFilter` off to see everything; the header then reads `health filter off`.
+
+⚠ **A first sweep shows an empty board, and that is correct.** Turnover needs two observations of a
+pair, so until the hub leg `Divine>Chaos` has been swept twice, every cycle reads thin. The board says
+so in place of the rows rather than leaving you to guess.
 
 ### Columns
 
 | Column | Meaning |
 | --- | --- |
-| `pair` | Direction, `from>to`, with both names in full. Scarab and essence names share long prefixes - twenty essences begin `Deafening Essence of` - so an abbreviated cell would collapse a whole family into one indistinguishable string. |
-| `margin%` | `(competing head - immediate) / immediate`. The maker edge, computed exactly and converted to a percentage only for display. |
-| `imm` | Immediate input depth: how much is available to take right now. |
-| `queue` | How much is already queued ahead of the competing head. |
-| `tradable` | `min(imm, queue)`. Depth on one side only is not tradable depth. |
-| `churn/min` | Head-rate moves per minute between consecutive observations. `-` means the pair has been observed once and has no measurable velocity. |
-| `turn/min` | Units of depth appearing or disappearing per minute, across both sides of the direction. The finer of the two velocity signals: a book can be traded steadily without its head price ever moving, and that reads as `0.00` churn but non-zero turnover. |
-| `fills:no` | Measured fills and no-fills for this pair from `execution-audit-<league>.jsonl`. `-` means never traded. |
-| `min` | Expected minutes to fill. The measured median wins where there is one; failing that, `queue / turn per minute` — how long the queue in front of you takes to drain at the observed flow; failing that, head churn; failing everything, `ChurnIntervalCapMinutes`. |
-| `score` | `margin x tradable depth x fill confidence / expected minutes`. |
+| `cycle` | The loop, hub initial + target name + bridge initial + hub initial. Target names are printed in full: scarab and essence names share long prefixes — twenty essences begin `Deafening Essence of` — so an abbreviated cell would collapse a whole family into one indistinguishable string. |
+| `mode` | One letter per leg, in leg order: `M` made, `T` taken. `MTT` means queue for the first leg and cross the other two. Read `mult` back through this — a row reading `MMM` is the all-maker product, and any other mode is a mixed one. |
+| `mult` | The product of the rate each leg's **assigned mode** actually gets, computed exactly and converted to a decimal only for display. Above 1.000 is a profit before depth is considered. This is the number the policy would get, not the best number the book could theoretically show. |
+| `take` | The all-taker product — what you can execute right now, with no waiting on any leg. `0.000` means at least one leg has no immediate quote, so an instant run of this loop is not defined. Compare it against `mult`: if they are equal the row is already `TTT`, and if `take` alone clears 1.000 the loop is instant money. |
+| `lot` | How much of the starting currency the cycle can actually carry, propagated leg by leg and capped at each leg's own depth — the tradable depth on a made leg, the resting immediate depth on a taken one. Capping only the opening trade would report a gain you cannot take. |
+| `gain` | `lot x (mult - 1)`, in the cycle's **own** starting currency. |
+| `chaos/hr` | `gain` converted to chaos through the hub's own maker rate, divided by the cycle time. **The only column that ranks Divine-start and Chaos-start rows against each other**, and the default sort. `-` when the cycle does not profit. |
+| `min` | Expected minutes for the whole loop: the sum of its three legs. A **taken** leg costs `TakerLegSeconds` of click time and nothing else. A **made** leg costs its drain estimate — the measured median fill time where there is one; failing that `queue / turn per minute`, how long the queue in front of you takes to drain; failing that head churn; failing everything, `ChurnIntervalCapMinutes`. |
+| `queues` | The competing queue on each of the three legs, in order. |
+| `turn` | Units of depth appearing or disappearing per minute on each of the three legs, in order. `-` for a leg observed only once. |
+| `fills:no` | Measured fills and no-fills for the opening pair from `execution-audit-<league>.jsonl`. `-` means never traded. |
 
-Every factor of the score has its own column on purpose. A wide margin on a book one unit deep and a
-narrow margin on a deep fast book both show why they scored what they scored, so a ranking can be
-argued with rather than trusted.
+The last three columns keep the per-leg evidence on the row, so a ranking can be argued with rather
+than trusted — the same principle the old leg board was built on. A cycle whose `mult` is spectacular
+and whose `queues` read `181/4/3000` is telling you exactly where it will get stuck.
 
-`MarketSweepBoardSortHotkey` cycles the sort column: score, margin, tradable depth, churn, depth
-turnover, traded history. Sorting only reorders what is on screen; it never changes what was
-measured. An unknown churn or turnover sorts last rather than as zero, so a pair swept once is never
-mistaken for a dead one.
+`MarketSweepBoardSortHotkey` cycles the sort column: chaos/hr, multiplier, instant multiplier, gain,
+lot, cycle minutes, traded history. Sorting on instant multiplier puts the rows you can execute this
+minute on top. Sorting only reorders what is on screen; it never changes what was measured. Cycle
+minutes sorts *ascending* — the fastest loop leads — and **`gain` and `lot` are quoted in each row's
+own starting currency**, so sorting by either compares numbers that are not in the same unit. That is
+useful for "how much does this one move", but only `chaos/hr` is a profitability ranking.
 
 ### What velocity can and cannot see
 
@@ -308,8 +417,8 @@ long gap undercounts, because several moves collapse into one observation, and a
 has no value at all. Intervals longer than `ChurnIntervalCapMinutes` are therefore excluded rather
 than averaged in, and shorter intervals are weighted more heavily.
 
-The two signals answer different questions and both are on the board. Churn says how often the price
-is being rewritten; turnover says how much is actually changing hands. A book quietly consumed at an
+The two signals answer different questions. Churn says how often the price is being rewritten;
+turnover says how much is actually changing hands. A book quietly consumed at an
 unchanged price is invisible to the first and obvious to the second, which is why the fill estimate
 prefers turnover: the queue in front of a maker order is what has to drain before the order is
 reached, and turnover measures that draining in the same units as the queue. It is an approximation
@@ -319,7 +428,8 @@ the same as rows being consumed, so it runs optimistic on a book that is filling
 **Two settings that can silently cancel each other out.** Idle sweeping revisits a pair no sooner
 than `SweepStalePairMinutes`, and any interval longer than `ChurnIntervalCapMinutes` is discarded
 rather than averaged in. If the stale threshold is at or above the cap, every measurement an idle
-sweep produces is thrown away and both velocity columns stay `-` forever. The defaults (cap 90, stale
+sweep produces is thrown away, the `turn` column stays `-` forever, and the health filter therefore
+hides every cycle. The defaults (cap 90, stale
 30) are set well apart, but a settings file saved before this was fixed keeps its old values — the
 board draws a yellow warning line when it sees the two the wrong way round.
 
@@ -330,6 +440,64 @@ read the board still ranks, on the inferred signal alone.
 Observations are appended to `market-observations-<league>.jsonl` in the plugin config directory, one
 line per capture, pruned to `VelocityHistoryDays` on load. A corrupt file blocks that league's sweep
 and is left on disk untouched rather than being silently overwritten.
+
+### Trading what the sweep finds
+
+`TradeDuringSweep` lets a sweep act on what it finds instead of leaving the row on screen for you to
+notice. Tick it, press either sweep hotkey, and the moment a capture puts a `TTT` cycle on the board
+whose estimated profit clears `MinimumProfitChaos`, the sweep holds where it is, the ordinary full
+workflow trades that one cycle through to `Stashed`, and the sweep resumes at the step it was about
+to capture.
+
+The board still decides nothing economic. All it contributes is a **target name** - the one thing
+you supply by hand today. The route is planned from a fresh coherent three-market probe in exact
+integers, against the same `MinimumProfitChaos`, exactly as it is when you set `TargetCurrency`
+yourself. A row that has gone stale costs one probe and is refused; it cannot be traded on.
+
+- **The checkbox alone authorizes nothing.** Trading is armed by pressing a sweep hotkey while the
+  box is ticked, and it dies with that sweep. Nothing is persisted, so a reload leaves no standing
+  authority to spend and no trade arms until you press again.
+- **Every full-workflow precondition still applies** - all ten permissions, exclusive Lite
+  ownership, foreground client, the panels visible, calibration complete, readable state,
+  `ActiveFeature = Arbitrage`. It runs the same authorization the hotkey runs, not a copy of it. A
+  refusal is printed with its reason on the sweep line and the sweep carries on.
+- **Only `TTT` rows.** That is the claim that all three legs can be crossed this second, and it is
+  what makes the rest of the row mean anything: only for a `TTT` row do `mult`, `lot` and `gain`
+  describe an all-taker execution. An `MTT` row's profit includes a maker leg that this will not
+  post, so it is a number for a different trade. A loop that is profitable all-taker but displayed
+  as `MTT` is therefore invisible here - read the `take` column and trade it by hand.
+- **Every leg is crossed.** The route is planned with no competing legs at all, so there is no queue
+  wait, no `CompetingOrderWaitMinutes` timeout and no cancellation path. `EnableDirectDivineCycles`
+  routes need two competing legs and so never arise here.
+- **One cycle, then back to sweeping.** The workflow hands the panel back after a single route
+  rather than scanning for another. Discovery belongs to the sweep.
+- **One trade per target per press.** A target is spent the moment it is picked, whether the trade
+  paid, refused, or found no route, so a single press cannot spend twice on the same name. The next
+  press starts clean.
+- **Idle sweeping never trades.** `SweepWhileIdle` runs unattended, and unattended autonomous
+  spending is a much larger commitment than this checkbox.
+- **Finding nothing is the ordinary case.** With no qualifying row the sweep simply keeps sweeping:
+  nothing is placed and nothing is revoked.
+- **It always says why.** A line under the board header carries the reason nothing was traded - no
+  all-taker row, the best one under the floor, every qualifying target already spent this sweep, or
+  the specific refusal. A refusal is drawn in yellow; the ordinary "nothing qualifies" note in grey.
+
+Stopping the sweep mid-trade stops the survey only - the trade it started keeps running, and the
+status line says so. Stop that with `FullWorkflowHotkey`.
+
+If a trade stops **between its legs** - the principal already converted, the cycle not closed - the
+sweep stops too, and says which workflow is parked, at which leg, and what it is holding. That state
+looks settled to every other check in the plugin: no order is owed, nothing is uncollected, and the
+currency is safely in your stash. Only the workflow knows the cycle is half-done, and nothing will
+drive it further on its own, so the sweep will not quietly carry on around it. Finish or stop the
+parked workflow with `FullWorkflowHotkey` before sweeping again.
+
+Between its first leg and the leg that realizes Chaos, a workflow that has to replan will accept any
+plan that still pays something, rather than holding out for `MinimumProfitChaos` - the principal is
+already committed, and stranding it to chase the floor is the worse outcome. It will not accept a
+plan that closes at a loss: that reprobes for a while, and if the book does not come back it stops
+and tells you. Past the realizing leg this no longer applies, because restoring the principal is a
+debt to settle at whatever it costs, not a trade to decline.
 
 ## Reading the Overlay
 
@@ -406,3 +574,4 @@ Do not use forced reset as normal recovery. It abandons accounting but does not 
 orders.
 
 For sell sweep behavior, see [SELL-SWEEP.md](SELL-SWEEP.md).
+For market sweep scoping and its regression steps, see [MARKET-SWEEP.md](MARKET-SWEEP.md).

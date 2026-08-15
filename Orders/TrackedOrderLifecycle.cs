@@ -39,6 +39,24 @@ public static class TrackedOrderLifecycle
     public static long RemainingReturnToCollect(TrackedOrderState tracked) =>
         TotalOfferedReturn(tracked) - tracked.SettledReturnAmount - tracked.PendingReturnBatchAmount;
 
+    public static long ExpectedBulkOwned(TrackedOrderState tracked)
+    {
+        ArgumentNullException.ThrowIfNull(tracked);
+        if (tracked.BulkCollectionOwnedBaseline is not { } baseline)
+            throw new InvalidOperationException("Bulk collection has no authenticated ownership baseline.");
+        return checked(baseline + tracked.SettledWantedAmount + tracked.PendingWantedBatchAmount);
+    }
+
+    public static bool BulkWantedStashCompletesSettlement(TrackedOrderState tracked)
+    {
+        ArgumentNullException.ThrowIfNull(tracked);
+        return tracked.BulkCollectionOwnedBaseline is not null &&
+               checked(tracked.SettledWantedAmount + tracked.PendingWantedBatchAmount) ==
+                   TotalWantedProceeds(tracked) &&
+               tracked.SettledReturnAmount == TotalOfferedReturn(tracked) &&
+               tracked.PendingReturnBatchAmount == 0;
+    }
+
     public static long RemainingToCollect(TrackedOrderState tracked) =>
         RemainingWantedToCollect(tracked) + RemainingReturnToCollect(tracked);
 

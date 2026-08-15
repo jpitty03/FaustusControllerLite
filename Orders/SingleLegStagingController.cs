@@ -121,6 +121,15 @@ public sealed class SingleLegStagingController
     public string Status { get; private set; } = "Idle; no leg is staged.";
     public string Failure { get; private set; } = string.Empty;
     public bool FreshProbeRetryRecommended { get; private set; }
+
+    /// <summary>
+    /// Whether <see cref="Failure"/> came from <see cref="Invalidate"/> dropping a staged leg whose plan was
+    /// recomputed, rather than from staging going wrong. Both leave the controller <c>Cancelled</c> carrying
+    /// a reason, and a caller that cannot tell them apart reports routine housekeeping as the reason a
+    /// workflow stopped - which is how "Candidate was recalculated." came to stand in for a real preparation
+    /// failure in the runtime log on 2026-08-14.
+    /// </summary>
+    public bool FailureIsRoutineInvalidation { get; private set; }
     public bool IsRunning => State is not SingleLegStagingState.Idle and
         not SingleLegStagingState.Staged and
         not SingleLegStagingState.Cancelled;
@@ -148,6 +157,7 @@ public sealed class SingleLegStagingController
         Status = "Idle; no leg is staged.";
         Failure = string.Empty;
         FreshProbeRetryRecommended = false;
+        FailureIsRoutineInvalidation = false;
         _leg = null;
 
         if (!TryValidatePolicy(leg, quoteValidationPolicy, out failure))
@@ -322,6 +332,7 @@ public sealed class SingleLegStagingController
         }
 
         Failure = reason;
+        FailureIsRoutineInvalidation = false;
         if (_pairSelector.IsRunning)
         {
             _pairSelector.Cancel(reason);
@@ -343,6 +354,7 @@ public sealed class SingleLegStagingController
 
         _leg = null;
         Failure = reason;
+        FailureIsRoutineInvalidation = true;
         State = SingleLegStagingState.Cancelled;
         Status = $"Invalidated: {reason}";
     }
