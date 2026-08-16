@@ -67,6 +67,8 @@ public sealed class TrackedOrderCancellationController
     private Func<TrackedOrderState, string, bool>? _persist;
     private IReadOnlyList<PlacedOrderSnapshot> _baselineOrders = [];
     private string _unrelatedFingerprint = string.Empty;
+    private string _unrelatedIdentityFingerprint = string.Empty;
+    private readonly List<int> _siblingOrderIds = [];
     private string _league = string.Empty;
     private int _areaInstanceId;
     private Vector2 _moveStart;
@@ -97,10 +99,12 @@ public sealed class TrackedOrderCancellationController
         bool conflictingControllerEnabled,
         int cursorSpeed,
         Func<TrackedOrderState, string, bool> persist,
+        IReadOnlyCollection<int> siblingOrderIds,
         out string failure)
     {
         ArgumentNullException.ThrowIfNull(tracked);
         ArgumentNullException.ThrowIfNull(persist);
+        ArgumentNullException.ThrowIfNull(siblingOrderIds);
         if (IsRunning || tracked.Status != TrackedOrderStatus.TimedOut || !permissions.Ready ||
             conflictingControllerEnabled || gameController.Game.IngameState.IngameUi.PopUpWindow.IsVisible)
         {
@@ -115,8 +119,11 @@ public sealed class TrackedOrderCancellationController
         _tracked = tracked;
         _persist = persist;
         _baselineOrders = orders;
-        _unrelatedFingerprint = TrackedOrderLifecycle.OrderSetFingerprint(
-            orders.Where(candidate => !TrackedOrderLifecycle.IdentityMatches(tracked, candidate)));
+        _siblingOrderIds.Clear();
+        _siblingOrderIds.AddRange(siblingOrderIds.Where(id => id != order!.PlayerOrderId));
+        (_unrelatedFingerprint, _unrelatedIdentityFingerprint) = TrackedOrderLifecycle.CaptureUnrelatedOrders(
+            orders.Where(candidate => !TrackedOrderLifecycle.IdentityMatches(tracked, candidate)),
+            _siblingOrderIds);
         _league = gameController.Game.IngameState.ServerData.League;
         _areaInstanceId = gameController.Game.IngameState.ServerData.InstanceId;
         _cancelButtonClicked = false;
@@ -411,7 +418,9 @@ public sealed class TrackedOrderCancellationController
             PlayerOrderIdAtArm = order!.PlayerOrderId,
             RemainingOfferedAtArm = order.RemainingOfferedAmount,
             ReceivedWantedAtArm = order.ReceivedWantedAmount,
-            UnrelatedOrdersFingerprint = _unrelatedFingerprint
+            UnrelatedOrdersFingerprint = _unrelatedFingerprint,
+            UnrelatedIdentityFingerprint = _unrelatedIdentityFingerprint,
+            SiblingOrderIds = [.. _siblingOrderIds]
         };
         if (!_persist!(armed, "TrackedOrderCancellationArmed"))
         {
@@ -558,11 +567,12 @@ public sealed class TrackedOrderCancellationController
     }
 
     private bool SnapshotsUnchanged(IReadOnlyList<PlacedOrderSnapshot> orders) =>
-        TrackedOrderCollectionController.SnapshotsEqual(_baselineOrders, orders);
+        TrackedOrderCollectionController.SnapshotsEqual(_baselineOrders, orders, _siblingOrderIds);
 
     private bool UnrelatedOrdersUnchanged(IReadOnlyList<PlacedOrderSnapshot> orders, PlacedOrderSnapshot tracked) =>
-        TrackedOrderLifecycle.OrderSetFingerprint(
-            orders.Where(order => !TrackedOrderLifecycle.IdentityMatches(_tracked!, order))) == _unrelatedFingerprint;
+        TrackedOrderLifecycle.UnrelatedOrdersUnchanged(
+            orders.Where(order => !TrackedOrderLifecycle.IdentityMatches(_tracked!, order)),
+            _unrelatedFingerprint, _unrelatedIdentityFingerprint, _siblingOrderIds);
 
     public static bool TryValidateTerminalRow(
         GameController gameController,
@@ -578,13 +588,13 @@ public sealed class TrackedOrderCancellationController
         }
         var index = orders.Select((order, orderIndex) => (order, orderIndex))
             .Single(pair => pair.order.PlayerOrderId == terminal.PlayerOrderId).orderIndex;
-        var expectedText = kind == LifecycleObservationKind.Canceled ? "Order Cancelled" : "Order Completed";
         var row = panel.OrderElements[index];
         var matchingRows = panel.OrderElements.Where(element => element.IsVisible &&
-            TerminalRowTextsMatch(EnumerateText(element, 0), terminal, expectedText)).ToArray();
+            TerminalRowTextsMatch(EnumerateText(element, 0), terminal)).ToArray();
         if (matchingRows.Length != 1 || row.Address != matchingRows[0].Address)
         {
-            failure = $"Terminal SDK model did not align with one unique visible {expectedText} row.";
+            failure = $"Terminal SDK model did not align with one unique visible terminal row; " +
+                $"found {matchingRows.Length}.";
             return false;
         }
         failure = string.Empty;
@@ -600,14 +610,17 @@ public sealed class TrackedOrderCancellationController
             numeric.Contains(terminal.RemainingOfferedAmount);
     }
 
+    /// <summary>
+    /// A row that has stopped trading and whose displayed amounts match this terminal snapshot.
+    /// Which terminal it reached is proved by the amounts, not by the status string - see
+    /// <see cref="OrderRowStatusText"/> for why the string cannot carry that.
+    /// </summary>
     public static bool TerminalRowTextsMatch(
         IEnumerable<string> texts,
-        PlacedOrderSnapshot terminal,
-        string expectedStatus)
+        PlacedOrderSnapshot terminal)
     {
         var values = texts.ToArray();
-        return values.Any(text => text.Equals(expectedStatus, StringComparison.OrdinalIgnoreCase)) &&
-            TerminalRowAmountsMatch(values, terminal);
+        return OrderRowStatusText.IsTerminal(values) && TerminalRowAmountsMatch(values, terminal);
     }
 
     private bool ClickLeftOnce(out string failure)

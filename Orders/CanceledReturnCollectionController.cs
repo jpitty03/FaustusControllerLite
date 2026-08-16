@@ -1,4 +1,4 @@
-using ExileCore;
+﻿using ExileCore;
 using ExileCore.PoEMemory;
 using FaustusControllerLite.Input;
 using System.Numerics;
@@ -29,6 +29,8 @@ public sealed class CanceledReturnCollectionController
     private Func<TrackedOrderState, string, bool>? _persist;
     private InventoryTransferSnapshot? _inventoryBefore;
     private string _unrelatedFingerprint = string.Empty;
+    private string _unrelatedIdentityFingerprint = string.Empty;
+    private readonly List<int> _siblingOrderIds = [];
     private long _aggregateOwnedBefore;
     private SettlementAsset? _asset;
     private bool _rowShouldDisappear;
@@ -65,8 +67,10 @@ public sealed class CanceledReturnCollectionController
         int cursorSpeed,
         long aggregateOwnedBefore,
         Func<TrackedOrderState, string, bool> persist,
+        IReadOnlyCollection<int> siblingOrderIds,
         out string failure)
     {
+        ArgumentNullException.ThrowIfNull(siblingOrderIds);
         var remainingWanted = TrackedOrderLifecycle.RemainingWantedToCollect(tracked);
         var remainingReturn = TrackedOrderLifecycle.RemainingReturnToCollect(tracked);
         if (IsRunning || tracked.Status is not TrackedOrderStatus.CanceledUncollected and
@@ -130,8 +134,11 @@ public sealed class CanceledReturnCollectionController
         _rowShouldDisappear = remainingWanted + remainingReturn - batch == 0;
         _terminalStatus = tracked.Status;
         _calibration = calibration;
-        _unrelatedFingerprint = TrackedOrderLifecycle.OrderSetFingerprint(
-            orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)));
+        _siblingOrderIds.Clear();
+        _siblingOrderIds.AddRange(siblingOrderIds.Where(id => id != tracked.PlayerOrderId));
+        (_unrelatedFingerprint, _unrelatedIdentityFingerprint) = TrackedOrderLifecycle.CaptureUnrelatedOrders(
+            orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)),
+            _siblingOrderIds);
         _league = gameController.Game.IngameState.ServerData.League;
         _areaInstanceId = gameController.Game.IngameState.ServerData.InstanceId;
         _clickAttempted = false;
@@ -211,12 +218,10 @@ public sealed class CanceledReturnCollectionController
         var index = orders.Select((order, orderIndex) => (order, orderIndex))
             .Single(pair => pair.order.PlayerOrderId == matches[0].PlayerOrderId).orderIndex;
         row = panel.OrderElements[index];
-        var expectedStatus = matches[0].IsCanceled ? "Order Cancelled" : "Order Completed";
-        if (!row.IsVisible || !EnumerateText(row, 0).Any(text =>
-                text.Equals(expectedStatus, StringComparison.OrdinalIgnoreCase)))
+        if (!row.IsVisible || !OrderRowStatusText.IsTerminal(EnumerateText(row, 0)))
         {
             row = null;
-            failure = "Parallel terminal settlement row lacked exact visible status evidence.";
+            failure = "Parallel terminal settlement row is not visibly terminal.";
             return false;
         }
         failure = string.Empty;
@@ -354,6 +359,8 @@ public sealed class CanceledReturnCollectionController
             AggregateOwnedBefore = _aggregateOwnedBefore,
             NonTargetInventoryFingerprint = InventoryTransferEvidence.NonTargetFingerprint(inventory, asset.Metadata),
             UnrelatedOrdersFingerprint = _unrelatedFingerprint,
+            UnrelatedIdentityFingerprint = _unrelatedIdentityFingerprint,
+            SiblingOrderIds = [.. _siblingOrderIds],
             AreaInstanceId = _areaInstanceId,
             ArmedAtUtc = DateTimeOffset.UtcNow
         };
@@ -425,7 +432,9 @@ public sealed class CanceledReturnCollectionController
                 ? ClickedSlotIconCleared(gameController, _tracked!, _asset, _calibration!, out failure)
                 : TerminalSlotHasIcon(gameController, _tracked!, _asset, _calibration!, out failure));
         var unrelated = orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(_tracked!, order));
-        if (rowEvidence && TrackedOrderLifecycle.OrderSetFingerprint(unrelated) == _unrelatedFingerprint &&
+        if (rowEvidence &&
+            TrackedOrderLifecycle.UnrelatedOrdersUnchanged(
+                unrelated, _unrelatedFingerprint, _unrelatedIdentityFingerprint, _siblingOrderIds) &&
             InventoryStashTransferController.TryReadSnapshot(
                 gameController, _asset!.Metadata, _staticMaxStackSize, out var inventory, out failure) &&
             inventory.TargetInventoryAmount == checked(_inventoryBefore!.TargetInventoryAmount + _asset.Amount) &&
@@ -493,20 +502,68 @@ public sealed class CanceledReturnCollectionController
                 : TerminalSlotHasIcon(gameController, tracked, collectedAsset, calibration, out failure));
         var unrelated = orders.Where(order =>
             !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order));
-        if (!rowEvidence || TrackedOrderLifecycle.OrderSetFingerprint(unrelated) != intent.UnrelatedOrdersFingerprint ||
-            !InventoryStashTransferController.TryReadSnapshot(
-                gameController, intent.Metadata, PersistedMaxStackSize(tracked, intent.WantedSlot),
-                out var inventory, out failure) ||
-            inventory.TargetInventoryAmount != checked(intent.InventoryAmountBefore + intent.Amount) ||
-            inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore ||
-            InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
-                intent.NonTargetInventoryFingerprint ||
-            checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore) > intent.AggregateOwnedBefore ||
-            checked(inventory.TargetInventoryAmount + inventory.TargetVisibleStashAmount) !=
-                checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore + intent.Amount))
+        // Every condition reports itself. This was one sentence covering eight different faults, and
+        // reading it in a log told you only that recovery had refused - never which evidence moved.
+        if (!rowEvidence)
         {
             if (string.IsNullOrEmpty(failure))
-                failure = "Interrupted terminal collection did not match exact row/inventory/stash/ownership post-state.";
+            {
+                failure = rowShouldDisappear
+                    ? $"Interrupted collection expected the terminal row to be gone; found {trackedMatches.Length}."
+                    : $"Interrupted collection expected one terminal row left at {expectedWantedAfter} wanted / " +
+                        $"{expectedReturnAfter} offered; found {trackedMatches.Length} matching row(s).";
+            }
+            return false;
+        }
+        if (!TrackedOrderLifecycle.UnrelatedOrdersUnchanged(
+                unrelated, intent.UnrelatedOrdersFingerprint, intent.UnrelatedIdentityFingerprint,
+                intent.SiblingOrderIds))
+        {
+            failure = $"Interrupted collection found unrelated orders changed after the click " +
+                $"({intent.SiblingOrderIds.Count} sibling row(s) were allowed to fill).";
+            return false;
+        }
+        if (!InventoryStashTransferController.TryReadSnapshot(
+                gameController, intent.Metadata, PersistedMaxStackSize(tracked, intent.WantedSlot),
+                out var inventory, out failure))
+        {
+            return false;
+        }
+        var expectedAfter = checked(intent.InventoryAmountBefore + intent.Amount);
+        if (inventory.TargetInventoryAmount != expectedAfter)
+        {
+            failure = $"Interrupted collection expected {expectedAfter} {intent.Metadata} in inventory " +
+                $"({intent.InventoryAmountBefore} before + {intent.Amount} collected); " +
+                $"found {inventory.TargetInventoryAmount}.";
+            return false;
+        }
+        if (inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore)
+        {
+            failure = $"Interrupted collection saw the visible stash's {intent.Metadata} move " +
+                $"{intent.VisibleStashAmountBefore} -> {inventory.TargetVisibleStashAmount} " +
+                $"(visible tab {inventory.VisibleTabType}).";
+            return false;
+        }
+        if (InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
+            intent.NonTargetInventoryFingerprint)
+        {
+            failure = "Interrupted collection found non-target inventory custody changed after the click.";
+            return false;
+        }
+        if (checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore) > intent.AggregateOwnedBefore)
+        {
+            failure = $"Interrupted collection recorded more {intent.Metadata} in inventory and visible stash " +
+                $"({intent.InventoryAmountBefore} + {intent.VisibleStashAmountBefore}) than it owned " +
+                $"({intent.AggregateOwnedBefore}).";
+            return false;
+        }
+        if (checked(inventory.TargetInventoryAmount + inventory.TargetVisibleStashAmount) !=
+            checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore + intent.Amount))
+        {
+            failure = $"Interrupted collection expected inventory plus visible stash to hold " +
+                $"{checked(intent.InventoryAmountBefore + intent.VisibleStashAmountBefore + intent.Amount)} " +
+                $"{intent.Metadata}; found " +
+                $"{checked(inventory.TargetInventoryAmount + inventory.TargetVisibleStashAmount)}.";
             return false;
         }
         failure = string.Empty;
@@ -546,22 +603,65 @@ public sealed class CanceledReturnCollectionController
         }
         var trackedMatches = orders.Where(order => TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order)).ToArray();
         var unrelated = orders.Where(order => !TrackedOrderLifecycle.TerminalIdentityMatches(tracked, order));
-        if (trackedMatches.Length != 1 ||
-            trackedMatches[0].ReceivedWantedAmount != TrackedOrderLifecycle.RemainingWantedToCollect(tracked) ||
-            trackedMatches[0].RemainingOfferedAmount != TrackedOrderLifecycle.RemainingReturnToCollect(tracked) ||
-            TrackedOrderLifecycle.OrderSetFingerprint(unrelated) != intent.UnrelatedOrdersFingerprint ||
-            !TerminalSlotHasIcon(gameController, tracked, asset, calibration, out failure) ||
+        if (trackedMatches.Length != 1)
+        {
+            failure = $"Interrupted collection expected exactly one terminal row before the click; " +
+                $"found {trackedMatches.Length}.";
+            return false;
+        }
+        if (trackedMatches[0].ReceivedWantedAmount != TrackedOrderLifecycle.RemainingWantedToCollect(tracked) ||
+            trackedMatches[0].RemainingOfferedAmount != TrackedOrderLifecycle.RemainingReturnToCollect(tracked))
+        {
+            failure = $"Interrupted collection expected the terminal row to still hold " +
+                $"{TrackedOrderLifecycle.RemainingWantedToCollect(tracked)} wanted / " +
+                $"{TrackedOrderLifecycle.RemainingReturnToCollect(tracked)} offered; found " +
+                $"{trackedMatches[0].ReceivedWantedAmount} / {trackedMatches[0].RemainingOfferedAmount}.";
+            return false;
+        }
+        if (!TrackedOrderLifecycle.UnrelatedOrdersUnchanged(
+                unrelated, intent.UnrelatedOrdersFingerprint, intent.UnrelatedIdentityFingerprint,
+                intent.SiblingOrderIds))
+        {
+            failure = $"Interrupted collection found unrelated orders changed before the click " +
+                $"({intent.SiblingOrderIds.Count} sibling row(s) were allowed to fill).";
+            return false;
+        }
+        if (!TerminalSlotHasIcon(gameController, tracked, asset, calibration, out failure) ||
             !InventoryStashTransferController.TryReadSnapshot(
                 gameController, intent.Metadata, PersistedMaxStackSize(tracked, intent.WantedSlot),
-                out var inventory, out failure) ||
-            inventory.TargetInventoryAmount != intent.InventoryAmountBefore ||
-            inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore ||
-            InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
-                intent.NonTargetInventoryFingerprint ||
-            checked(inventory.TargetInventoryAmount + inventory.TargetVisibleStashAmount) > intent.AggregateOwnedBefore)
+                out var inventory, out failure))
         {
             if (string.IsNullOrEmpty(failure))
-                failure = "Interrupted terminal collection did not match exact durable pre-click evidence.";
+            {
+                failure = "Interrupted collection could not read the terminal slot icon or the inventory.";
+            }
+            return false;
+        }
+        if (inventory.TargetInventoryAmount != intent.InventoryAmountBefore)
+        {
+            failure = $"Interrupted collection expected {intent.InventoryAmountBefore} {intent.Metadata} " +
+                $"still in inventory before the click; found {inventory.TargetInventoryAmount}.";
+            return false;
+        }
+        if (inventory.TargetVisibleStashAmount != intent.VisibleStashAmountBefore)
+        {
+            failure = $"Interrupted collection saw the visible stash's {intent.Metadata} move " +
+                $"{intent.VisibleStashAmountBefore} -> {inventory.TargetVisibleStashAmount} " +
+                $"(visible tab {inventory.VisibleTabType}).";
+            return false;
+        }
+        if (InventoryTransferEvidence.NonTargetFingerprint(inventory, intent.Metadata) !=
+            intent.NonTargetInventoryFingerprint)
+        {
+            failure = "Interrupted collection found non-target inventory custody changed before the click.";
+            return false;
+        }
+        if (checked(inventory.TargetInventoryAmount + inventory.TargetVisibleStashAmount) >
+            intent.AggregateOwnedBefore)
+        {
+            failure = $"Interrupted collection saw more {intent.Metadata} in inventory and visible stash " +
+                $"({inventory.TargetInventoryAmount} + {inventory.TargetVisibleStashAmount}) than the " +
+                $"{intent.AggregateOwnedBefore} it owned when it armed.";
             return false;
         }
         failure = string.Empty;
@@ -592,11 +692,9 @@ public sealed class CanceledReturnCollectionController
         var index = orders.Select((order, orderIndex) => (order, orderIndex))
             .Single(pair => pair.order.PlayerOrderId == matches[0].PlayerOrderId).orderIndex;
         var row = panel.OrderElements[index];
-        var expectedStatus = matches[0].IsCanceled ? "Order Cancelled" : "Order Completed";
-        if (!row.IsVisible || !EnumerateText(row, 0).Any(text =>
-                text.Equals(expectedStatus, StringComparison.OrdinalIgnoreCase)))
+        if (!row.IsVisible || !OrderRowStatusText.IsTerminal(EnumerateText(row, 0)))
         {
-            failure = "Terminal row lost exact visible status evidence after first asset collection.";
+            failure = "Terminal row stopped being visibly terminal after first asset collection.";
             return false;
         }
         var rect = row.GetClientRectCache;

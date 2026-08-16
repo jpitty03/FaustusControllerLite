@@ -1,4 +1,4 @@
-using ExileCore;
+﻿using ExileCore;
 using ExileCore.PoEMemory.MemoryObjects;
 using FaustusControllerLite.Core;
 using FaustusControllerLite.Domain;
@@ -105,6 +105,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private string _catalogueStatus = "Waiting for Currency Exchange catalogue.";
     private string _operationStatus = "Idle (Milestone 9 full-workflow orchestration available; all input remains permission-gated).";
     private string _lastFailure = "None";
+    private string _lastSellSweepSkipReason = "None";
     private string _lastCandidate = "None; capture all three markets in one area/session.";
     private string _trackedOrder = "None";
     private FeatureMode _activeFeature = FeatureMode.Arbitrage;
@@ -121,7 +122,43 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
     private long _collectionOwnedBaseline;
     private long _collectionBatchAmount;
     private DateTimeOffset _nextLifecyclePollAtUtc;
+    private DateTimeOffset _nextSlotMoveAtUtc;
+
+    /// <summary>
+    /// How often an order may move between the active and resting slots, and how long to wait after
+    /// a move fails. Each move is a canonical write, so this is the hard ceiling on how fast the
+    /// sweep can rewrite its own state file however wrong the logic above it turns out to be.
+    /// </summary>
+    private const int SlotMoveIntervalMilliseconds = 500;
+    private const int SlotMoveBackoffSeconds = 5;
+
+    /// <summary>
+    /// How many times one candidate may be re-planned before the sweep gives up on it. A quote that
+    /// moves between planning and staging is ordinary - especially at an immediate head, which is
+    /// repriced by every fill - so re-probing is the right answer and stopping the sweep is not. But
+    /// re-probing without a bound is its own failure: a market volatile enough to move on every
+    /// attempt would hold the queue forever. Past this, the holding is skipped, which is what the
+    /// sweep already does with a market it cannot use.
+    /// </summary>
+    private const int MaximumSweepReProbes = 3;
+    private int _sweepReProbeIndex = -1;
+    private int _sweepReProbeCount;
     private DateTimeOffset _collectionOwnershipPhaseStartedAtUtc;
+
+    /// <summary>
+    /// How long the collected proceeds have to finish appearing in the inventory.
+    ///
+    /// The order row disappears the instant the server acknowledges the collect; the item entities
+    /// arrive afterwards, and a batch of nineteen stacks takes visibly longer to arrive than one of
+    /// two. Every other stage of this flow already waits - three seconds for the row to disappear,
+    /// three for canceled-return evidence, two stable reads for ownership - and the inventory check
+    /// was the one stage with no window at all: a single read, and ambiguity if it lost the race.
+    /// It is the longest of them because it is the only one waiting on a count of items rather than
+    /// on one thing changing.
+    /// </summary>
+    private static readonly TimeSpan CollectedInventorySettleTimeout = TimeSpan.FromSeconds(6);
+    private DateTimeOffset _collectedInventoryDeadlineUtc;
+    private long _collectedInventoryOwned;
     private string _collectionOwnershipMetadata = string.Empty;
     private string _stashTransferMetadata = string.Empty;
     private long _stashTransferAmount;
@@ -153,6 +190,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         ReadingCanceledReturnBaseline,
         CollectingCanceledReturn,
         ReadingCanceledReturnAfter,
+        SettlingCollectedInventory,
     }
 
     private enum SweepExecutionState
@@ -296,6 +334,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         ObservePickerOwnership();
         ObservePickerCalibration();
         PollTrackedOrderLifecycle();
+        PollSweepSlotMoves();
 
         var wizardHotkeyHandled = HandleCalibrationWizardHotkeys();
         if (!wizardHotkeyHandled)
@@ -486,6 +525,10 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             CollectionInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
             IsFullFaustusControllerEnabled());
         SynchronizeTrackedCollection();
+        if (_collectionFlow == CollectionFlowState.SettlingCollectedInventory)
+        {
+            SettleVerifiedCollection(_collectedInventoryOwned);
+        }
         _inventoryStashTransfer.Tick(
             GameController,
             StashTransferInputPermissions.From(Settings, _fullWorkflowAuthorized, _sweepAuthorized),
@@ -637,6 +680,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ref y, panelVisible && _catalogue is not null ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
         DrawStatus($"Operation: {_operationStatus}", ref y, SharpDX.Color.White);
         DrawStatus($"Last failure: {_lastFailure}", ref y, _lastFailure == "None" ? SharpDX.Color.Gray : SharpDX.Color.OrangeRed);
+        DrawStatus($"Previous Operation: {_lastSellSweepSkipReason}", ref y, _lastSellSweepSkipReason == "None" ? SharpDX.Color.Gray : SharpDX.Color.Yellow);
         DrawStatus($"Bankroll: {DescribeBankrollCompact()}", ref y,
             _bankroll.IsInitialized ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow);
         DrawStatus(_activeFeature == FeatureMode.Arbitrage
@@ -1042,6 +1086,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _sellSweep = SellSweepCoordinator.Stop(active, "Operator stopped the sweep.", now);
             _sellSweepStatus = DescribeSellSweep(_sellSweep);
             _operationStatus = "Sell sweep stopped by operator.";
+            _lastSellSweepSkipReason = "None";
             return;
         }
 
@@ -1080,6 +1125,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _sellSweep = planned;
         _sellSweepStatus = DescribeSellSweep(planned!);
         _lastFailure = "None";
+        _lastSellSweepSkipReason = "None";
         _operationStatus = planned!.Phase == SellSweepPhase.Completed
             ? "Sell sweep planned nothing to sell."
             : $"Sell sweep planned {planned.Candidates.Count} candidate(s) in " +
@@ -1269,7 +1315,12 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             : $"Enable the missing sell-sweep permissions: {string.Join(", ", missing)}.";
     }
 
-    private static string DescribeSellSweep(SellSweepState sweep)
+    private static string DescribeSweepSlots(SellSweepState sweep) =>
+        sweep.Slots.Count == 0
+            ? "none"
+            : string.Join(",", sweep.Slots.Select(slot => slot.AttemptId.ToString("D")));
+
+    private string DescribeSellSweep(SellSweepState sweep)
     {
         var current = sweep.Current;
         var sold = sweep.Candidates.Count(
@@ -1279,9 +1330,34 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             : $"{current.Name} x{current.HoldingAtScan} (~{current.PlannedProceedsChaos}c)";
         return $"{sweep.Phase} [{SellSweepExecutionModes.ToLabel(sweep.ExecutionMode)} / " +
             $"{SellSweepExecutionModes.ToExecutionIntent(sweep.ExecutionMode)}]: {position}; " +
-            $"{sold}/{sweep.Candidates.Count} sold, " +
+            $"{DescribeSweepOccupancy(sweep)}; {sold}/{sweep.Candidates.Count} sold, " +
             $"{sweep.RealizedProceedsChaos}c realized. {sweep.Detail}";
     }
+
+    /// <summary>
+    /// How many slots are holding an order and what each has been waiting on. Idle slots are sweep
+    /// throughput left on the table, so the operator sees the number that matters most.
+    /// </summary>
+    private string DescribeSweepOccupancy(SellSweepState sweep)
+    {
+        var limit = SweepSlotLimit();
+        if (sweep.Slots.Count == 0)
+        {
+            return $"0/{limit} resting";
+        }
+        var now = DateTimeOffset.UtcNow;
+        var detail = string.Join(", ", sweep.Slots.Select(slot =>
+            $"{sweep.CandidateFor(slot)?.Name ?? "unknown"} " +
+            $"{(long)Math.Max(0d, (now - slot.PlacedAtUtc).TotalSeconds)}s"));
+        return $"{sweep.Slots.Count}/{limit} resting ({detail})";
+    }
+
+    /// <summary>
+    /// How many orders the sweep may keep resting at once. Clamped to what the exchange can hold,
+    /// because a slot the panel has no row for is a slot that can only fail at placement.
+    /// </summary>
+    private int SweepSlotLimit() =>
+        Math.Clamp(Settings.MaxConcurrentSweepOrders.Value, 1, ExchangeOrderCapacity.MaxExchangeOrders);
 
     private bool HandleCalibrationWizardHotkeys()
     {
@@ -1978,8 +2054,9 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             revoked.Add($"probe session changed from {sweep.OriginProbeSessionId:D} to {_manualProbeSessionId:D}");
         var reason = $"Sell-sweep authorization changed before an input controller tick: " +
             $"{string.Join("; ", revoked)}. Automatic input stopped.";
-        var durable = sweep.Phase == SellSweepPhase.OrderLive ||
-            _trackedOrderState?.IsUnresolved == true && sweep.CurrentAttemptId == _trackedOrderState.AttemptId;
+        var durable = sweep.Slots.Count > 0 ||
+            _trackedOrderState?.IsUnresolved == true &&
+                sweep.FindSlot(_trackedOrderState.AttemptId) is not null;
         _automatedProbe.Cancel(reason);
         _singleLegStaging.Cancel(reason);
         _singleLegPlacement.Cancel(reason);
@@ -2009,7 +2086,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         var now = DateTimeOffset.UtcNow;
-        var directive = SellSweepCoordinator.Decide(sweep, _trackedOrderState);
+        var directive = SellSweepCoordinator.Decide(
+            sweep, _trackedOrderState, _bankroll.RestingOrders, SweepSlotLimit());
         switch (directive)
         {
             case SellSweepDirectiveKind.RescanAndPlanCurrentCandidate:
@@ -2053,10 +2131,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             case SellSweepDirectiveKind.AdvanceToNextCandidate:
                 AdvanceSweepCandidate(sweep, now);
                 break;
+            case SellSweepDirectiveKind.PromoteRestingOrderForSettlement:
+                PromoteRestingSweepOrderForSettlement(sweep);
+                break;
             case SellSweepDirectiveKind.ManualReconciliationRequired:
                 MarkSweepAmbiguous(sweep,
                     $"Sweep/tracked attempt mismatch or unresolved state requires manual reconciliation " +
-                    $"(sweep={sweep.CurrentAttemptId?.ToString("D") ?? "none"}, tracked={_trackedOrderState?.AttemptId.ToString("D") ?? "none"}).",
+                    $"(sweep={DescribeSweepSlots(sweep)}, tracked={_trackedOrderState?.AttemptId.ToString("D") ?? "none"}).",
                     now);
                 break;
             case SellSweepDirectiveKind.None:
@@ -2074,16 +2155,48 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             _sellSweepStatus = $"{DescribeSellSweep(sweep)} | {_operationStatus}";
             return;
         }
-        if (IsAnyInputOperationActive() || IsCollectionFlowActive() || _trackedCancellation.IsRunning ||
-            _bankrollLoadBlocked || _trackedOrderLoadBlocked || !_bankroll.IsInitialized ||
-            _bankroll.HasUnresolvedOrder || _trackedOrderState?.IsUnresolved == true ||
-            !_pickerCalibration.IsComplete || !_pickerCalibration.IsPlacementComplete)
+        // Waiting is not failing. A multi-order sweep races with itself constantly - an order that
+        // has not been demoted yet, one just promoted and not yet reclassified, a controller
+        // mid-operation - and every one of those resolves on its own within a tick or two. Stopping
+        // on one aborts the sweep and strands every order it has out, which is what a promoted
+        // order arriving mid-pricing used to do.
+        if (SweepActiveSlotIsBusy(sweep, out var busyReason))
         {
-            StopSweepBeforePlacement(sweep, "Sweep placement preconditions were unavailable.", now);
+            _sellSweepStatus = $"{DescribeSellSweep(sweep)} | placement waiting: {busyReason}";
+            return;
+        }
+        // These do not resolve on their own, and each names itself: "preconditions were unavailable"
+        // covered eight faults with one sentence.
+        var blockers = new[]
+        {
+            (_bankrollLoadBlocked, "canonical bankroll is not loadable"),
+            (_trackedOrderLoadBlocked, "tracked-order state is not loadable"),
+            (!_bankroll.IsInitialized, "canonical bankroll is not initialized"),
+            (_bankroll.RestingOrders.Any(TrackedOrderRestPolicy.BlocksTrading), "a resting order is ambiguous"),
+            (_trackedOrderState?.IsUnresolved == true, "an unresolved order the sweep does not own is in the active slot"),
+            (!_pickerCalibration.IsComplete, "picker calibration is incomplete"),
+            (!_pickerCalibration.IsPlacementComplete, "placement calibration is incomplete"),
+        }.Where(blocker => blocker.Item1).Select(blocker => blocker.Item2).ToArray();
+        if (blockers.Length != 0)
+        {
+            StopSweepBeforePlacement(sweep,
+                $"Sweep placement is not possible: {string.Join("; ", blockers)}.", now);
             return;
         }
         if (_sweepPreparedLeg is not { } leg || _sweepPlacementToken is not { } token)
         {
+            // A plan is always recoverable by re-probing; the orders an abort strands are not.
+            if (sweep.Current is { Outcome: SellSweepCandidateOutcome.Pending })
+            {
+                _sellSweep = SellSweepCoordinator.ClearPreparationForRetry(
+                    sweep, "The staged placement was no longer in memory; re-planning this candidate.",
+                    now, SweepSlotLimit());
+                ClearSweepPreparation();
+                _sellSweepStatus = DescribeSellSweep(_sellSweep);
+                AppendRuntimeDiagnostic("SweepPreparationRecovered",
+                    "Durable preparation outlived its staged leg and token; the candidate is being re-planned.");
+                return;
+            }
             StopSweepBeforePlacement(sweep, "Sweep placement preparation was unavailable.", now);
             return;
         }
@@ -2099,10 +2212,24 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             StopSweepBeforePlacement(sweep, failure, now);
             return;
         }
-        if (orders.Count != 0 || ExchangeOrderCapacity.IsAtCapacity(ExchangeOrderCapacity.CountLive(orders)))
+        // Every row on the panel must be one the sweep can prove it placed. An unrecognised row is
+        // something else trading on this panel, and that has to stop the sweep exactly as an
+        // unexpected order always did - only rows the sweep owns are allowed to be there now.
+        var owned = SweepOwnedOrderIds(sweep);
+        var foreign = orders.Count(order => order.PlayerOrderId <= 0 || !owned.Contains(order.PlayerOrderId));
+        if (foreign != 0)
         {
             StopSweepBeforePlacement(sweep,
-                $"Sweep placement requires an empty exchange order list; found {orders.Count}.", now);
+                $"Sweep placement requires every exchange row to be one of its own orders; " +
+                $"found {foreign} of {orders.Count} it cannot account for.", now);
+            return;
+        }
+        var liveOrders = ExchangeOrderCapacity.CountLive(orders);
+        var slotLimit = SweepSlotLimit();
+        if (liveOrders >= slotLimit || ExchangeOrderCapacity.IsAtCapacity(liveOrders))
+        {
+            StopSweepBeforePlacement(sweep,
+                $"Sweep placement requires a free slot; {liveOrders} of {slotLimit} are already live.", now);
             return;
         }
 
@@ -2161,10 +2288,19 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
 
     private void AdvanceSweepCandidate(SellSweepState sweep, DateTimeOffset now)
     {
-        if (_trackedOrderState is null || IsAnyInputOperationActive())
+        // A controller still finishing is a wait, not lost custody. Marking the sweep ambiguous here
+        // failed every candidate it still owned because something else happened to be mid-operation
+        // on the frame the stashed order came up for advancement - which, with several orders out,
+        // is an ordinary overlap rather than an anomaly.
+        if (IsAnyInputOperationActive())
+        {
+            _sellSweepStatus = $"{DescribeSellSweep(sweep)} | advancement waiting for {_operationStatus}";
+            return;
+        }
+        if (_trackedOrderState is null)
         {
             MarkSweepAmbiguous(sweep,
-                "The matching stashed attempt was not idle and ready to advance.", now);
+                "The matching stashed attempt was gone before the sweep could advance past it.", now);
             return;
         }
         if (!SellSweepCoordinator.TryCalculateRealizedProceedsChaos(
@@ -2179,7 +2315,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             ? "Order canceled with zero fill; all offered custody was returned and stashed."
             : $"Stashed actual terminal proceeds of {received} {_trackedOrderState.WantedMetadata}, valued at {realized} Chaos.";
         _sellSweep = SellSweepCoordinator.Advance(
-            sweep, SellSweepCandidateOutcome.Sold, realized, detail, now);
+            sweep, _trackedOrderState.AttemptId, SellSweepCandidateOutcome.Sold, realized, detail, now);
         ClearSweepPreparation();
         if (!_sellSweep.IsActive)
         {
@@ -2189,6 +2325,76 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _lastFailure = "None";
     }
 
+    /// <summary>
+    /// Whether the one active slot is mid-something, so a placement must wait rather than abort.
+    ///
+    /// <see cref="SellSweepCoordinator.Decide"/> deliberately authorizes a placement alongside a
+    /// pending order - that is the whole of the concurrency - because it reasons about slots, not
+    /// about who is holding input. Placement is still serial, so the driver is where that authority
+    /// meets the fact that the active slot has to be free first. An order the sweep owns sitting
+    /// unresolved in the active slot is waiting to be demoted or settled, and both happen on their
+    /// own; an order it does not own is a different problem and is refused below.
+    /// </summary>
+    private bool SweepActiveSlotIsBusy(SellSweepState sweep, out string reason)
+    {
+        if (IsAnyInputOperationActive() || IsCollectionFlowActive() || _trackedCancellation.IsRunning)
+        {
+            reason = string.IsNullOrEmpty(_operationStatus) ? "an input operation is running." : _operationStatus;
+            return true;
+        }
+        if (_trackedOrderState is { IsUnresolved: true } active && sweep.FindSlot(active.AttemptId) is not null)
+        {
+            reason = $"the sweep's own {active.Status} order still holds the active slot.";
+            return true;
+        }
+        reason = string.Empty;
+        return false;
+    }
+
+    /// <summary>
+    /// Re-plans the current candidate after a quote moved out from under it, or retires the holding
+    /// once it has happened too many times. Returns false only when the sweep is in no state to
+    /// re-plan, in which case the caller falls back to stopping.
+    /// </summary>
+    private bool TryReProbeSweepCandidate(
+        SellSweepState sweep,
+        string reason,
+        string eventType,
+        DateTimeOffset now)
+    {
+        if (sweep.Current is not { Outcome: SellSweepCandidateOutcome.Pending } candidate ||
+            sweep.Slots.Count >= SweepSlotLimit())
+        {
+            return false;
+        }
+        if (_sweepReProbeIndex != sweep.CurrentIndex)
+        {
+            _sweepReProbeIndex = sweep.CurrentIndex;
+            _sweepReProbeCount = 0;
+        }
+        if (++_sweepReProbeCount > MaximumSweepReProbes)
+        {
+            var skipped = $"{candidate.Name} x{candidate.HoldingAtScan}: quote moved on " +
+                $"{MaximumSweepReProbes} consecutive re-plans ({reason})";
+            ClearSweepPreparation();
+            _sellSweep = SellSweepCoordinator.Advance(
+                sweep, SellSweepCandidateOutcome.Skipped, 0, skipped, now);
+            _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            AppendRuntimeDiagnostic("SweepCandidateSkipped", skipped);
+            _lastFailure = "None";
+            return true;
+        }
+        _sellSweep = SellSweepCoordinator.ClearPreparationForRetry(sweep, reason, now, SweepSlotLimit());
+        ClearSweepPreparation();
+        _sellSweepStatus = DescribeSellSweep(_sellSweep);
+        _operationStatus =
+            $"Quote moved before the order was placed; re-planning {candidate.Name} " +
+            $"({_sweepReProbeCount} of {MaximumSweepReProbes}).";
+        AppendRuntimeDiagnostic(eventType, reason);
+        _lastFailure = "None";
+        return true;
+    }
+
     private void StopSweepBeforePlacement(SellSweepState sweep, string reason, DateTimeOffset now)
     {
         _sweepAuthorized = false;
@@ -2196,7 +2402,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _singleLegPlacement.Cancel(reason);
         ClearSweepPreparation();
         _sweepBenchmarkCapture = null;
-        _sellSweep = SellSweepCoordinator.Stop(sweep, reason, now);
+        // Stopping says "nothing is outstanding". With orders resting that would be a lie, and the
+        // same rule authorization revocation uses applies: durable custody marks ambiguous.
+        _sellSweep = sweep.Slots.Count > 0
+            ? SellSweepCoordinator.MarkAmbiguous(sweep, reason, now)
+            : SellSweepCoordinator.Stop(sweep, reason, now);
         _sellSweepStatus = DescribeSellSweep(_sellSweep);
         _lastFailure = reason;
     }
@@ -2345,35 +2555,37 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 GameController.Game.IngameState.ServerData.InstanceId
                     .ToString(System.Globalization.CultureInfo.InvariantCulture),
                 sweep.MinimumSaleChaos,
-                sweep.ExecutionMode));
+                sweep.ExecutionMode,
+                Settings.MinCompetingQueue.Value,
+                Settings.MaxCompetingSpread.Value));
         }
         catch (Exception exception)
         {
             ClearSweepPreparation();
+            var failedDetail = $"Pricing {candidate.Name} threw {exception.GetType().Name}: {exception.Message}";
             _sellSweep = SellSweepCoordinator.Advance(
-                sweep,
-                SellSweepCandidateOutcome.Failed,
-                0,
-                $"Pricing {candidate.Name} threw {exception.GetType().Name}: {exception.Message}",
-                now);
+                sweep, SellSweepCandidateOutcome.Failed, 0, failedDetail, now);
             _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            AppendRuntimeDiagnostic("SweepCandidateFailed", failedDetail);
             return;
         }
 
         if (result.Best is not { } best)
         {
             ClearSweepPreparation();
+            var skippedDetail =
+                $"{candidate.Name} x{candidate.HoldingAtScan}: {result.RejectionReason} ({result.Detail})";
             _sellSweep = SellSweepCoordinator.Advance(
-                sweep,
-                SellSweepCandidateOutcome.Skipped,
-                0,
-                $"{candidate.Name} x{candidate.HoldingAtScan}: {result.RejectionReason} ({result.Detail})",
-                now);
+                sweep, SellSweepCandidateOutcome.Skipped, 0, skippedDetail, now);
             _sellSweepStatus = DescribeSellSweep(_sellSweep);
+            AppendRuntimeDiagnostic("SweepCandidateSkipped",
+                $"{skippedDetail} | every market: {FaustusSellPlanner.DescribeRejections(result)}");
+            _lastSellSweepSkipReason = $"Previous Operation: {candidate.Name} skipped. Reason: [{result.RejectionReason}]";
             return;
         }
 
-        _sellSweep = SellSweepCoordinator.MarkPrepared(sweep, best, sweep.OriginProbeSessionId, now);
+        _sellSweep = SellSweepCoordinator.MarkPrepared(
+            sweep, best, sweep.OriginProbeSessionId, now, SweepSlotLimit());
         _sweepPreparedLeg = new RouteLegResult(
             best.Edge,
             candidate.HoldingAtScan,
@@ -3078,7 +3290,13 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
             else if (_sweepExecution == SweepExecutionState.Staging && _sellSweep is { IsActive: true } sweep)
             {
-                StopSweepBeforePlacement(sweep, _singleLegStaging.Failure, DateTimeOffset.UtcNow);
+                var stagingNow = DateTimeOffset.UtcNow;
+                if (!_singleLegStaging.FreshProbeRetryRecommended ||
+                    !TryReProbeSweepCandidate(
+                        sweep, _singleLegStaging.Failure, "SweepStagingAbortedForReProbe", stagingNow))
+                {
+                    StopSweepBeforePlacement(sweep, _singleLegStaging.Failure, stagingNow);
+                }
             }
         }
 
@@ -3847,7 +4065,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         : (false, finalFailure);
                 },
                 (_, capture) => SellSweepPlacement.TryValidateLiveMarket(
-                        token, capture, DateTimeOffset.UtcNow, out var liveFailure)
+                        token, capture, DateTimeOffset.UtcNow, out var liveFailure,
+                        Settings.MinCompetingQueue.Value, Settings.MaxCompetingSpread.Value)
                     ? (true, string.Empty)
                     : (false, liveFailure),
                 PersistSweepTrackedOrder,
@@ -3903,21 +4122,20 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 var reason = string.IsNullOrWhiteSpace(_singleLegPlacement.Failure)
                     ? $"Sweep placement ended {_singleLegPlacement.State} without a reason."
                     : _singleLegPlacement.Failure;
+                var placementCommitted = sweep.PreparedSignature.Length == 0;
                 if (_singleLegPlacement.State == SingleLegPlacementState.Cancelled &&
                     _singleLegPlacement.FreshProbeRetryRecommended &&
                     (!_singleLegPlacement.FreshProbeRetryFromLiveQuoteRejection ||
                         sweep.ExecutionMode == SellSweepExecutionMode.FastestFillMarketRate) &&
-                    sweep.Phase == SellSweepPhase.ReadyForCandidate &&
-                    _trackedOrderState?.IsUnresolved != true)
+                    !placementCommitted && _trackedOrderState?.IsUnresolved != true)
                 {
-                    _sellSweep = SellSweepCoordinator.ClearPreparationForRetry(
-                        sweep, reason, DateTimeOffset.UtcNow);
-                    ClearSweepPreparation();
-                    _sellSweepStatus = DescribeSellSweep(_sellSweep);
-                    _operationStatus = "Prepared sweep quote moved before the click; re-probing both candidate markets.";
-                    _lastFailure = "None";
+                    if (!TryReProbeSweepCandidate(
+                            sweep, reason, "SweepPlacementAbortedForReProbe", DateTimeOffset.UtcNow))
+                    {
+                        StopSweepBeforePlacement(sweep, reason, DateTimeOffset.UtcNow);
+                    }
                 }
-                else if (sweep.Phase == SellSweepPhase.OrderLive || _trackedOrderState?.IsUnresolved == true)
+                else if (placementCommitted || _trackedOrderState?.IsUnresolved == true)
                 {
                     MarkSweepAmbiguous(sweep, reason, DateTimeOffset.UtcNow);
                 }
@@ -4007,7 +4225,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         }
 
         var validationFailure = string.Empty;
-        if (_sellSweep is not { Phase: SellSweepPhase.ReadyForCandidate } sweep ||
+        if (_sellSweep is not { IsActive: true } sweep ||
             _sweepPlacementToken is not { } token || _sweepPreparedLeg is not { } leg ||
             !SellSweepPlacement.TryValidatePrepared(
                 sweep, token, leg, _manualProbeSessionId, GetCurrentLeague(),
@@ -4021,7 +4239,8 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         SellSweepState placedSweep;
         try
         {
-            placedSweep = SellSweepCoordinator.MarkPlaced(sweep, state.AttemptId, DateTimeOffset.UtcNow);
+            placedSweep = SellSweepCoordinator.MarkPlaced(
+                sweep, state.AttemptId, DateTimeOffset.UtcNow, SweepSlotLimit());
         }
         catch (Exception exception)
         {
@@ -4064,6 +4283,244 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         _sellSweepStatus = DescribeSellSweep(placedSweep);
         return true;
     }
+
+    /// <summary>
+    /// Rows on the exchange panel that belong to this plugin's own resting orders. A settlement is
+    /// allowed to see these take a fill while it runs; every other row must be bit-identical. Empty
+    /// until the sweep starts resting orders, which is exactly today's behaviour.
+    /// </summary>
+    private IReadOnlyCollection<int> RestingOrderIds() =>
+        _bankroll.RestingOrders.Count == 0
+            ? []
+            : _bankroll.RestingOrders
+                .Where(order => order.PlayerOrderId is > 0)
+                .Select(order => order.PlayerOrderId!.Value)
+                .ToArray();
+
+    /// <summary>
+    /// Exchange rows the sweep can prove are its own, by attempt. Placement refuses on anything
+    /// else: a row the sweep did not place is something else using the panel, and losing that check
+    /// is how a sweep would quietly trade on top of a manual order.
+    /// </summary>
+    private HashSet<int> SweepOwnedOrderIds(SellSweepState sweep) =>
+        _bankroll.AllOrders
+            .Where(order => order.PlayerOrderId is > 0 && sweep.FindSlot(order.AttemptId) is not null)
+            .Select(order => order.PlayerOrderId!.Value)
+            .ToHashSet();
+
+    /// <summary>
+    /// Whether the one active slot can take another order. It is free when nothing is in it, or when
+    /// what is in it is resolved and no longer owed to the sweep - the order it just stashed and has
+    /// already advanced past.
+    /// </summary>
+    private bool ActiveSlotIsFreeForPromotion(SellSweepState? sweep) =>
+        _trackedOrderState is null ||
+        !_trackedOrderState.IsUnresolved &&
+            (sweep is null || sweep.FindSlot(_trackedOrderState.AttemptId) is null);
+
+    /// <summary>
+    /// Whether no controller is mid-operation. Moving an order between the active and resting slots
+    /// is a durable bookkeeping write, and it must never happen underneath something holding input.
+    /// </summary>
+    private bool SweepSlotMovesAreSafe() =>
+        !IsAnyInputOperationActive() && !IsCollectionFlowActive() && !_trackedCancellation.IsRunning &&
+        _sweepExecution == SweepExecutionState.Idle && !_singleLegStaging.IsRunning &&
+        !_singleLegPlacement.IsRunning && _placementPreparation == PlacementPreparationState.Idle &&
+        !_bankrollLoadBlocked && !_trackedOrderLoadBlocked && _bankroll.IsInitialized &&
+        _bankrollStore is not null;
+
+    /// <summary>
+    /// Moves the active slot's order out to a resting slot. Only a <see cref="TrackedOrderStatus.Pending"/>
+    /// order the sweep owns may go: it is placed, stable, and holds no armed intent, which is exactly
+    /// what <see cref="TrackedOrderRestPolicy"/> means by restable.
+    /// </summary>
+    private bool TryDemoteActiveOrderToRest(SellSweepState sweep)
+    {
+        if (!sweep.IsActive || _trackedOrderState is not { Status: TrackedOrderStatus.Pending } active ||
+            sweep.FindSlot(active.AttemptId) is null || !SweepSlotMovesAreSafe())
+        {
+            return false;
+        }
+        try
+        {
+            var next = CloneBankroll(_bankroll);
+            next.TrackedOrder = null;
+            next.RestingOrders.Add(active);
+            next.HasUnresolvedOrder = next.ComputeUnresolved();
+            next.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            _bankrollStore!.Save(next);
+            _bankroll = next;
+            _trackedOrderState = null;
+            _trackedOrder = $"Resting: id={active.PlayerOrderId?.ToString() ?? "unknown"}, " +
+                $"{active.OfferedAmount} {active.OfferedMetadata} -> {active.WantedAmount} {active.WantedMetadata}";
+            try { _trackedOrderStore?.AppendAudit(active, "SweepOrderMovedToRestingSlot"); }
+            catch (Exception auditException)
+            {
+                _lastFailure = $"Order moved to a resting slot, but audit append failed: {auditException.Message}";
+            }
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _lastFailure = $"Moving the order to a resting slot failed: {exception.Message}";
+            AppendRuntimeDiagnostic("SweepRestingDemotionRefused", _lastFailure);
+            _nextSlotMoveAtUtc = DateTimeOffset.UtcNow.AddSeconds(SlotMoveBackoffSeconds);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Moves a resting order into the active slot so a controller can settle it. Nothing about the
+    /// order changes; it simply becomes the one order an input controller owns, and every
+    /// click-boundary proof in <c>Orders</c> then applies to it unchanged.
+    /// </summary>
+    private bool TryPromoteRestingOrder(SellSweepState? sweep, TrackedOrderState resting)
+    {
+        if (!ActiveSlotIsFreeForPromotion(sweep) || !SweepSlotMovesAreSafe() ||
+            !_bankroll.RestingOrders.Any(order => order.AttemptId == resting.AttemptId))
+        {
+            return false;
+        }
+        try
+        {
+            var next = CloneBankroll(_bankroll);
+            next.RestingOrders.RemoveAll(order => order.AttemptId == resting.AttemptId);
+            next.TrackedOrder = resting;
+            next.HasUnresolvedOrder = next.ComputeUnresolved();
+            next.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            _bankrollStore!.Save(next);
+            _bankroll = next;
+            _trackedOrderState = resting;
+            _trackedOrder = $"{resting.Status}: id={resting.PlayerOrderId?.ToString() ?? "unknown"}, " +
+                $"{resting.OfferedAmount} {resting.OfferedMetadata} -> {resting.WantedAmount} {resting.WantedMetadata}";
+            _nextLifecyclePollAtUtc = DateTimeOffset.MinValue;
+            try { _trackedOrderStore?.AppendAudit(resting, "RestingOrderPromotedToActiveSlot"); }
+            catch (Exception auditException)
+            {
+                _lastFailure = $"Resting order promoted, but audit append failed: {auditException.Message}";
+            }
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _lastFailure = $"Promoting a resting order failed: {exception.Message}";
+            AppendRuntimeDiagnostic("SweepRestingPromotionRefused", _lastFailure);
+            _nextSlotMoveAtUtc = DateTimeOffset.UtcNow.AddSeconds(SlotMoveBackoffSeconds);
+            return false;
+        }
+    }
+
+    private void PromoteRestingSweepOrderForSettlement(SellSweepState sweep)
+    {
+        var pending = SellSweepCoordinator.NextSettlementSlot(sweep, _bankroll.RestingOrders);
+        _sellSweepStatus = pending is not null && TryPromoteRestingOrder(sweep, pending)
+            ? $"{DescribeSellSweep(sweep)} | promoted a resting order into the active slot to settle it."
+            : $"{DescribeSellSweep(sweep)} | waiting to promote a resting order for settlement.";
+    }
+
+    /// <summary>
+    /// Watches the orders no controller is holding. A resting order is observation-only, so this
+    /// sends no input and writes nothing while the order is still plainly pending. The moment one
+    /// stops being pending it is promoted into the active slot, where the existing lifecycle poll
+    /// records the terminal transition and settles the ledger exactly as it always has - no
+    /// settlement, crediting, or terminal proof is duplicated here.
+    /// </summary>
+    /// <summary>
+    /// Moves one order at a time between the active slot and the resting set, deciding both
+    /// directions from a single observation of the panel.
+    ///
+    /// The two directions must never disagree, and reading the panel once is what guarantees it: an
+    /// order is demoted only while it observes as plainly <see cref="LifecycleObservationKind.Pending"/>,
+    /// and promoted only when it observes as anything conclusive that is not pending. The gap
+    /// between those - not visible, or mid-transition - moves nothing at all. Deciding demotion from
+    /// the stored <see cref="TrackedOrderStatus"/> instead is what let a promoted order be demoted
+    /// straight back the same frame, because promotion deliberately leaves its status alone; that
+    /// ping-ponged two canonical writes per frame until the file system refused one.
+    /// </summary>
+    private void PollSweepSlotMoves()
+    {
+        if (DateTimeOffset.UtcNow < _nextSlotMoveAtUtc)
+        {
+            return;
+        }
+        var sweep = _sellSweep is { IsActive: true } running ? running : null;
+        var restingCount = _bankroll.RestingOrders.Count;
+        var demotable = sweep is not null &&
+            _trackedOrderState is { Status: TrackedOrderStatus.Pending } active &&
+            sweep.FindSlot(active.AttemptId) is not null;
+        if (restingCount == 0 && !demotable || !SweepSlotMovesAreSafe())
+        {
+            return;
+        }
+        // Set before any attempt, so a move that keeps failing is bounded no matter why.
+        _nextSlotMoveAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(SlotMoveIntervalMilliseconds);
+
+        // A sweep that is no longer running cannot settle what it left out. Promoting the oldest of
+        // those keeps the operator's ordinary cancel/collect/stash hotkeys able to reach it, one at
+        // a time, instead of stranding orders nothing in the plugin can name.
+        if (sweep is null)
+        {
+            if (ActiveSlotIsFreeForPromotion(null))
+            {
+                TryPromoteRestingOrder(null, _bankroll.RestingOrders[0]);
+            }
+            return;
+        }
+
+        var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        if (!panel.IsVisible || panel.CurrencyPicker.IsVisible ||
+            GameController.Game.IngameState.IngameUi.PopUpWindow.IsVisible ||
+            !SingleLegPlacementController.TryReadOrders(GameController, out var orders, out _))
+        {
+            return;
+        }
+
+        var observedAt = DateTimeOffset.UtcNow;
+        // A placed order that is still plainly pending owns no input and needs no controller.
+        // Holding the one active slot open for it is exactly what serialised the sweep.
+        if (demotable && IsPlainlyPending(_trackedOrderState!, orders, observedAt))
+        {
+            if (TryDemoteActiveOrderToRest(sweep))
+            {
+                _sellSweepStatus = $"{DescribeSellSweep(_sellSweep!)} | order moved to a resting slot.";
+            }
+            return;
+        }
+
+        if (!ActiveSlotIsFreeForPromotion(sweep))
+        {
+            return;
+        }
+        foreach (var slot in sweep.Slots.OrderBy(entry => entry.PlacedAtUtc))
+        {
+            if (_bankroll.RestingOrders.FirstOrDefault(order => order.AttemptId == slot.AttemptId)
+                is not { } resting)
+            {
+                continue;
+            }
+            var observation = TrackedOrderLifecycle.Evaluate(resting, orders, observedAt);
+            if (!TrackedOrderRestPolicy.ObservationRequiresSettlement(observation.Kind))
+            {
+                continue;
+            }
+            if (TryPromoteRestingOrder(sweep, resting))
+            {
+                _operationStatus = $"Promoted a resting order into the active slot: {observation.Detail}";
+            }
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Whether the panel says this order is simply waiting - not terminal, not past its deadline,
+    /// not ambiguous, and not missing. Only an order in that state may rest.
+    /// </summary>
+    private static bool IsPlainlyPending(
+        TrackedOrderState order,
+        IReadOnlyCollection<PlacedOrderSnapshot> orders,
+        DateTimeOffset observedAtUtc) =>
+        TrackedOrderRestPolicy.ObservationAllowsRest(
+            TrackedOrderLifecycle.Evaluate(order, orders, observedAtUtc).Kind);
 
     private bool PersistTrackedOrder(TrackedOrderState state, string eventType) =>
         PersistTrackedOrderWithFunding(state, eventType, null);
@@ -4122,7 +4579,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
 
             next.TrackedOrder = state;
-            next.HasUnresolvedOrder = state.IsUnresolved;
+            next.HasUnresolvedOrder = next.ComputeUnresolved();
             next.UpdatedAtUtc = DateTimeOffset.UtcNow;
             var priorWorkflowPhase = next.Workflow?.Phase;
             if (next.Workflow?.IsActive == true)
@@ -4243,9 +4700,11 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         if (_trackedOrderState.Status is TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked &&
             _trackedOrderState.CancelIntent is { } recoveryIntent)
         {
-            var unrelatedFingerprint = TrackedOrderLifecycle.OrderSetFingerprint(
-                orders.Where(candidate => !TrackedOrderLifecycle.IdentityMatches(_trackedOrderState, candidate)));
-            if (unrelatedFingerprint != recoveryIntent.UnrelatedOrdersFingerprint)
+            if (!TrackedOrderLifecycle.UnrelatedOrdersUnchanged(
+                    orders.Where(candidate =>
+                        !TrackedOrderLifecycle.IdentityMatches(_trackedOrderState, candidate)),
+                    recoveryIntent.UnrelatedOrdersFingerprint, recoveryIntent.UnrelatedIdentityFingerprint,
+                    recoveryIntent.SiblingOrderIds))
             {
                 var ambiguous = TrackedOrderCollectionController.CloneTracked(
                     _trackedOrderState, TrackedOrderStatus.Ambiguous,
@@ -4819,6 +5278,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 IsFullFaustusControllerEnabled(),
                 Settings.CursorTweenSpeed.Value,
                 PersistTrackedOrder,
+                RestingOrderIds(),
                 out var failure))
         {
             _lastFailure = failure;
@@ -5204,6 +5664,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                 _collectionBatchAmount,
                 aggregateOwnedBefore,
                 PersistTrackedOrder,
+                RestingOrderIds(),
                 out failure))
         {
             AbortCollectionFlow(failure);
@@ -5371,6 +5832,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
                         Settings.CursorTweenSpeed.Value,
                         owned,
                         PersistTrackedOrder,
+                        RestingOrderIds(),
                         out failure))
                 {
                     AbortCollectionFlow(failure);
@@ -5507,7 +5969,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
             progress.UpdatedAtUtc = DateTimeOffset.UtcNow;
             next.TrackedOrder = progress;
-            next.HasUnresolvedOrder = progress.IsUnresolved;
+            next.HasUnresolvedOrder = next.ComputeUnresolved();
             next.UpdatedAtUtc = progress.UpdatedAtUtc;
             _bankrollStore.Save(next);
             _bankroll = next;
@@ -5795,7 +6257,21 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             }
             if (!_trackedCollection.VerifyInventoryPostState(GameController, out var custodyFailure))
             {
-                MarkCollectionAmbiguous(custodyFailure);
+                // The proceeds are real - ownership already proved the exact rise - they are simply
+                // not all on screen yet. Give them the same settle window every other stage of this
+                // flow gets rather than calling the first losing read ambiguous.
+                if (_collectionFlow != CollectionFlowState.SettlingCollectedInventory)
+                {
+                    _collectedInventoryOwned = observedOwned;
+                    _collectedInventoryDeadlineUtc = DateTimeOffset.UtcNow + CollectedInventorySettleTimeout;
+                    _collectionFlow = CollectionFlowState.SettlingCollectedInventory;
+                }
+                if (DateTimeOffset.UtcNow >= _collectedInventoryDeadlineUtc)
+                {
+                    MarkCollectionAmbiguous(custodyFailure);
+                    return;
+                }
+                _operationStatus = $"Waiting for collected proceeds to finish entering the inventory: {custodyFailure}";
                 return;
             }
 
@@ -5816,7 +6292,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
             collected.WantedAssetCollected =
                 collected.SettledWantedAmount + collected.PendingWantedBatchAmount == totalProceeds;
             next.TrackedOrder = collected;
-            next.HasUnresolvedOrder = collected.IsUnresolved;
+            next.HasUnresolvedOrder = next.ComputeUnresolved();
             next.UpdatedAtUtc = DateTimeOffset.UtcNow;
             _bankrollStore.Save(next);
             _bankroll = next;
@@ -5954,6 +6430,7 @@ public sealed class FaustusControllerLite : BaseSettingsPlugin<FaustusController
         NonCoreBalances = state.CloneNonCoreBalances(),
         HasUnresolvedOrder = state.HasUnresolvedOrder,
         TrackedOrder = state.TrackedOrder,
+        RestingOrders = state.CloneRestingOrders(),
         Workflow = state.Workflow is null ? null : WorkflowCoordinator.Clone(state.Workflow),
         UpdatedAtUtc = state.UpdatedAtUtc
     };

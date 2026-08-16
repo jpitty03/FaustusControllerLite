@@ -1,4 +1,4 @@
-using FaustusControllerLite.Domain;
+﻿using FaustusControllerLite.Domain;
 using FaustusControllerLite.Orders;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -30,8 +30,8 @@ public sealed class BankrollStore
             ?? throw new InvalidDataException("Bankroll schema version was missing.");
         var state = JsonConvert.DeserializeObject<BankrollState>(json)
             ?? throw new InvalidDataException("Bankroll state was empty.");
-        var migrated = schemaVersion is 1 or 2 or 3 or 4 or 5;
-        var trackedMigrated = state.TrackedOrder?.SchemaVersion is 1 or 2 or 3 or 4 or 5;
+        var migrated = schemaVersion is 1 or 2 or 3 or 4 or 5 or 6;
+        var trackedMigrated = state.AllOrders.Any(order => IsLegacyTrackedSchema(order.SchemaVersion));
         var workflowMigrated = state.Workflow?.SchemaVersion is 1 or 2 or 3;
         if (migrated)
         {
@@ -58,14 +58,18 @@ public sealed class BankrollStore
             }
             state.SchemaVersion = BankrollState.CurrentSchemaVersion;
         }
-        if (trackedMigrated && state.TrackedOrder is { } migratedTracked)
+        if (trackedMigrated)
         {
-            if (migratedTracked.StashTransferIntent is { } legacyStashIntent)
-                legacyStashIntent.StashCustodyMode = StashCustodyMode.VisibleCurrencyStashExact;
-            TrackedOrderLifecycle.MigrateLegacyAssetProgress(migratedTracked);
-            TrackedOrderLifecycle.MigrateLegacyAssetAmounts(migratedTracked);
-            migratedTracked.SchemaVersion = TrackedOrderState.CurrentSchemaVersion;
-            state.HasUnresolvedOrder = migratedTracked.IsUnresolved;
+            foreach (var migratedTracked in state.AllOrders)
+            {
+                if (!IsLegacyTrackedSchema(migratedTracked.SchemaVersion)) continue;
+                if (migratedTracked.StashTransferIntent is { } legacyStashIntent)
+                    legacyStashIntent.StashCustodyMode = StashCustodyMode.VisibleCurrencyStashExact;
+                TrackedOrderLifecycle.MigrateLegacyAssetProgress(migratedTracked);
+                TrackedOrderLifecycle.MigrateLegacyAssetAmounts(migratedTracked);
+                migratedTracked.SchemaVersion = TrackedOrderState.CurrentSchemaVersion;
+            }
+            state.HasUnresolvedOrder = state.ComputeUnresolved();
         }
         if (workflowMigrated && state.Workflow is { } migratedWorkflow)
         {
@@ -114,11 +118,81 @@ public sealed class BankrollStore
             state.ReservedChaos < 0 || state.ReservedDivine < 0 ||
             state.CompletedUncollectedChaos < 0 || state.CompletedUncollectedDivine < 0 ||
             !NonCoreBalancesAreValid(state.NonCoreBalances) ||
-            state.HasUnresolvedOrder != (state.TrackedOrder?.IsUnresolved == true))
+            state.HasUnresolvedOrder != state.ComputeUnresolved())
         {
             throw new InvalidDataException("Bankroll state failed schema or value validation.");
         }
-        if (state.TrackedOrder is { } tracked &&
+        ValidateRestingSet(state);
+        foreach (var slot in state.AllOrders)
+        {
+            ValidateTrackedOnLoad(slot, league);
+        }
+        ValidateReservationConsistency(state);
+        if (state.Workflow is { } workflow)
+        {
+            if (workflow.League != league)
+            {
+                throw new InvalidDataException("Workflow league did not match canonical bankroll league.");
+            }
+            if (state.RestingOrders.Count != 0)
+            {
+                throw new InvalidDataException("A workflow cannot run alongside resting sweep orders.");
+            }
+            WorkflowCoordinator.Validate(workflow, state.TrackedOrder);
+            if (workflow.Phase == WorkflowExecutionPhase.Completed &&
+                ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(state, state.TrackedOrder, out _))
+                throw new InvalidDataException("Completed workflow still had unsettled canonical custody.");
+        }
+
+        if (migrated || trackedMigrated || workflowMigrated)
+        {
+            Save(state);
+        }
+
+        return state;
+    }
+
+    private static bool IsLegacyTrackedSchema(int schemaVersion) =>
+        schemaVersion is 1 or 2 or 3 or 4 or 5 or 6;
+
+    /// <summary>
+    /// The resting set's own rules, which exist only because more than one order can now be known at
+    /// once. A resting order must be restable (see <see cref="TrackedOrderRestPolicy"/>), must be a
+    /// distinct attempt, and must offer a distinct asset - two live sells of the same item share one
+    /// queue and compete with each other, so the sweep never creates that shape and canonical state
+    /// refuses to represent it.
+    /// </summary>
+    private static void ValidateRestingSet(BankrollState state)
+    {
+        foreach (var resting in state.RestingOrders)
+        {
+            if (resting is null)
+            {
+                throw new InvalidDataException("A resting order entry was null.");
+            }
+            if (!TrackedOrderRestPolicy.CanRest(resting.Status))
+            {
+                throw new InvalidDataException(
+                    $"Resting order status {resting.Status} holds armed input and cannot rest.");
+            }
+        }
+
+        var attempts = state.AllOrders.Select(order => order.AttemptId).ToList();
+        if (attempts.Distinct().Count() != attempts.Count)
+        {
+            throw new InvalidDataException("Canonical orders repeated an attempt identity.");
+        }
+
+        var offered = state.AllOrders.Select(order => order.OfferedMetadata).ToList();
+        if (offered.Distinct(StringComparer.Ordinal).Count() != offered.Count)
+        {
+            throw new InvalidDataException("Two canonical orders offered the same asset.");
+        }
+    }
+
+    private static void ValidateTrackedOnLoad(TrackedOrderState? order, string league)
+    {
+        if (order is { } tracked &&
             (tracked.SchemaVersion != TrackedOrderState.CurrentSchemaVersion ||
              tracked.League != league || tracked.Status == TrackedOrderStatus.None ||
              tracked.AttemptId == Guid.Empty || tracked.ProbeSessionId == Guid.Empty ||
@@ -139,21 +213,21 @@ public sealed class BankrollStore
         {
             throw new InvalidDataException("Tracked order inside bankroll failed transition validation.");
         }
-        if (state.TrackedOrder is { } lifecycleTracked && RequiresLifecycleIdentity(lifecycleTracked.Status) &&
+        if (order is { } lifecycleTracked && RequiresLifecycleIdentity(lifecycleTracked.Status) &&
             !TrackedOrderLifecycle.HasDurableIdentity(lifecycleTracked))
         {
             throw new InvalidDataException("Unresolved lifecycle state lacked durable creation/ratio/deadline identity.");
         }
-        if (state.TrackedOrder is { } progressTracked && !TrackedOrderLifecycle.AssetProgressIsValid(progressTracked))
+        if (order is { } progressTracked && !TrackedOrderLifecycle.AssetProgressIsValid(progressTracked))
         {
             throw new InvalidDataException("Settlement-asset progress was internally inconsistent.");
         }
-        if (state.TrackedOrder is { BulkCollectionOwnedBaseline: < 0 } or
+        if (order is { BulkCollectionOwnedBaseline: < 0 } or
             { Status: TrackedOrderStatus.Stashed, BulkCollectionOwnedBaseline: not null })
         {
             throw new InvalidDataException("Bulk collection ownership baseline was invalid.");
         }
-        if (state.TrackedOrder is { Status: TrackedOrderStatus.Stashed } stashedState &&
+        if (order is { Status: TrackedOrderStatus.Stashed } stashedState &&
             (!HasCompleteTerminalEvidence(stashedState) ||
              TrackedOrderLifecycle.CreateSettlementAssets(stashedState,
                  stashedState.TerminalRemainingOfferedAmount!.Value,
@@ -161,52 +235,33 @@ public sealed class BankrollStore
         {
             throw new InvalidDataException("Resolved stashed state lacked terminal settlement evidence.");
         }
-        if (state.TrackedOrder is { StashTransferIntent: not null } armed &&
+        if (order is { StashTransferIntent: not null } armed &&
             (armed.Status is not TrackedOrderStatus.StashTransferArmed and not TrackedOrderStatus.Ambiguous ||
              !IsValidStashTransferIntent(armed.StashTransferIntent) ||
              !IntentMatchesSettlementAsset(armed, armed.StashTransferIntent!)))
         {
             throw new InvalidDataException("Stash-transfer-armed state lacked durable recovery evidence.");
         }
-        if (state.TrackedOrder is { Status: TrackedOrderStatus.StashTransferArmed, StashTransferIntent: null })
+        if (order is { Status: TrackedOrderStatus.StashTransferArmed, StashTransferIntent: null })
             throw new InvalidDataException("Stash-transfer-armed state lacked durable recovery evidence.");
-        if (state.TrackedOrder is { StashTransferIntent: not null, CollectionAssetIntent: not null })
+        if (order is { StashTransferIntent: not null, CollectionAssetIntent: not null })
             throw new InvalidDataException("Collection and stash-transfer intents cannot coexist.");
-        if (state.TrackedOrder is { Status: TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous,
+        if (order is { Status: TrackedOrderStatus.CollectionArmed or TrackedOrderStatus.Ambiguous,
                 CollectionAssetIntent: not null } assetCollection &&
             !IsValidCollectionAssetIntent(assetCollection.CollectionAssetIntent, assetCollection))
         {
             throw new InvalidDataException("Canceled return collection lacked exact durable asset intent.");
         }
-        if (state.TrackedOrder is { Status: TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked } cancelState &&
+        if (order is { Status: TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked } cancelState &&
             !IsValidCancelIntent(cancelState.CancelIntent, cancelState))
         {
             throw new InvalidDataException("Cancellation state lacked durable exact intent evidence.");
         }
-        if (state.TrackedOrder is { Status: TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.CanceledUncollected } terminalState &&
+        if (order is { Status: TrackedOrderStatus.CompletedUncollected or TrackedOrderStatus.CanceledUncollected } terminalState &&
             !HasCompleteTerminalEvidence(terminalState))
         {
             throw new InvalidDataException("Terminal tracked state lacked complete amounts and ledger commit evidence.");
         }
-        ValidateReservationConsistency(state);
-        if (state.Workflow is { } workflow)
-        {
-            if (workflow.League != league)
-            {
-                throw new InvalidDataException("Workflow league did not match canonical bankroll league.");
-            }
-            WorkflowCoordinator.Validate(workflow, state.TrackedOrder);
-            if (workflow.Phase == WorkflowExecutionPhase.Completed &&
-                ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(state, state.TrackedOrder, out _))
-                throw new InvalidDataException("Completed workflow still had unsettled canonical custody.");
-        }
-
-        if (migrated || trackedMigrated || workflowMigrated)
-        {
-            Save(state);
-        }
-
-        return state;
     }
 
     private static bool IsValidStashTransferIntent(StashTransferIntentState? intent)
@@ -280,10 +335,11 @@ public sealed class BankrollStore
             state.AvailableChaos < 0 || state.AvailableDivine < 0 || state.ReservedChaos < 0 ||
             state.ReservedDivine < 0 || state.CompletedUncollectedChaos < 0 ||
             state.CompletedUncollectedDivine < 0 || !NonCoreBalancesAreValid(state.NonCoreBalances) ||
-            state.HasUnresolvedOrder != (state.TrackedOrder?.IsUnresolved == true))
+            state.HasUnresolvedOrder != state.ComputeUnresolved())
         {
             throw new InvalidDataException("Bankroll state failed save-time schema or value validation.");
         }
+        ValidateRestingSet(state);
         ValidateReservationConsistency(state);
         if (state.Workflow is { } workflow)
         {
@@ -291,12 +347,19 @@ public sealed class BankrollStore
             {
                 throw new InvalidDataException("Workflow league did not match canonical bankroll league.");
             }
+            if (state.RestingOrders.Count != 0)
+            {
+                throw new InvalidDataException("A workflow cannot run alongside resting sweep orders.");
+            }
             WorkflowCoordinator.Validate(workflow, state.TrackedOrder);
             if (workflow.Phase == WorkflowExecutionPhase.Completed &&
                 ContinuousWorkflowLoop.TryDescribeUnsettledCanonicalState(state, state.TrackedOrder, out _))
                 throw new InvalidDataException("Completed workflow still had unsettled canonical custody.");
         }
-        ValidateTrackedForSave(state.TrackedOrder, state.League);
+        foreach (var slot in state.AllOrders)
+        {
+            ValidateTrackedForSave(slot, state.League);
+        }
         Directory.CreateDirectory(_directory);
         var path = GetStatePath(state.League);
         var temporaryPath = path + ".tmp";
@@ -304,30 +367,50 @@ public sealed class BankrollStore
         File.Move(temporaryPath, path, true);
     }
 
+    /// <summary>
+    /// Reservations must still match the orders holding principal exactly, order for order. With a
+    /// resting set that means summing across every slot instead of reading one - and because two
+    /// slots may never offer the same asset, each metadata's expected reservation still comes from
+    /// exactly one order, so this stays an exact identity rather than a bound.
+    /// </summary>
     private static void ValidateReservationConsistency(BankrollState state)
     {
-        var tracked = state.TrackedOrder;
-        var reservationRequired = tracked?.IsUnresolved == true && tracked.LedgerCommittedAtUtc is null &&
-            tracked.Status is TrackedOrderStatus.Armed or TrackedOrderStatus.Pending or TrackedOrderStatus.TimedOut or
-                TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked or TrackedOrderStatus.Ambiguous;
-        var expectedChaos = reservationRequired && tracked!.OfferedMetadata == BankrollState.ChaosMetadata
-            ? tracked.OfferedAmount : 0;
-        var expectedDivine = reservationRequired && tracked!.OfferedMetadata == BankrollState.DivineMetadata
-            ? tracked.OfferedAmount : 0;
+        var expected = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var order in state.AllOrders)
+        {
+            if (!ReservationRequired(order))
+            {
+                continue;
+            }
+            if (!expected.TryAdd(order.OfferedMetadata, order.OfferedAmount))
+            {
+                throw new InvalidDataException("Two canonical orders reserved the same offered asset.");
+            }
+        }
+
+        var expectedChaos = expected.GetValueOrDefault(BankrollState.ChaosMetadata);
+        var expectedDivine = expected.GetValueOrDefault(BankrollState.DivineMetadata);
         if (state.ReservedChaos != expectedChaos || state.ReservedDivine != expectedDivine)
         {
             throw new InvalidDataException("Canonical reservations did not exactly match the unresolved tracked order.");
         }
         foreach (var pair in state.NonCoreBalances)
         {
-            var expected = reservationRequired && tracked!.OfferedMetadata == pair.Key ? tracked.OfferedAmount : 0;
-            if (pair.Value.Reserved != expected)
+            if (pair.Value.Reserved != expected.GetValueOrDefault(pair.Key))
                 throw new InvalidDataException("Canonical non-core reservation did not match the exact unresolved order.");
         }
-        if (reservationRequired && expectedChaos == 0 && expectedDivine == 0 &&
-            !state.NonCoreBalances.ContainsKey(tracked!.OfferedMetadata))
-            throw new InvalidDataException("Unresolved order had no exact offered-metadata reservation bucket.");
+        foreach (var metadata in expected.Keys)
+        {
+            if (metadata != BankrollState.ChaosMetadata && metadata != BankrollState.DivineMetadata &&
+                !state.NonCoreBalances.ContainsKey(metadata))
+                throw new InvalidDataException("Unresolved order had no exact offered-metadata reservation bucket.");
+        }
     }
+
+    private static bool ReservationRequired(TrackedOrderState order) =>
+        order.IsUnresolved && order.LedgerCommittedAtUtc is null &&
+        order.Status is TrackedOrderStatus.Armed or TrackedOrderStatus.Pending or TrackedOrderStatus.TimedOut or
+            TrackedOrderStatus.CancelArmed or TrackedOrderStatus.CancelClicked or TrackedOrderStatus.Ambiguous;
 
     private static void ValidateTrackedForSave(TrackedOrderState? tracked, string league)
     {

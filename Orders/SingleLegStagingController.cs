@@ -716,14 +716,18 @@ public sealed class SingleLegStagingController
         if (!TryCreateStagingSample(
                 _leg!, capture, out var sample, out var sampleFailure, _quoteValidationPolicy))
         {
-            if (ShouldRetryMissingCompetingBook(_leg!, capture, _quoteValidationPolicy))
+            if (ShouldRetryMissingBook(_leg!, capture, _quoteValidationPolicy))
             {
                 _lastQuoteSampleFailure = sampleFailure;
-                Status = $"Waiting for the selected competing book to become readable: {sampleFailure}";
+                Status = $"Waiting for the selected book to become readable: {sampleFailure}";
                 _nextActionAt = now + TimeSpan.FromMilliseconds(100);
                 return;
             }
-            CancelForFreshProbe(sampleFailure);
+            // Name the sample. The initial one runs on a clean panel; the final one runs after the
+            // amount has been typed, and the exchange reprices its displayed book against the
+            // quantity in the box - so which of the two refused is the difference between a market
+            // that moved and a rate that was never going to match.
+            CancelForFreshProbe($"[{State}] {sampleFailure}");
             return;
         }
 
@@ -854,14 +858,20 @@ public sealed class SingleLegStagingController
         {
             return TryValidateImprovedCompetingBounds(leg, liveEdges, out failure);
         }
-        var matching = liveEdges.FirstOrDefault(edge =>
+        var live = liveEdges as IReadOnlyList<DirectedExchangeEdge> ?? liveEdges.ToArray();
+        var matching = live.FirstOrDefault(edge =>
             edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To) &&
             edge.ExecutionIntent == leg.Edge.ExecutionIntent && edge.Rate == leg.Edge.Rate &&
             (policy != SingleLegQuoteValidationPolicy.AggressiveImmediateLimit ||
              IdentityMatches(edge.From, leg.Edge.From) && IdentityMatches(edge.To, leg.Edge.To)));
         if (matching is null)
         {
-            failure = "The live quote no longer exactly matches the candidate leg.";
+            // Say which quote and which rate. This refusal used to name neither, so a run where
+            // every candidate failed it looked identical to a run where the market simply moved -
+            // and the two want opposite responses.
+            failure = $"The live quote no longer exactly matches the candidate leg: planned " +
+                $"{leg.Edge.ExecutionIntent} {leg.Edge.Rate} for {leg.Edge.From.Metadata}->" +
+                $"{leg.Edge.To.Metadata}; live {DescribeLiveDirection(live, leg)}.";
             return false;
         }
 
@@ -950,13 +960,70 @@ public sealed class SingleLegStagingController
         return true;
     }
 
-    public static bool ShouldRetryMissingCompetingBook(
+    /// <summary>
+    /// Whether a failed staging sample is worth waiting on rather than abandoning.
+    ///
+    /// Two reasons qualify, and the second is not about intent at all. A competing leg re-samples
+    /// while its ladder settles, as it always has. And *any* leg re-samples while the capture has no
+    /// book for its own pair yet: the exchange does not populate the stock ladder the instant a pair
+    /// is selected, so the first sample after selection can be a correctly-read capture of nothing.
+    /// That second case used to be reachable only by competing legs, which is why an immediate leg
+    /// abandoned instantly on a panel that simply had not finished loading - and why a Fastest Fill
+    /// sweep could refuse every candidate it had while the market itself was perfectly healthy.
+    ///
+    /// Both are bounded by the sampling step deadline, so a book that never appears still gives up.
+    /// </summary>
+    public static bool ShouldRetryMissingBook(
         RouteLegResult leg,
         MarketCapture capture,
-        SingleLegQuoteValidationPolicy policy) =>
-        (policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit || IsImprovedCompetingLeg(leg)) &&
-        leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing &&
-        capture.Pair.Equals(leg.Edge.Pair);
+        SingleLegQuoteValidationPolicy policy)
+    {
+        ArgumentNullException.ThrowIfNull(leg);
+        ArgumentNullException.ThrowIfNull(capture);
+        if (!capture.Pair.Equals(leg.Edge.Pair))
+        {
+            return false;
+        }
+        if ((policy == SingleLegQuoteValidationPolicy.PreserveCompetingLimit || IsImprovedCompetingLeg(leg)) &&
+            leg.Edge.ExecutionIntent == QuoteExecutionIntent.Competing)
+        {
+            return true;
+        }
+        // No edge at all in the leg's direction is a book that has not loaded, not a price that
+        // moved. A price that moved produces an edge with a different rate, and that still fails
+        // immediately.
+        return !MarketCaptureNormalizer.CreateEdges(capture).Any(edge =>
+            edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To));
+    }
+
+    /// <summary>
+    /// Every live edge in the leg's direction, so a rate refusal can be read without a second run.
+    /// A drifting head and a direction the capture never produced at all are different faults with
+    /// different fixes, and the failure text is the only place they can be told apart.
+    /// </summary>
+    private static string DescribeLiveDirection(
+        IReadOnlyList<DirectedExchangeEdge> liveEdges,
+        RouteLegResult leg)
+    {
+        var sameDirection = liveEdges
+            .Where(edge => edge.From.Equals(leg.Edge.From) && edge.To.Equals(leg.Edge.To))
+            .ToArray();
+        if (sameDirection.Length == 0)
+        {
+            var pairs = liveEdges
+                .Select(edge => $"{edge.From.Metadata}->{edge.To.Metadata}:{edge.ExecutionIntent}")
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            return pairs.Length == 0
+                ? "no edges at all"
+                : $"nothing in that direction; the capture held {string.Join(", ", pairs)}";
+        }
+        return string.Join(", ", sameDirection.Select(edge =>
+            $"{edge.ExecutionIntent} {edge.Rate}" +
+            (edge.ExecutionIntent == QuoteExecutionIntent.Immediate
+                ? $" (depth {edge.ImmediateInputDepth})"
+                : $" (queue {edge.CompetingQueueAhead})")));
+    }
 
     public static bool TryValidatePolicy(
         RouteLegResult leg,

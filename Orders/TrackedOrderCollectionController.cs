@@ -124,6 +124,8 @@ public sealed class TrackedOrderCollectionController
     private long _aggregateOwnedBefore;
     private InventoryTransferSnapshot? _inventoryBefore;
     private string _unrelatedFingerprint = string.Empty;
+    private string _unrelatedIdentityFingerprint = string.Empty;
+    private readonly List<int> _siblingOrderIds = [];
     private TrackedCollectionState _releaseTarget;
     private string _releaseStatus = string.Empty;
 
@@ -143,10 +145,12 @@ public sealed class TrackedOrderCollectionController
         long batchAmount,
         long aggregateOwnedBefore,
         Func<TrackedOrderState, string, bool> persist,
+        IReadOnlyCollection<int> siblingOrderIds,
         out string failure)
     {
         ArgumentNullException.ThrowIfNull(tracked);
         ArgumentNullException.ThrowIfNull(persist);
+        ArgumentNullException.ThrowIfNull(siblingOrderIds);
         if (IsRunning || !permissions.Ready || conflictingControllerEnabled)
         {
             failure = "Collection is running, permissions are incomplete, placement/full workflow is enabled, or controller exclusion failed.";
@@ -195,8 +199,10 @@ public sealed class TrackedOrderCollectionController
         _remainingBefore = liveMatch.ReceivedWantedAmount;
         _aggregateOwnedBefore = aggregateOwnedBefore;
         _inventoryBefore = inventory;
-        _unrelatedFingerprint = TrackedOrderLifecycle.OrderSetFingerprint(
-            orders.Where(order => order.PlayerOrderId != liveMatch.PlayerOrderId));
+        _siblingOrderIds.Clear();
+        _siblingOrderIds.AddRange(siblingOrderIds.Where(id => id != liveMatch.PlayerOrderId));
+        (_unrelatedFingerprint, _unrelatedIdentityFingerprint) = TrackedOrderLifecycle.CaptureUnrelatedOrders(
+            orders.Where(order => order.PlayerOrderId != liveMatch.PlayerOrderId), _siblingOrderIds);
         _clickAttempted = false;
         Failure = string.Empty;
         BeginMovement(target, cursorSpeed);
@@ -306,7 +312,7 @@ public sealed class TrackedOrderCollectionController
     public static bool RowTextsMatchTrackedOrder(IEnumerable<string> rowTexts, TrackedOrderState tracked)
     {
         var texts = rowTexts.Select(text => text.Trim()).Where(text => text.Length > 0).ToArray();
-        if (!texts.Any(text => text.Equals("Order Completed", StringComparison.OrdinalIgnoreCase))) return false;
+        if (!OrderRowStatusText.IsTerminal(texts)) return false;
 
         foreach (var text in texts)
         {
@@ -499,7 +505,7 @@ public sealed class TrackedOrderCollectionController
         if (!TryResolveTarget(gameController, tracked, calibration, out var fresh, out var orders, out var failure) ||
             Vector2.Distance(fresh, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
-            !SnapshotsEqual(_baselineOrders.Values, orders) ||
+            !SnapshotsEqual(_baselineOrders.Values, orders, _siblingOrderIds) ||
             !InventoryStashTransferController.TryReadSnapshot(
                 gameController, tracked.WantedMetadata, tracked.WantedMaxStackSize,
                 out var inventory, out failure) ||
@@ -525,6 +531,8 @@ public sealed class TrackedOrderCollectionController
             NonTargetInventoryFingerprint = InventoryTransferEvidence.NonTargetFingerprint(
                 _inventoryBefore, armed.WantedMetadata),
             UnrelatedOrdersFingerprint = _unrelatedFingerprint,
+            UnrelatedIdentityFingerprint = _unrelatedIdentityFingerprint,
+            SiblingOrderIds = [.. _siblingOrderIds],
             AreaInstanceId = _areaInstanceId,
             ArmedAtUtc = DateTimeOffset.UtcNow,
         };
@@ -538,7 +546,7 @@ public sealed class TrackedOrderCollectionController
         if (!TryResolveTarget(gameController, _tracked, calibration, out fresh, out orders, out failure) ||
             Vector2.Distance(fresh, _target) > GeometryTolerance ||
             Vector2.Distance(ExileInput.MousePositionNum, fresh) > CursorTolerance ||
-            !SnapshotsEqual(_baselineOrders.Values, orders) ||
+            !SnapshotsEqual(_baselineOrders.Values, orders, _siblingOrderIds) ||
             !InventoryStashTransferController.TryReadSnapshot(
                 gameController, _tracked.WantedMetadata, _tracked.WantedMaxStackSize,
                 out inventory, out failure) ||
@@ -614,7 +622,7 @@ public sealed class TrackedOrderCollectionController
         if (expectedRemainingAfter == 0)
         {
             if (!orders.Any(order => SameOrderIgnoringId(order, trackedSnapshot)) &&
-                SnapshotsEqualIgnoringIds(expected, orders))
+                SnapshotsEqualIgnoringIds(expected, orders, _siblingOrderIds))
             {
                 BeginRelease(TrackedCollectionState.CollectedEvidence,
                     "Tracked order disappeared with every unrelated order ID unchanged.");
@@ -628,7 +636,8 @@ public sealed class TrackedOrderCollectionController
             if (reduced.Length == 1 &&
                 SnapshotsEqualIgnoringIds(
                     expected,
-                    orders.Where(order => order.PlayerOrderId != reduced[0].PlayerOrderId).ToArray()))
+                    orders.Where(order => order.PlayerOrderId != reduced[0].PlayerOrderId).ToArray(),
+                    _siblingOrderIds))
             {
                 BeginRelease(TrackedCollectionState.CollectedEvidence,
                     $"Tracked order proceeds reduced exactly to {expectedRemainingAfter} with unrelated orders unchanged.");
@@ -677,7 +686,7 @@ public sealed class TrackedOrderCollectionController
             }
             unrelated = current.Where(order => order.PlayerOrderId != reduced[0].PlayerOrderId).ToArray();
         }
-        if (!SnapshotsEqualIgnoringIds(expected, unrelated))
+        if (!SnapshotsEqualIgnoringIds(expected, unrelated, _siblingOrderIds))
         {
             failure = "Unrelated order snapshots changed after the collection click.";
             return false;
@@ -696,12 +705,31 @@ public sealed class TrackedOrderCollectionController
         if (!InventoryStashTransferController.TryReadSnapshot(
                 gameController, _tracked.WantedMetadata, _tracked.WantedMaxStackSize,
                 out var current, out failure)) return false;
-        if (current.TargetInventoryAmount != checked(_inventoryBefore.TargetInventoryAmount + _batchAmount) ||
-            current.TargetVisibleStashAmount != _inventoryBefore.TargetVisibleStashAmount ||
-            InventoryTransferEvidence.NonTargetFingerprint(current, _tracked.WantedMetadata) !=
-                InventoryTransferEvidence.NonTargetFingerprint(_inventoryBefore, _tracked.WantedMetadata))
+        // One message per condition, with the numbers. These three used to share a sentence, and a
+        // live failure then could not say whether the batch was short, the stash had moved, or
+        // something unrelated had shifted in the inventory - three different faults with three
+        // different fixes.
+        var expectedInventory = checked(_inventoryBefore.TargetInventoryAmount + _batchAmount);
+        if (current.TargetInventoryAmount != expectedInventory)
         {
-            failure = "Collection batch inventory, stash, or non-target custody did not match the durable intent.";
+            failure = $"Collection batch expected {expectedInventory} {_tracked.WantedMetadata} in inventory " +
+                $"({_inventoryBefore.TargetInventoryAmount} before + {_batchAmount} collected); " +
+                $"found {current.TargetInventoryAmount}.";
+            return false;
+        }
+        if (current.TargetVisibleStashAmount != _inventoryBefore.TargetVisibleStashAmount)
+        {
+            failure = $"Collection batch changed the visible stash's {_tracked.WantedMetadata} from " +
+                $"{_inventoryBefore.TargetVisibleStashAmount} to {current.TargetVisibleStashAmount} " +
+                $"(visible tab {_inventoryBefore.VisibleTabType} -> {current.VisibleTabType}).";
+            return false;
+        }
+        if (InventoryTransferEvidence.NonTargetFingerprint(current, _tracked.WantedMetadata) !=
+            InventoryTransferEvidence.NonTargetFingerprint(_inventoryBefore, _tracked.WantedMetadata))
+        {
+            failure = "Collection batch changed non-target inventory custody: " +
+                InventoryTransferEvidence.DescribeNonTargetChange(
+                    _inventoryBefore, current, _tracked.WantedMetadata) + ".";
             return false;
         }
         failure = string.Empty;
@@ -710,26 +738,76 @@ public sealed class TrackedOrderCollectionController
 
     public static bool SnapshotsEqual(
         IEnumerable<PlacedOrderSnapshot> expected,
-        IEnumerable<PlacedOrderSnapshot> actual)
+        IEnumerable<PlacedOrderSnapshot> actual) => SnapshotsEqual(expected, actual, null);
+
+    /// <summary>
+    /// Exact snapshot equality, except that an order the sweep owns is compared on its immutable half
+    /// only - it is allowed to have taken a fill while this settlement ran. With no siblings this is
+    /// the same whole-snapshot comparison it has always been.
+    /// </summary>
+    public static bool SnapshotsEqual(
+        IEnumerable<PlacedOrderSnapshot> expected,
+        IEnumerable<PlacedOrderSnapshot> actual,
+        IReadOnlyCollection<int>? siblingOrderIds)
     {
         var left = expected.OrderBy(order => order.PlayerOrderId).ToArray();
         var right = actual.OrderBy(order => order.PlayerOrderId).ToArray();
-        return left.SequenceEqual(right);
+        if (left.Length != right.Length) return false;
+        for (var index = 0; index < left.Length; index++)
+        {
+            var sibling = siblingOrderIds is { Count: > 0 } &&
+                siblingOrderIds.Contains(left[index].PlayerOrderId);
+            if (sibling
+                ? left[index].PlayerOrderId != right[index].PlayerOrderId ||
+                  !SameOrderIdentityIgnoringId(left[index], right[index])
+                : !left[index].Equals(right[index]))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     public static bool SnapshotsEqualIgnoringIds(
         IEnumerable<PlacedOrderSnapshot> expected,
-        IEnumerable<PlacedOrderSnapshot> actual)
+        IEnumerable<PlacedOrderSnapshot> actual) => SnapshotsEqualIgnoringIds(expected, actual, null);
+
+    public static bool SnapshotsEqualIgnoringIds(
+        IEnumerable<PlacedOrderSnapshot> expected,
+        IEnumerable<PlacedOrderSnapshot> actual,
+        IReadOnlyCollection<int>? siblingOrderIds)
     {
         var unmatched = actual.ToList();
+        var siblings = new List<PlacedOrderSnapshot>();
         foreach (var expectedOrder in expected)
         {
+            if (siblingOrderIds is { Count: > 0 } && siblingOrderIds.Contains(expectedOrder.PlayerOrderId))
+            {
+                siblings.Add(expectedOrder);
+                continue;
+            }
             var index = unmatched.FindIndex(actualOrder => SameOrderIgnoringId(expectedOrder, actualOrder));
+            if (index < 0) return false;
+            unmatched.RemoveAt(index);
+        }
+        // Strict matches are consumed first, so a lenient sibling match can never absorb the row that
+        // an unrelated order was supposed to prove.
+        foreach (var siblingOrder in siblings)
+        {
+            var index = unmatched.FindIndex(
+                actualOrder => SameOrderIdentityIgnoringId(siblingOrder, actualOrder));
             if (index < 0) return false;
             unmatched.RemoveAt(index);
         }
         return unmatched.Count == 0;
     }
+
+    private static bool SameOrderIdentityIgnoringId(PlacedOrderSnapshot left, PlacedOrderSnapshot right) =>
+        left.CreationDate == right.CreationDate &&
+        left.OfferedMetadata == right.OfferedMetadata && left.OfferedHash == right.OfferedHash &&
+        left.WantedMetadata == right.WantedMetadata && left.WantedHash == right.WantedHash &&
+        left.OriginalOfferedAmount == right.OriginalOfferedAmount &&
+        left.OfferedRatioPart == right.OfferedRatioPart && left.WantedRatioPart == right.WantedRatioPart;
 
     private static bool SameOrderIgnoringId(PlacedOrderSnapshot left, PlacedOrderSnapshot right) =>
         left.CreationDate == right.CreationDate &&
@@ -814,6 +892,8 @@ public sealed class TrackedOrderCollectionController
             RemainingOfferedAtArm = source.CancelIntent.RemainingOfferedAtArm,
             ReceivedWantedAtArm = source.CancelIntent.ReceivedWantedAtArm,
             UnrelatedOrdersFingerprint = source.CancelIntent.UnrelatedOrdersFingerprint,
+            UnrelatedIdentityFingerprint = source.CancelIntent.UnrelatedIdentityFingerprint,
+            SiblingOrderIds = [.. source.CancelIntent.SiblingOrderIds],
             ConfirmationOpenedAtUtc = source.CancelIntent.ConfirmationOpenedAtUtc,
             ConfirmClickAttemptedAtUtc = source.CancelIntent.ConfirmClickAttemptedAtUtc
         },
@@ -829,6 +909,8 @@ public sealed class TrackedOrderCollectionController
             AggregateOwnedBefore = source.CollectionAssetIntent.AggregateOwnedBefore,
             NonTargetInventoryFingerprint = source.CollectionAssetIntent.NonTargetInventoryFingerprint,
             UnrelatedOrdersFingerprint = source.CollectionAssetIntent.UnrelatedOrdersFingerprint,
+            UnrelatedIdentityFingerprint = source.CollectionAssetIntent.UnrelatedIdentityFingerprint,
+            SiblingOrderIds = [.. source.CollectionAssetIntent.SiblingOrderIds],
             AreaInstanceId = source.CollectionAssetIntent.AreaInstanceId,
             ArmedAtUtc = source.CollectionAssetIntent.ArmedAtUtc
         },

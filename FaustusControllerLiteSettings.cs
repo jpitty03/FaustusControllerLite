@@ -92,6 +92,34 @@ public sealed class FaustusControllerLiteSettings : ISettings
     public RangeNode<int> MinimumSaleChaos { get; set; } = new(10, 1, 5_000);
 
     /// <summary>
+    /// The smallest queue a competing sell may rest behind before that market is skipped. A queue of one
+    /// is one order, and one order at an absurd price is not a market. Set to 0 to release this half of
+    /// the check. See <see cref="CompetingLiquidityGate"/>.
+    /// </summary>
+    [Category("Strategy")]
+    public RangeNode<int> MinCompetingQueue { get; set; } =
+        new((int)CompetingLiquidityGate.DefaultMinCompetingQueue, 0, 10_000);
+
+    /// <summary>
+    /// How many times the same-direction immediate rate a competing rate may reach before that market is
+    /// skipped as unfillable. Raise it towards the maximum to release this half of the check.
+    /// See <see cref="CompetingLiquidityGate"/>.
+    /// </summary>
+    [Category("Strategy")]
+    public RangeNode<int> MaxCompetingSpread { get; set; } =
+        new((int)CompetingLiquidityGate.DefaultMaxCompetingSpread, 1, 1_000);
+
+    /// <summary>
+    /// How many sell orders the sweep may keep resting at once. A competing sell is priced to rest,
+    /// so waiting is the point of the order - but waiting on one at a time is what made a sweep of
+    /// twenty holdings twenty fill-or-timeout waits end to end. The exchange holds ten orders.
+    /// Settlement stays strictly serial whatever this is set to; only resting is concurrent. Set to
+    /// 1 to reproduce the single-order behaviour exactly.
+    /// </summary>
+    [Category("Strategy")]
+    public RangeNode<int> MaxConcurrentSweepOrders { get; set; } = new(3, 1, 10);
+
+    /// <summary>
     /// Reverses the sweep queue so the smallest stack is swept first. The default (largest first)
     /// is the operating order - an interruption then costs the least remaining value - but a first
     /// live test wants the cheapest possible mistake, so the order is an operator choice rather

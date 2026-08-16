@@ -1,4 +1,4 @@
-# Sell Sweep
+﻿# Sell Sweep
 
 Sell an entire holding of one item kind (initially Scarabs) from the visible stash tab, one order
 at a time. The sweep captures one execution strategy when it is planned: **Most Currency** uses
@@ -28,6 +28,12 @@ Given the Currency Exchange, the inventory, and a stash tab of the selected kind
 - **Fastest Fill never falls back.** It selects only immediate target and Divine/Chaos edges. A
   positive readable head proves the rate exists, but visible immediate depth does not cap sizing:
   every whole lot in the holding is placed at that aggressive limit.
+- **A competing head must be a believable market.** Most Currency prices at the head of the
+  competing ladder and then waits behind it, so the head has to be reachable before the holding is
+  sized against it. A competing market is skipped when its queue is below `MinCompetingQueue` or its
+  rate exceeds `MaxCompetingSpread` times the same-direction immediate rate. Rejection is per market,
+  not per candidate: a trolled Divine book simply loses to a healthy Chaos one. Fastest Fill is
+  untouched - it crosses against depth that is already resting.
 - **Unexpected Fastest remainder stays pending.** A partial immediate fill uses the normal
   `CompetingOrderWaitMinutes` deadline and the existing cancellation, collection, and stash flow.
 - **Offered items are drawn from the stash automatically.** The exchange pulls offered currency
@@ -386,6 +392,364 @@ second placement while a tracked order is unresolved. Multi-slot is Phase 7.
 - Placement remains one live order. Queue persistence and automatic continuation after reload remain
   Phase 7/non-goals; canonical tracked state is the manual recovery authority after reload.
 
+### Phase 7 - competing-head liquidity gate (landed)
+
+The sweep priced against whatever led the competing ladder without asking whether that head was
+reachable. On the 2026-08-15 book the `Divine Orb / Expedition Scarab` pair carried exactly one
+competing level - 1 Divine per Scarab, three units listed - against an immediate side of 450 Scarabs
+per Divine. Sixty Scarabs worth 47 Chaos on their own healthy Chaos book were priced at 60 Divine
+(11,880 Chaos), beat the Chaos market by 253x, and were posted against nobody.
+`Expedition Scarab of Infusion` was the same shape: queue 1, spread 200x, 11,880 against 60 Chaos.
+
+Measured across all 141 captures in that `latest-rates.json`, the two signals separate cleanly:
+
+| Signal | Trolled rows | Legit target->Divine | Legit target->Chaos |
+|---|---|---|---|
+| competing / immediate, same direction | 450x, 200x | 3.0x - 11.4x | ~1.001x |
+| competing levels in the book | 1 | 1 - 5 | 5 |
+| `CompetingQueueAhead` at the head | 3, 1 | 80 - 1313 | 84 - 8689 |
+
+- `Domain/CompetingLiquidityGate.cs` is the whole rule, shared by the planner and the click boundary
+  so the two cannot drift. Two independent halves, because credibility and price are independent
+  failures. The queue floor is `MarketSweepScore.DefaultMinCycleQueue` reused rather than picked
+  again - the market sweep already answers this question about these books, and its rationale is the
+  same one. The spread cap anchors the competing rate to the same-direction immediate rate, which is
+  the only rate in that direction with a counterparty already resting on it; the default of 25x sits
+  an order of magnitude above the widest legitimate row and an order of magnitude below the narrowest
+  troll. A missing immediate edge fails the spread half: no anchor is worse evidence than a wide one.
+- The spread is cross-multiplied in `BigInteger`, matching `Rational.CompareTo`. This is a
+  place / do-not-place decision, so no float enters it. `MarketSweepCycleLeg.Spread` stays `double`
+  because it is a ranking input, not a gate.
+- `FaustusSellPlanner.EvaluateMarket` runs the gate after the edge is selected and before the holding
+  is sized, and returns `SellRejectionReason.UnbackedCompetingHead` for that market alone. `Evaluate`
+  already scores Chaos and Divine independently and takes the higher `ProceedsChaos`, so the healthy
+  market wins with no fallback machinery. Both markets failing falls through the existing
+  `SellSweepCoordinator.Advance(..., Skipped, ...)` path and the sweep moves to the next candidate.
+- `SellSweepPlacement.TryValidateLiveMarket` re-runs the same gate on the final capture. The rate and
+  amounts can match exactly while the queue behind the head drains or is cancelled, so plan-time
+  belief is not click-time belief.
+- Thresholds are read live from settings at pricing and at the click. They are not snapshotted into
+  `SellSweepState`: that record is persisted with a schema version, and a safety threshold does not
+  earn a schema bump.
+- Not done, deliberately: repricing down the ladder. The trolled capture has exactly one competing
+  level, so there is nothing to walk down to, and `QuoteMatrixBuilder` asserts exactly four edges per
+  capture. Chaos fallback is the real remedy. Fastest Fill's uncapped sizing is also left alone; it
+  is a documented decision above and a separate change.
+- Not gated: the Divine->Chaos benchmark edge. It values proceeds rather than being sold into, and
+  in the observed failure it was a healthy 198/1 rate. If a trolled benchmark is ever seen, it
+  belongs in this gate too.
+
+### Phase 8 - concurrent resting orders (landed)
+
+The sweep sold one holding, then blocked until that order filled or timed out, was cancelled,
+collected, and stashed, and only then priced the next candidate. A competing sell is priced to
+*rest*, so the wait is the point of the order - and with nine of the exchange's ten slots empty the
+whole time, it was also the entire cost of the design. A sweep of twenty holdings serialised twenty
+fill-or-timeout waits back to back.
+
+The single-order rule was not incidental. It was enforced in four places: `BankrollState.TrackedOrder`
+is one nullable record, `SellSweepState` carried a singular `CurrentIndex` / `CurrentAttemptId` /
+`PreparedSignature`, `SellSweepCoordinator.MarkPlaced` threw *"one order is live at a time."*, and
+sweep placement refuses unless the visible order list is completely empty. `_trackedOrderState` has
+185 references in `FaustusControllerLite.cs`; turning all of them into a collection is the wrong
+shape of change.
+
+So the split is between what "an order exists" means, not between one order and many:
+
+- **Active slot** - the one order an input controller currently owns: arming, clicking, cancelling,
+  collecting, stashing. Stays `BankrollState.TrackedOrder` and stays `_trackedOrderState`. Exactly
+  one may exist, ever. All 185 call sites keep their current meaning.
+- **Resting slots** - orders that are placed and simply waiting, with no armed input intent.
+  `BankrollState.RestingOrders`, observation-only. Resting is the only thing that happens in
+  parallel; settlement stays strictly serial, one collect / stash / cancel at a time on the same
+  evidence it demands today.
+
+| Class | Statuses | Rule |
+|---|---|---|
+| Restable | `Pending`, `TimedOut`, `CompletedUncollected`, `CanceledUncollected`, `Ambiguous` | any number may rest |
+| Active-only | `Armed`, `CancelArmed`, `CancelClicked`, `CollectionArmed`, `Collected`, `StashTransferArmed` | at most one, and it is the active slot |
+
+`Ambiguous` rests as well as blocking. It has to: a resting order that turns ambiguous while the
+active slot is mid-settlement would otherwise have nowhere to be recorded, and canonical state that
+cannot be written is the exact wedge shape of the Milestone 10 history. It still blocks all trading
+and is still never retried.
+
+Concurrency is a setting, `MaxConcurrentSweepOrders`, 1-10, default 3. `1` reproduces the old
+behaviour exactly and is the rollback lever. One live order per offered metadata: two competing
+sells of the same item share a queue and the second is priced against the first, so the sweep would
+compete with itself. The arbitrage full workflow stays single-order - route legs are sequential by
+construction, leg 2 spends what leg 1 produced - and canonical state refuses to hold a workflow and
+a resting set at the same time.
+
+**8.1 - canonical state (landed).** `BankrollState` gains `RestingOrders`, `AllOrders`, and
+`ComputeUnresolved()`; bankroll schema 6 -> 7, migration lossless and additive (an existing file
+loads with an empty resting set and its tracked order still the active slot).
+`Orders/TrackedOrderRestPolicy` is the single answer to which statuses may rest, which need
+settlement, and which block trading. `BankrollStore` applies every existing per-order validation to
+each slot via `AllOrders` instead of to `TrackedOrder` alone, and adds three rules of the resting
+set's own: restable status, unique `AttemptId`, distinct `OfferedMetadata`. Reservation validation
+sums across slots and, because two slots may never offer the same asset, stays an exact identity per
+metadata rather than becoming a bound.
+
+The one safety property that changes, and it changes narrowly: `HasUnresolvedOrder` is now "the
+active slot is unresolved, **or** any resting slot is ambiguous". A resting `Pending` order no longer
+blocks trading - which is the entire point - and `Armed` and `Ambiguous` still block globally.
+
+**8.2 - fingerprint split (landed).** `OrderSetFingerprint` hashes every unrelated order's fill
+amounts, so a sibling filling mid-settlement aborted a collection. It splits into an identity half
+(`OrderIdentityFingerprint`, strict for every order: nothing may appear, vanish, or change what it
+is) and a volatile half (the existing hash, kept verbatim, now strict only for orders the sweep does
+not own). `GoldCost` is deliberately excluded from the identity half - a completed order can report
+it as zero, which `TerminalIdentityMatches` already accounts for. Safe because a fill sits inside the
+order until collected and never touches inventory; the proof that authorizes crediting is the
+phase-bound exact ownership increase, and that is untouched.
+
+The fingerprints were never the only whole-set check. `TrackedOrderCollectionController.SnapshotsEqual`
+and `SnapshotsEqualIgnoringIds`, and `TrackedOrderCancellationController.SnapshotsUnchanged`, compare
+every visible order field by field, so they had to learn the same rule: a listed sibling is compared
+on its immutable half, everything else exactly. In `SnapshotsEqualIgnoringIds` the strict matches are
+consumed first, so a lenient sibling match can never absorb the row an unrelated order was supposed
+to prove.
+
+The sibling set travels as `List<int> SiblingOrderIds` on `CollectionAssetIntentState` and
+`CancelIntentState` alongside `UnrelatedIdentityFingerprint`, so an interrupted settlement recovers
+with the same leniency it armed with; tracked-order schema 6 -> 7. Siblings are named by
+`PlayerOrderId`, so a renumber makes the check fail closed - an abort, never a silent pass. An intent
+armed before this change has an empty identity half: it verifies on the volatile half alone, exactly
+as it did, and refuses any sibling leniency it never recorded. All three `Start` overloads now take
+the sibling set; `FaustusControllerLite.RestingOrderIds()` derives it from `BankrollState.RestingOrders`,
+which stays empty until 8.3 - so this phase changes no behaviour at all.
+
+**8.3 - sweep slots (landed).** `SellSweepState.CurrentAttemptId` becomes
+`List<SellSweepSlot> Slots` - a slot is `{ CandidateIndex, AttemptId, PreparedSignature,
+OfferedMetadata, PlacedAtUtc }`, the durable link between a holding and the attempt selling it, so
+several candidates can be out at once without the sweep having to guess which tracked order belongs
+to which holding. Sweep schema 1 -> 2; nothing persists it, so there is no migration.
+
+`CurrentIndex` narrows to *the next candidate to price*: placement consumes a candidate and moves
+the cursor on, so a slotted candidate is always behind it and can never be re-priced or re-placed.
+Every read that reaches a candidate through the cursor had to stop doing that -
+`TryCalculateRealizedProceedsChaos` and the sold branch of `Advance` now reach it through the slot
+the attempt closed, because by the time an order stashes the cursor is several holdings past it.
+`PreparedSignature` stays singular: placement is still serial, and only one placement is ever in
+flight. `Phase` is maintained as `Slots.Count > 0 ? OrderLive : ReadyForCandidate`, so every
+external `Phase == OrderLive` read still means "the sweep has an order out" and needed no change.
+
+`Decide` gains a `(sweep, active, resting, maxConcurrentSweepOrders)` overload and one directive
+per tick, in priority order: anything ambiguous - or a slot with no order behind it, which means a
+row the sweep placed is gone - requires an operator; the active slot runs today's per-status switch
+untouched, and anything but a plain observation owns the tick outright because settlement is
+serial; a resting order that has reached a terminal state is promoted and settled *before* any new
+order is placed, which keeps reserved principal and uncollected proceeds low; only then, with a
+free slot and a candidate whose item is not already resting, is a placement authorized; otherwise
+the sweep observes. The two-argument form delegates with an empty resting set and a limit of 1,
+which is the old machine step for step - so the driver, which still calls that form until 8.4, is
+byte-for-byte unchanged in behaviour.
+
+The limit lives in one place, `HasFreeSlot`, which `MarkPrepared`, `ClearPreparationForRetry`, and
+`MarkPlaced` all pass through, each defaulting to 1. A slot therefore cannot be opened past the
+limit whichever path asks. `MarkPlaced` also refuses an attempt id that already stands for a slot
+and any item already resting. `MarkAmbiguous` fails every candidate the sweep still owns, resting
+ones included: a resting order's custody is exactly as unprovable as the active one's.
+
+**8.4 - driver and settings (landed).** `MaxConcurrentSweepOrders` is a Strategy setting,
+`RangeNode<int>(3, 1, 10)`, clamped by `SweepSlotLimit()` to what the exchange can hold. `1`
+reproduces the single-order behaviour exactly and is the rollback lever.
+
+The driver moves one order at a time between the active slot and the resting set, and that is the
+whole of the new plumbing:
+
+- **Demotion.** `TickSellSweep` calls `TryDemoteActiveOrderToRest` before deciding anything. An
+  order the sweep owns that has reached `Pending` is placed, stable, and holds no armed intent, so
+  holding the one active slot open for it is exactly what serialised the sweep. It moves out to a
+  resting slot in one durable write and the next candidate can be priced while it waits.
+- **Promotion.** `PollSweepSlotMoves` runs beside `PollTrackedOrderLifecycle` and watches the
+  orders nobody is holding. It sends no input and writes nothing while an order is still plainly
+  pending: `TrackedOrderLifecycle.Evaluate` is pure, so observing a resting order costs nothing. The
+  moment one observes as timed out, terminal, or ambiguous it is promoted into the active slot -
+  status untouched - and the existing lifecycle poll records the transition and settles the ledger
+  exactly as it always has. **No settlement, crediting, or terminal proof is duplicated for resting
+  orders.** That is the reason the whole design is one active slot rather than a set of them.
+- **Orphans.** A sweep that stopped or went ambiguous cannot settle what it left out, so when no
+  sweep is running the poll promotes the oldest resting order anyway. That keeps the operator's
+  ordinary cancel/collect/stash hotkeys able to reach it, one at a time, instead of stranding orders
+  nothing in the plugin can name.
+
+Two `Decide` rules had to widen for the driver's lazy clearing. A stashed order stays in the active
+slot after `Advance` has already closed its slot, so for a tick or two the sweep sees a tracked
+order it cannot name while other orders are still out. An **unresolved** one is still lost custody
+and still requires an operator; a **resolved** one is harmless leftover, and settlement promotion
+now overwrites it rather than waiting for an empty active slot.
+
+The placement gate no longer requires an empty order list. It requires every row on the panel -
+live or terminal - to be one the sweep can prove it placed by attempt id, and live orders strictly
+below `min(MaxExchangeOrders, MaxConcurrentSweepOrders)`. An unrecognised row still stops the sweep;
+that is the sweep detecting another actor on the panel, and it must not be lost. At a limit of 1
+with no slots open the owned set is empty, so any row at all refuses - which is the old
+`orders.Count != 0` check exactly.
+
+`StopSweepBeforePlacement` marks ambiguous instead of stopping when slots are open, for the same
+reason authorization revocation does: stopping says "nothing is outstanding", and with orders
+resting that is a lie.
+
+**Both directions are decided from one observation, and that is load-bearing.** The first build
+demoted on the stored status (`Pending`) and promoted on the live observation. Promotion
+deliberately leaves an order's status alone - the existing lifecycle poll is what records the
+transition - so a resting order that observed as timed out was promoted into the active slot still
+reading `Pending`, and the demotion rule moved it straight back out the same frame. That ping-ponged
+**two canonical bankroll writes per frame** until Windows refused one
+(`SweepRestingDemotionRefused: Access to the path is denied`), and the collection that eventually
+ran on top of the storm went ambiguous on a torn inventory read.
+
+Demotion therefore moved into `PollSweepSlotMoves` alongside promotion, where both share one panel
+read: an order rests only while it observes as plainly `Pending`
+(`TrackedOrderRestPolicy.ObservationAllowsRest`), and takes the active slot only on a conclusive
+non-pending observation (`ObservationRequiresSettlement`). `NotVisible` and `Transitioning` fall in
+the gap between them and move nothing at all. `resting and settling never claim the same order`
+asserts the two are disjoint over every observation kind there is. Independently of that logic,
+`SlotMoveIntervalMilliseconds` caps slot moves at two per second and a failed move backs off five
+seconds, so no future mistake above it can rewrite canonical state at frame rate again.
+
+**An unloaded book is not a moved price.** A full Immediate-mode sweep produced 42 staging aborts
+and zero placements - every candidate refused on *"The live quote no longer exactly matches the
+candidate leg"*, three times each, then skipped. A 100% refusal rate across books 62,000 listings
+deep is not a market moving; it is a check that cannot pass.
+
+The refusal named neither the rate nor the sample, so it was instrumented before it was touched -
+and the instrumented line settled it in one run: `[SamplingInitialQuote] … live no edges at all`.
+The *initial* sample, before any amount is typed, against a correctly-read capture of **nothing**.
+The exchange does not populate its stock ladder the instant a pair is selected, so the first sample
+after selection can legitimately see an empty book.
+
+`ShouldRetryMissingCompetingBook` already waited exactly that out - and was hard-gated to competing
+legs, so an immediate leg abandoned instantly on a panel that had merely not finished loading. It is
+now `ShouldRetryMissingBook`: a competing ladder still settles as before, and *any* leg waits while
+the capture holds no edge in its own direction. A book that loaded and reads a different price is a
+moved market and still fails at once, so a stale plan is re-planned rather than sat on. Both are
+bounded by the sampling step deadline.
+
+This is the same shape as the concurrency bugs above and as the `Ambiguous` rest policy: a tolerance
+that was written for one path and never generalised to the other. Worth checking first whenever
+Fastest Fill and Most Currency behave differently.
+
+**A moved quote is re-planned, wherever it moves.** The placement click already re-probed when the
+quote moved out from under it; staging did not, and stopped the whole sweep instead - even though
+`SingleLegStagingController` had already set `FreshProbeRetryRecommended` to say the abort was
+routine, and even though the arbitrage workflow'''s branch of the same method reads that flag. Only
+the sweep'''s branch ignored it. Fastest Fill made it constant, because an immediate head is repriced
+by every fill.
+
+Both aborts now share `TryReProbeSweepCandidate`; they differ only in *when* the quote moved, never
+in what should happen next. Re-planning without a bound is its own failure, though - a market
+volatile enough to move on every attempt would hold the queue forever - so after
+`MaximumSweepReProbes` consecutive re-plans of one candidate the holding is skipped, which is what
+the sweep already does with a market it cannot use. The counter is keyed to the cursor, so a
+successful placement resets it by moving on.
+
+**A skip reports every market, not the loudest one.** A holding is skipped only when *both*
+proceeds markets refuse it, and they usually refuse for different reasons. `ReasonPriority` picks
+one for the summary line, which is fine for an overlay and actively misleading in a log: fifteen
+Divination Scarab of Plenty were reported as *"cannot fill one lot of 65 for CurrencyModValues"* -
+true, and irrelevant, because Divine was never the market that mattered. `NoWholeLot` outranks
+`UnbackedCompetingHead`, so the Chaos market'''s actual refusal never reached the log at all.
+`FaustusSellPlanner.DescribeRejections` now appends every market'''s verdict to
+`SweepCandidateSkipped`; the overlay keeps the one-line summary.
+
+**A preparation has two halves and they move together.** `PreparedSignature` is the durable half;
+the staged leg and placement token in the driver are the other. `AdvanceSweepCandidate` clears the
+driver'''s half on every advancement - but `Advance` only cleared the durable half when the cursor'''s
+own candidate was retired, not when a slot closed. So a sweep that planned its next holding and then
+finished settling a resting order kept a `PreparedSignature` whose plan no longer existed anywhere:
+the next tick read it as *place now*, found no leg or token, and aborted with *"Sweep placement
+preparation was unavailable"*. A partially filled order made it easy to hit, because settling both
+sides takes long enough for the sweep to have planned something else in the meantime.
+
+Any retirement now clears the preparation, whichever candidate was retired; only the cursor still
+moves for a candidate that was never placed. And because the two halves being out of step is a plan
+problem rather than a custody problem, the driver re-probes instead of aborting if it ever sees it
+again - a plan is always recoverable, and the orders an abort strands are not.
+
+**The proceeds need time to arrive, and how much depends on how many.** A 368-Chaos batch is
+nineteen inventory stacks. The order row disappears the instant the server acknowledges the collect,
+and `SynchronizeTrackedCollection` settled on that same frame - reading the inventory exactly once
+and calling the batch ambiguous if all nineteen stacks had not yet materialised. They had not; they
+arrived moments later, and 368 Chaos then sat in the inventory against a canonical state that had
+given up on them.
+
+Every other stage of this flow already waits: three seconds for the row to disappear, three for
+canceled-return evidence, two stable reads for ownership. The inventory check was the only stage
+with no window at all, and the only one waiting on a *count* of items rather than on one thing
+changing - so it is the stage most sensitive to batch size, and the one that had the least
+tolerance. `CollectedInventorySettleTimeout` gives it six seconds, retried per frame from
+`CollectionFlowState.SettlingCollectedInventory`, and ownership has already proved the exact rise
+before that wait ever begins, so nothing is being taken on trust.
+
+**Waiting is not failing.** `Decide` deliberately authorizes a placement alongside a pending order -
+that is the whole of the concurrency - because it reasons about slots, not about who is holding
+input. `PlaceCurrentSweepCandidate` still carried the single-order world'''s refusal of *any*
+unresolved active order, so the moment a resting order was promoted mid-pricing the driver refused
+the placement `Decide` had just authorized, and `StopSweepBeforePlacement` marked the whole sweep
+ambiguous with every order it had out.
+
+Placement is serial, so the driver is where that authority meets the fact that the active slot must
+be free first - but the answer is to **wait**, not to abort. `SweepActiveSlotIsBusy` now separates
+the ordinary races of a multi-order sweep (an order not yet demoted, one just promoted and not yet
+reclassified, a controller mid-operation) from the faults that do not resolve on their own, and each
+of the seven durable blockers names itself instead of sharing *"preconditions were unavailable"*.
+`AdvanceSweepCandidate` had the same shape and was worse - it marked the sweep *ambiguous* because
+something else was mid-operation on the frame a stashed order came up - and now waits too.
+
+**A row is evidence of being terminal, never of which terminal.** A partly filled order that is
+then cancelled has two collectible assets, and collecting the first one broke the second every
+time. The SDK reported the row as `completed=True canceled=False` while the row itself still read
+*"Order Cancelled"*, so `expectedStatus = IsCanceled ? "Order Cancelled" : "Order Completed"`
+looked for the wrong string and refused with *"lost exact visible status evidence"*. The game does
+not keep the flag and the text in agreement, and nothing ever required it to.
+
+`OrderRowStatusText.IsTerminal` replaces all four sites that derived an expected string that way.
+The safety property is unchanged and is the only one the text ever carried: a row that is still
+trading reads `Order Listed` and is still refused. *Which* terminal a row reached, and for how
+much, is proved by the SDK amounts and the durable intent - which is where it was always proved.
+
+This was never sweep-specific. `CanceledReturnCollectionController` is shared with the arbitrage
+workflow and the manual hotkeys, so any partly filled order that gets cancelled hit it; the sweep
+simply meets that shape constantly, because a competing order that times out mid-fill is its normal
+outcome rather than an unusual one.
+
+**A retired candidate leaves a record.** A skip is the sweep declining to sell a stack - a decision
+about the operator's holdings - and it used to exist only in the on-screen status line, which
+scrolls away. Worse, the branch an operator actually *sees* (the cursor turning back from Place
+Order when the final live-market re-check rejects) deliberately clears `_lastFailure`, so the one
+visible moment left no trace at all. `SweepCandidateSkipped`, `SweepCandidateFailed`, and
+`SweepPlacementAbortedForReProbe` now carry the reason into `workflow-runtime.log`. Skips are the
+sweep working as designed, which is exactly why they have to be legible afterwards - otherwise a
+correct competing-liquidity refusal is indistinguishable from a bug.
+
+**Settlement failures now report themselves.** `VerifyInventoryPostState`, and both halves of the
+interrupted-collection classifier in `CanceledReturnCollectionController`, used to answer eleven
+different faults with three sentences - so a live refusal said only that settlement had been
+refused, never which evidence moved. Each condition is now its own check with the actual numbers in
+it, and `InventoryTransferEvidence.DescribeNonTargetChange` names the first non-target difference
+rather than reporting that a hash moved: an item appearing, a stack changing size, an item being
+repositioned, or - the one worth telling apart - `clearOfExchange` flipping, which means the
+exchange panel resized underneath items that never moved at all.
+
+**The limit is carried in four places, and all four must agree.** `Decide`, `MarkPrepared`,
+`MarkPlaced`, and `ClearPreparationForRetry` each take `maxConcurrentSweepOrders` and each defaults
+it to 1. The first live run threw *"A sweep can prepare only its current unplaced candidate."* on the
+second placement because only `Decide` had been told the real limit: the driver authorized a
+placement the coordinator then refused. All four now pass `SweepSlotLimit()`, and
+`sell sweep honours one limit end to end` walks limits 1 through 3 asserting they agree slot for slot.
+
+Two more driver reads of `Phase` had to go for the same reason - `Phase` now says whether *some*
+order is resting, not whether *this* placement is out. Arming a placement no longer requires
+`ReadyForCandidate` (it requires only that the sweep is running and the preparation still
+validates), and a cancelled click decides between re-probe and ambiguity on whether it consumed the
+prepared signature into a slot, which is the click's own outcome rather than the panel's.
+
+The status line reports occupancy as `2/3 resting (Sacrifice Scarab 41s, Gilded Scarab 12s)` -
+idle slots are sweep throughput left on the table, so the operator sees the number that matters.
+
 ## Invariants To Preserve
 
 - Every `Allow*` setting and hotkey defaults off/unbound.
@@ -394,7 +758,8 @@ second placement while a tracked order is unresolved. Multi-slot is Phase 7.
   picker, no popup, no held modifiers, an unchanged commanded cursor, and an unexpired deadline.
 - Currency identity remains exact metadata; names stay display-only.
 - All economics stay exact-integer; no floating point enters a decision.
-- One order in flight; canonical state keeps a single tracked order.
+- One order under input at a time: canonical state keeps a single active tracked order, and any
+  other order it knows about is resting - placed, observation-only, with no armed intent.
 
 ## Regression Testing
 
@@ -411,7 +776,7 @@ cd ../../Tests/FaustusControllerLite.Tests
 dotnet run --project FaustusControllerLite.Tests.csproj --no-restore
 ```
 
-Expected: `Build succeeded. 0 Warning(s) 0 Error(s)` and `172/172 tests passed`. Any warning is a
+Expected: `Build succeeded. 0 Warning(s) 0 Error(s)` and `198/198 tests passed`. Any warning is a
 regression - the project has been kept warning-clean, so a new one means something was silently
 reinterpreted.
 
@@ -738,6 +1103,144 @@ In game, **Active Feature = Sell Sweep**, exchange panel + scarab tab + inventor
 6. Let an aggressive order partially fill. The remaining order must stay pending until the normal
    configured wait deadline, then use the existing cancellation and settlement flow.
 
+### Phase 7 - competing-head liquidity gate
+
+1. Confirm `competing liquidity gate reads queue and spread`, `sell planner skips unbacked competing
+   heads`, and `sell sweep live quote rejects unbacked competing head` pass, and that the whole suite
+   is green - the pre-existing sell-planner fixtures were given believable books (a queue and an
+   immediate anchor) rather than the gate being loosened to accommodate them.
+2. With `AllowSellSweep` off, probe and scan a tab holding the trolled scarabs. Expedition Scarab and
+   Expedition Scarab of Infusion must plan at their **Chaos** proceeds (47 and 60 Chaos), never at
+   11,880. Any candidate whose only market was trolled must appear as skipped, and its detail must
+   name the measured queue or spread.
+3. Confirm every healthy holding plans at the same proceeds and into the same market as before the
+   gate existed. A gate that rejects real business is worse than the bug.
+4. Set `MinCompetingQueue` to 0 and `MaxCompetingSpread` to 1000, rescan, and confirm the old
+   11,880-Chaos plan returns. This is the proof that the gate is the only thing changing the outcome.
+5. Restore the defaults, enable `AllowSellSweep`, and place one real order on a healthy candidate.
+   The click-boundary re-check must not reject a good book.
+6. Confirm **Fastest Fill (Market Rate)** is unchanged: re-run the execution strategy selector block
+   above and confirm every step behaves exactly as it did before this phase.
+
+### Phase 8.1 - canonical resting order set
+
+Back up `config/FaustusControllerLite/FaustusControllerLite/bankroll-<league>.json` before step 2.
+This phase changes the canonical file's schema; nothing else in it sends input, so every step here
+is a load/save proof rather than a trading one.
+
+1. Confirm `resting orders round trip and do not block trading`, `resting ambiguity still blocks
+   trading`, `resting set rejects armed, duplicate, and shared asset`, `resting reservations are
+   exact per order`, `schema six bankroll gains empty resting set`, and `workflow refuses alongside
+   resting orders` pass, and that the whole suite is green.
+2. **Migration.** Start the plugin on an existing schema-6 bankroll file. It must load without
+   complaint, and the rewritten file must read `"SchemaVersion": 7` with an empty `RestingOrders`
+   and the same balances, the same tracked order, and the same `HasUnresolvedOrder` as the backup.
+   Diff the two files: schema version and the new empty array are the only permitted differences.
+3. **Nothing behaves differently yet.** Nothing writes a resting order until 8.3, so run one
+   complete single-order sweep and one arbitrage workflow leg end to end. Both must be
+   indistinguishable from before this phase - place, wait, settle, stash, next.
+4. **Unresolved still blocks.** With an order live (`Pending` or `Armed` in the active slot), confirm
+   the plugin still refuses to start anything else, exactly as before. `HasUnresolvedOrder` is
+   computed now rather than assigned, so this is the check that the computation agrees with the old
+   assignment on every single-order state.
+5. **Corrupt-state refusal is intact.** Hand-edit a copy of the file to add a `RestingOrders` entry
+   whose status is `CollectionArmed`, and another copy with two entries sharing one
+   `OfferedMetadata`. Both must refuse to load and must not be overwritten - the safe reset still
+   refuses corrupt evidence, and the forced reset is still the only exit.
+6. **Workflow exclusion.** Hand-edit a copy with both a `Workflow` and one resting entry. It must
+   refuse to load with the workflow-alongside-resting message rather than silently running a
+   workflow on top of sweep orders.
+
+### Phase 8.2 - fingerprint split
+
+Nothing lists a sibling yet, so every check below is a proof that settlement is exactly as strict as
+it was. Back up `bankroll-<league>.json` and `tracked-order-<league>.json` before step 2.
+
+1. Confirm `identity fingerprint ignores fills but not identity` and `sibling fills survive
+   settlement verification` pass, and that the whole suite is green.
+2. **Migration.** Start the plugin on an existing tracked-order file. It must load without
+   complaint and rewrite as `"SchemaVersion": 7`. Diff it against the backup: the schema number, an
+   empty `SiblingOrderIds`, and an empty `UnrelatedIdentityFingerprint` on any armed intent are the
+   only permitted differences.
+3. **Settlement is unchanged.** Run one sweep order all the way through - place, time out, cancel,
+   collect the return, stash - and one that completes and is collected. Both must be
+   indistinguishable from before this phase. `RestingOrderIds()` returns empty, so both halves are
+   computed over the same set and the volatile half alone is the old check.
+4. **An unrelated fill still aborts.** With one sweep order settling, place a second order by hand
+   on an unrelated item and let it take a fill while the collection is armed. The collection must
+   abort exactly as it does today and leave the order recoverable - the sweep does not own that row,
+   so it gets no leniency.
+5. **Interrupted recovery.** Arm a cancellation, alt-tab out mid-confirmation, and let the recovery
+   path run. It must reach the same verdict as before: unchanged orders recover, a changed unrelated
+   order marks ambiguous. This is the check that the intent now carries both halves and reads both.
+6. **Pre-upgrade intent.** Hand-edit a copy of an armed tracked-order file to blank
+   `UnrelatedIdentityFingerprint` and empty `SiblingOrderIds`. Recovery must still verify on the
+   volatile half alone rather than refusing or passing everything.
+
+### Phase 8.4 - driver and settings
+
+Back up `bankroll-<league>.json` first. Steps 2 and 3 are the ones that decide whether to go
+further; do not raise the setting above 2 until step 5 has passed once.
+
+1. Confirm `sell sweep works around a settled leftover`, `sell sweep honours one limit end to end`,
+   and `resting and settling never claim the same order` pass, and the whole suite is green.
+2. **Rollback proof.** `MaxConcurrentSweepOrders = 1`. Run a full sweep of two or three holdings.
+   Behaviour must be indistinguishable from before this phase: place, wait, settle, stash, next,
+   one at a time. The status line reads `0/1 resting` or `1/1 resting` throughout. Any difference
+   here is a bug in the demotion path, not in the concurrency.
+3. **No slot churn.** Before anything else, with one order resting, watch
+   `execution-audit-<league>.jsonl`. `SweepOrderMovedToRestingSlot` must appear **once** per placed
+   order and `RestingOrderPromotedToActiveSlot` **once** per settled one. Alternating pairs on one
+   attempt id are the ping-pong regressing, and it writes the bankroll file twice a frame.
+4. **Two concurrent.** Set 2. The second order must go up while the first is still resting, on a
+   different item, and a third must be refused until one settles. Watch the status line count the
+   slots and the ages climb. Confirm `bankroll-<league>.json` holds the resting order under
+   `RestingOrders` with `"Status": "Pending"`, and that `HasUnresolvedOrder` is `false` while both
+   are merely pending.
+5. **Settling wins over placing.** With two resting, let one time out. The sweep must promote and
+   settle that one before opening another slot, even though a slot is free. Reserved principal and
+   uncollected proceeds staying low is the whole reason for that ordering.
+6. **A large batch.** Let one order fill for enough proceeds to need ten or more inventory stacks
+   (200+ Chaos). The collection must wait for every stack to arrive rather than settling on the
+   frame the order row disappears. This is the stage with the least tolerance for batch size, and
+   the one that failed at nineteen stacks.
+7. **The fill-during-settlement case** - the one this design exists for. With two resting, settle
+   one while the other takes a partial fill. The collection must not abort: the filling order is a
+   listed sibling and is compared on its immutable half only. Confirm the collected amount is
+   credited exactly once and the audit records one credit.
+8. **Foreign-order refusal.** Place an order by hand outside the sweep, then let a sweep try to
+   place. It must refuse on the row it cannot account for and mark ambiguous, naming the count.
+9. **Interruption.** With two resting, alt-tab out. Both orders must persist, both candidates must
+   read `Failed`, nothing may be retried, and a reload must recover both. Then confirm the orphan
+   path: with the sweep no longer running, one resting order is promoted into the active slot so the
+   manual cancel/collect/stash hotkeys can reach it, and the next is promoted after that one stashes.
+10. Raise to 3, run a full sweep, and only after a clean run raise toward 10.
+
+### Phase 8.3 - sweep slots
+
+The driver still calls the two-argument `Decide`, so a live sweep cannot reach a second slot yet.
+Everything below is therefore a proof that the single-slot path is unchanged, plus the unit
+coverage for the concurrent path that 8.4 switches on.
+
+1. Confirm `sell sweep fills every slot it is given` and `sell sweep single slot reproduces the old
+   machine` pass, and that the whole suite is green. The second is the rollback proof: it walks the
+   old directive sequence tick for tick through the new state machine.
+2. **A whole sweep is unchanged.** Run a sweep of two or three holdings end to end - price, place,
+   wait, time out, cancel, collect, stash, next. Every status line, every directive, and the final
+   realized total must be indistinguishable from before this phase.
+3. **The cursor moved.** While one order is resting, the status line's candidate is now the *next*
+   holding rather than the one that is out. That is the intended change and the only visible one;
+   confirm the sold candidate is still credited to the right row when it stashes, not to the one
+   the cursor is now on. `Advance` reaching the candidate through the slot is exactly what this
+   checks.
+4. **Revocation with an order out.** Alt-tab away while an order is resting. The sweep must mark
+   ambiguous, not stop: `durable` is now "any slot exists", so an order that is out is never
+   forgotten. Confirm the candidate that was out is `Failed` and nothing is retried.
+5. **A skipped candidate does not disturb a slot.** Let one candidate fail its re-probe while
+   another order is resting (a market that drains between plan and placement will do it). The
+   failed candidate must be retired off the cursor and the resting slot must be untouched - same
+   attempt id, same status, still resting afterwards.
+
 ## Open Risks
 
 - The exchange-panel overlap is still live: `exchangeRight=1793`, with inventory columns at x=1696
@@ -747,3 +1250,12 @@ In game, **Active Feature = Sell Sweep**, exchange panel + scarab tab + inventor
   known scarab-affinity case. The code now encodes that symmetry, but it is still an assumption
   until Phase 2 regression step 6 is run in game - that step is the only thing that confirms it.
 - The 10-order cap is a supplied constant and is not verifiable from the SDK.
+- Aborting a sweep with orders resting marks ambiguous and leaves those orders in `RestingOrders`.
+  They are recoverable - the orphan promotion path hands them to the manual hotkeys one at a time -
+  but nothing settles them automatically, and a sweep cannot be planned again until the order book
+  is empty. A transient failure at placement time therefore costs more now than it did when only
+  one order could ever be out.
+- Concurrent resting orders relax `HasUnresolvedOrder` for the first time since it was written: a
+  resting `Pending` order no longer blocks trading. Every other blocking state is unchanged, but
+  this is the one place where the multi-order design trades a safety margin for the throughput it
+  exists to buy, and it is the first thing to look at if the sweep ever acts while it should wait.

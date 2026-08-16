@@ -1,4 +1,4 @@
-using FaustusControllerLite.Orders;
+﻿using FaustusControllerLite.Orders;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -33,7 +33,7 @@ public sealed class TrackedOrderStore
 
         var state = JsonSerializer.Deserialize<TrackedOrderState>(File.ReadAllText(path), JsonOptions)
             ?? throw new InvalidDataException("Tracked order state was empty.");
-        var migrated = state.SchemaVersion is 1 or 2 or 3 or 4 or 5;
+        var migrated = state.SchemaVersion is 1 or 2 or 3 or 4 or 5 or 6;
         if (migrated)
         {
             if (state.StashTransferIntent is { } legacyStashIntent)

@@ -227,6 +227,51 @@ public static class InventoryTransferEvidence
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
     }
 
+    /// <summary>
+    /// Names the first non-target difference between two inventory reads. The fingerprint alone can
+    /// only say "something moved", which is useless in a log; every occurrence of that message has
+    /// cost a live investigation to work out whether an item appeared, a stack changed size, or a
+    /// panel simply moved underneath the same items.
+    /// </summary>
+    public static string DescribeNonTargetChange(
+        InventoryTransferSnapshot before,
+        InventoryTransferSnapshot after,
+        string metadata)
+    {
+        var left = before.NonTarget(metadata);
+        var right = after.NonTarget(metadata);
+        if (left.Count != right.Count)
+        {
+            return $"non-target item count moved {left.Count} -> {right.Count}";
+        }
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (left[index] == right[index])
+            {
+                continue;
+            }
+            var a = left[index];
+            var b = right[index];
+            if (a.EntityAddress != b.EntityAddress || a.Metadata != b.Metadata)
+            {
+                return $"non-target slot {index} became a different item " +
+                    $"({a.Metadata} -> {b.Metadata})";
+            }
+            if (a.Amount != b.Amount)
+            {
+                return $"non-target {a.Metadata} stack moved {a.Amount} -> {b.Amount}";
+            }
+            if (a.ClearOfExchange != b.ClearOfExchange)
+            {
+                return $"non-target {a.Metadata} crossed the exchange edge " +
+                    $"(clearOfExchange {a.ClearOfExchange} -> {b.ClearOfExchange}); the panel moved, not the item";
+            }
+            return $"non-target {a.Metadata} moved from ({a.X},{a.Y} {a.Width}x{a.Height}) " +
+                $"to ({b.X},{b.Y} {b.Width}x{b.Height})";
+        }
+        return "non-target custody hashed differently with no readable difference";
+    }
+
     public static RecoveryKind ClassifyRecovery(
         StashTransferIntentState intent,
         InventoryTransferSnapshot current,

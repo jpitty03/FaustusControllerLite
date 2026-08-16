@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -352,5 +352,73 @@ public static class TrackedOrderLifecycle
                 order.IsCompleted ? "1" : "0", order.IsCanceled ? "1" : "0"))
             .OrderBy(value => value, StringComparer.Ordinal));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    /// <summary>
+    /// The half of an order that cannot change while it sits on the panel: when it was created, what
+    /// it offers and wants, how much it originally offered, and at what whole-lot ratio. A fill moves
+    /// <c>RemainingOfferedAmount</c>, <c>ReceivedWantedAmount</c>, the completed/canceled flags, and -
+    /// at the terminal transition - <c>GoldCost</c> to zero, so none of those belong here.
+    ///
+    /// This exists so a settlement can still hold every unrelated order to "nothing appeared,
+    /// vanished, or turned into a different order" while an order the sweep itself owns is allowed to
+    /// take a fill in the middle of it.
+    /// </summary>
+    public static string OrderIdentityFingerprint(IEnumerable<PlacedOrderSnapshot> orders)
+    {
+        var canonical = string.Join("\n", orders.Select(order => string.Join("|",
+                order.CreationDate.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+                order.OfferedMetadata, order.OfferedHash.ToString(CultureInfo.InvariantCulture),
+                order.WantedMetadata, order.WantedHash.ToString(CultureInfo.InvariantCulture),
+                order.OriginalOfferedAmount.ToString(CultureInfo.InvariantCulture),
+                order.OfferedRatioPart.ToString(CultureInfo.InvariantCulture),
+                order.WantedRatioPart.ToString(CultureInfo.InvariantCulture)))
+            .OrderBy(value => value, StringComparer.Ordinal));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    public static IEnumerable<PlacedOrderSnapshot> ExcludeSiblings(
+        IEnumerable<PlacedOrderSnapshot> orders,
+        IReadOnlyCollection<int>? siblingOrderIds) =>
+        siblingOrderIds is { Count: > 0 }
+            ? orders.Where(order => !siblingOrderIds.Contains(order.PlayerOrderId))
+            : orders;
+
+    /// <summary>
+    /// The two fingerprints a settlement arms against. With no siblings both halves are computed over
+    /// the same set and the volatile half alone is exactly the old whole-set check, so a single-order
+    /// settlement is bit-for-bit as strict as it was before resting orders existed.
+    /// </summary>
+    public static (string Volatile, string Identity) CaptureUnrelatedOrders(
+        IEnumerable<PlacedOrderSnapshot> unrelated,
+        IReadOnlyCollection<int>? siblingOrderIds)
+    {
+        var snapshot = unrelated.ToArray();
+        return (OrderSetFingerprint(ExcludeSiblings(snapshot, siblingOrderIds)),
+            OrderIdentityFingerprint(snapshot));
+    }
+
+    /// <summary>
+    /// Whether the unrelated orders still match what a settlement armed against. Identity must hold
+    /// for every one of them; fill amounts may move only for the orders the sweep named as its own.
+    /// An intent that names siblings but carries no identity half is malformed and fails closed, and
+    /// an empty identity half is a pre-split intent whose volatile half already covered everything.
+    /// </summary>
+    public static bool UnrelatedOrdersUnchanged(
+        IEnumerable<PlacedOrderSnapshot> unrelated,
+        string volatileFingerprint,
+        string identityFingerprint,
+        IReadOnlyCollection<int>? siblingOrderIds)
+    {
+        var snapshot = unrelated.ToArray();
+        if (string.IsNullOrEmpty(identityFingerprint))
+        {
+            if (siblingOrderIds is { Count: > 0 }) return false;
+        }
+        else if (OrderIdentityFingerprint(snapshot) != identityFingerprint)
+        {
+            return false;
+        }
+        return OrderSetFingerprint(ExcludeSiblings(snapshot, siblingOrderIds)) == volatileFingerprint;
     }
 }

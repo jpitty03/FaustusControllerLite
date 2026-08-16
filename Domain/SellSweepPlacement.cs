@@ -1,4 +1,4 @@
-using FaustusControllerLite.Orders;
+﻿using FaustusControllerLite.Orders;
 using FaustusControllerLite.Probing;
 
 namespace FaustusControllerLite.Domain;
@@ -39,9 +39,9 @@ public static class SellSweepPlacement
         ArgumentNullException.ThrowIfNull(sweep);
         ArgumentNullException.ThrowIfNull(stagedLeg);
         var candidate = sweep.Current;
-        if (token is null || now > token.ExpiresAtUtc ||
-            sweep.Phase != SellSweepPhase.ReadyForCandidate || sweep.CurrentAttemptId is not null ||
+        if (token is null || now > token.ExpiresAtUtc || !sweep.IsActive ||
             candidate is null || candidate.Outcome != SellSweepCandidateOutcome.Pending ||
+            sweep.IsMetadataSlotted(candidate.Metadata) ||
             token.SweepId != sweep.SweepId || token.CandidateIndex != sweep.CurrentIndex ||
             token.CandidateIndex != candidate.Index ||
             !string.Equals(token.CandidateMetadata, candidate.Metadata, StringComparison.Ordinal) ||
@@ -88,7 +88,9 @@ public static class SellSweepPlacement
         SellSweepPlacementToken token,
         MarketCapture capture,
         DateTimeOffset now,
-        out string failure)
+        out string failure,
+        long minCompetingQueue = CompetingLiquidityGate.DefaultMinCompetingQueue,
+        long maxCompetingSpread = CompetingLiquidityGate.DefaultMaxCompetingSpread)
     {
         ArgumentNullException.ThrowIfNull(token);
         ArgumentNullException.ThrowIfNull(capture);
@@ -102,11 +104,16 @@ public static class SellSweepPlacement
         }
 
         DirectedExchangeEdge? edge;
+        DirectedExchangeEdge? immediateAnchor;
         try
         {
-            edge = MarketCaptureNormalizer.CreateEdges(capture).SingleOrDefault(candidate =>
+            var edges = MarketCaptureNormalizer.CreateEdges(capture);
+            edge = edges.SingleOrDefault(candidate =>
                 IdentityMatches(candidate.From, token.From) && IdentityMatches(candidate.To, token.To) &&
                 candidate.ExecutionIntent == token.ExecutionIntent);
+            immediateAnchor = edges.SingleOrDefault(candidate =>
+                IdentityMatches(candidate.From, token.From) && IdentityMatches(candidate.To, token.To) &&
+                candidate.ExecutionIntent == QuoteExecutionIntent.Immediate);
         }
         catch (Exception exception) when (exception is OverflowException or InvalidOperationException)
         {
@@ -126,6 +133,16 @@ public static class SellSweepPlacement
         if (token.ExecutionIntent == QuoteExecutionIntent.Immediate && edge.ImmediateInputDepth <= 0)
         {
             failure = "Final immediate edge had no positive readable depth at the prepared head rate.";
+            return false;
+        }
+
+        // The same gate the planner applied, re-run on the final book: an order priced against a believable
+        // head at plan time must still be priced against one at click time, because the queue behind it can
+        // drain or be cancelled in between.
+        if (!CompetingLiquidityGate.IsBelievable(
+                edge, immediateAnchor, minCompetingQueue, maxCompetingSpread, out var gateReason))
+        {
+            failure = $"Final competing edge is no longer backed: {gateReason}.";
             return false;
         }
 

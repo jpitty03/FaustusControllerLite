@@ -1,4 +1,4 @@
-using FaustusControllerLite.Orders;
+﻿using FaustusControllerLite.Orders;
 using FaustusControllerLite.Probing;
 
 namespace FaustusControllerLite.Domain;
@@ -33,6 +33,7 @@ public enum SellSweepDirectiveKind
     AuthorizeStashReturn,
     RecoverStashReturnWithoutRetry,
     AdvanceToNextCandidate,
+    PromoteRestingOrderForSettlement,
     ManualReconciliationRequired,
 }
 
@@ -54,9 +55,23 @@ public sealed class SellSweepCandidate
     public string Detail { get; set; } = string.Empty;
 }
 
+/// <summary>
+/// One order the sweep has placed and not yet closed out. A slot is the durable link between a
+/// candidate and the attempt that sold it, so several candidates can be resting at once without
+/// the sweep having to guess which tracked order belongs to which holding.
+/// </summary>
+public sealed class SellSweepSlot
+{
+    public int CandidateIndex { get; set; }
+    public Guid AttemptId { get; set; }
+    public string PreparedSignature { get; set; } = string.Empty;
+    public string OfferedMetadata { get; set; } = string.Empty;
+    public DateTimeOffset PlacedAtUtc { get; set; }
+}
+
 public sealed class SellSweepState
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public Guid SweepId { get; set; }
@@ -64,12 +79,22 @@ public sealed class SellSweepState
     public Guid OriginProbeSessionId { get; set; }
     public SellSweepExecutionMode ExecutionMode { get; set; } = SellSweepExecutionMode.MostCurrency;
     public SellSweepPhase Phase { get; set; }
+    /// <summary>
+    /// The next candidate to price. Placement consumes a candidate and moves this on, so a slotted
+    /// candidate is always behind the cursor and is never re-priced or re-placed.
+    /// </summary>
     public int CurrentIndex { get; set; }
-    public Guid? CurrentAttemptId { get; set; }
+
+    /// <summary>
+    /// The orders this sweep has out. Empty means nothing is placed; one entry is exactly the old
+    /// single-order behaviour. Placement is still serial - only resting is parallel.
+    /// </summary>
+    public List<SellSweepSlot> Slots { get; set; } = [];
 
     /// <summary>
     /// The quote the current candidate is prepared against. Empty means the candidate still needs
-    /// a fresh re-plan before any placement input is authorized.
+    /// a fresh re-plan before any placement input is authorized. Singular because only one
+    /// placement is ever in flight.
     /// </summary>
     public string PreparedSignature { get; set; } = string.Empty;
 
@@ -84,6 +109,24 @@ public sealed class SellSweepState
 
     public SellSweepCandidate? Current =>
         CurrentIndex >= 0 && CurrentIndex < Candidates.Count ? Candidates[CurrentIndex] : null;
+
+    public SellSweepSlot? FindSlot(Guid attemptId) =>
+        attemptId == Guid.Empty ? null : Slots.FirstOrDefault(slot => slot.AttemptId == attemptId);
+
+    /// <summary>
+    /// Whether this item already has an order resting. Two orders on the same item share a queue,
+    /// so the second would be priced against the first - the sweep would compete with itself.
+    /// </summary>
+    public bool IsMetadataSlotted(string metadata) =>
+        Slots.Any(slot => string.Equals(slot.OfferedMetadata, metadata, StringComparison.Ordinal));
+
+    public SellSweepCandidate? CandidateFor(SellSweepSlot slot)
+    {
+        ArgumentNullException.ThrowIfNull(slot);
+        return slot.CandidateIndex >= 0 && slot.CandidateIndex < Candidates.Count
+            ? Candidates[slot.CandidateIndex]
+            : null;
+    }
 }
 
 /// <summary>
@@ -271,35 +314,126 @@ public static class SellSweepPlanner
 public static class SellSweepCoordinator
 {
     /// <summary>
-    /// The single-live-order rule. Placement is reachable only from
-    /// <see cref="SellSweepPhase.ReadyForCandidate"/>, which is reachable only once the previous
-    /// candidate's order has left the tracked state entirely. There is deliberately no path that
-    /// authorizes a placement while an order is outstanding.
+    /// The single-order form, kept so every caller that has no resting set - and the arbitrage
+    /// workflow, which is deliberately never concurrent - reads exactly as it did.
     /// </summary>
-    public static SellSweepDirectiveKind Decide(SellSweepState sweep, TrackedOrderState? tracked)
+    public static SellSweepDirectiveKind Decide(SellSweepState sweep, TrackedOrderState? tracked) =>
+        Decide(sweep, tracked, [], 1);
+
+    /// <summary>
+    /// One directive per tick, in priority order:
+    /// <list type="number">
+    /// <item>anything ambiguous, or a slot with no order behind it, requires an operator;</item>
+    /// <item>the active slot - the one order an input controller owns - runs today's per-status
+    /// switch unchanged, and anything but a plain observation owns the tick outright because
+    /// settlement is strictly serial;</item>
+    /// <item>a resting order that has reached a terminal state is promoted and settled before any
+    /// new order is placed, which keeps reserved principal and uncollected proceeds low;</item>
+    /// <item>only then, with a free slot and a candidate whose item is not already resting, is a
+    /// placement authorized;</item>
+    /// <item>otherwise the sweep observes.</item>
+    /// </list>
+    /// With <paramref name="maxConcurrentSweepOrders"/> at 1 and an empty resting set this is the
+    /// old single-order machine step for step.
+    /// </summary>
+    public static SellSweepDirectiveKind Decide(
+        SellSweepState sweep,
+        TrackedOrderState? tracked,
+        IReadOnlyList<TrackedOrderState> resting,
+        int maxConcurrentSweepOrders)
     {
         ArgumentNullException.ThrowIfNull(sweep);
-        if (!sweep.IsActive) return SellSweepDirectiveKind.None;
-        if (sweep.Current is null) return SellSweepDirectiveKind.ManualReconciliationRequired;
-
-        if (sweep.Phase == SellSweepPhase.ReadyForCandidate)
+        ArgumentNullException.ThrowIfNull(resting);
+        if (maxConcurrentSweepOrders < 1)
         {
-            // An unresolved order here belongs to no candidate this sweep is positioned on:
-            // placing another would put two orders live. Refuse rather than guess.
-            if (tracked?.IsUnresolved == true)
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrentSweepOrders));
+        }
+        if (!sweep.IsActive) return SellSweepDirectiveKind.None;
+
+        // Ambiguity is never a controller's to resolve, wherever it sits.
+        if (resting.Any(order => TrackedOrderRestPolicy.BlocksTrading(order)))
+        {
+            return SellSweepDirectiveKind.ManualReconciliationRequired;
+        }
+
+        var observing = false;
+        if (tracked is not null)
+        {
+            var activeSlot = sweep.FindSlot(tracked.AttemptId);
+            if (activeSlot is null)
+            {
+                // An unresolved order that belongs to no slot is not this sweep's to act on.
+                // Refuse rather than guess, exactly as the single-order machine did. A *resolved*
+                // one is the order the sweep just stashed and already advanced past: harmless
+                // leftover in the active slot, and never a reason to stop the sweep.
+                if (tracked.IsUnresolved)
+                {
+                    return SellSweepDirectiveKind.ManualReconciliationRequired;
+                }
+            }
+            else
+            {
+                var active = MapActiveOrder(tracked);
+                if (active != SellSweepDirectiveKind.ObserveCurrentOrder) return active;
+                // A placement click is durably armed and in flight; nothing may start around it.
+                if (tracked.Status == TrackedOrderStatus.Armed) return active;
+                observing = true;
+            }
+        }
+
+        // Every slot must be accounted for by the active order or a resting one. A slot with no
+        // order behind it means a row the sweep placed is gone, which is an operator's problem.
+        foreach (var slot in sweep.Slots)
+        {
+            if (tracked is not null && tracked.AttemptId == slot.AttemptId) continue;
+            if (!resting.Any(order => order.AttemptId == slot.AttemptId))
             {
                 return SellSweepDirectiveKind.ManualReconciliationRequired;
             }
+        }
+
+        // Settle before placing: an order that has already stopped trading is holding custody the
+        // sweep could be banking instead of adding more exposure on top of it.
+        if ((tracked is null || sweep.FindSlot(tracked.AttemptId) is null) &&
+            NextSettlementSlot(sweep, resting) is not null)
+        {
+            return SellSweepDirectiveKind.PromoteRestingOrderForSettlement;
+        }
+
+        if (sweep.Slots.Count < maxConcurrentSweepOrders &&
+            sweep.Current is { Outcome: SellSweepCandidateOutcome.Pending } candidate &&
+            !sweep.IsMetadataSlotted(candidate.Metadata))
+        {
             return string.IsNullOrEmpty(sweep.PreparedSignature)
                 ? SellSweepDirectiveKind.RescanAndPlanCurrentCandidate
                 : SellSweepDirectiveKind.PlaceCurrentCandidate;
         }
 
-        if (tracked is null || sweep.CurrentAttemptId != tracked.AttemptId)
-        {
-            return SellSweepDirectiveKind.ManualReconciliationRequired;
-        }
+        return observing || sweep.Slots.Count > 0
+            ? SellSweepDirectiveKind.ObserveCurrentOrder
+            : SellSweepDirectiveKind.ManualReconciliationRequired;
+    }
 
+    /// <summary>
+    /// The resting order the sweep would promote into the active slot next. Oldest first, so a
+    /// slot that has been holding custody longest is banked first. Null when nothing is ready.
+    /// </summary>
+    public static TrackedOrderState? NextSettlementSlot(
+        SellSweepState sweep,
+        IReadOnlyList<TrackedOrderState> resting)
+    {
+        ArgumentNullException.ThrowIfNull(sweep);
+        ArgumentNullException.ThrowIfNull(resting);
+        return sweep.Slots
+            .OrderBy(slot => slot.PlacedAtUtc)
+            .Select(slot => resting.FirstOrDefault(order =>
+                order.AttemptId == slot.AttemptId &&
+                TrackedOrderRestPolicy.NeedsSettlement(order.Status)))
+            .FirstOrDefault(order => order is not null);
+    }
+
+    private static SellSweepDirectiveKind MapActiveOrder(TrackedOrderState tracked)
+    {
         return tracked.Status switch
         {
             // The placement controller persists Armed and binds this matching attempt immediately
@@ -332,11 +466,26 @@ public static class SellSweepCoordinator
         };
     }
 
+    /// <summary>
+    /// Whether a fresh placement may be prepared or sent. The limit lives here rather than at each
+    /// call site so a slot can never be opened past it, whichever path asks.
+    /// </summary>
+    private static bool HasFreeSlot(SellSweepState sweep, int maxConcurrentSweepOrders)
+    {
+        if (maxConcurrentSweepOrders < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrentSweepOrders));
+        }
+        return sweep.IsActive && sweep.Slots.Count < maxConcurrentSweepOrders &&
+            sweep.Slots.Count < ExchangeOrderCapacity.MaxExchangeOrders;
+    }
+
     public static SellSweepState MarkPrepared(
         SellSweepState sweep,
         SellMarketQuote quote,
         Guid probeSessionId,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        int maxConcurrentSweepOrders = 1)
     {
         ArgumentNullException.ThrowIfNull(sweep);
         ArgumentNullException.ThrowIfNull(quote);
@@ -345,14 +494,15 @@ public static class SellSweepCoordinator
             throw new ArgumentException(
                 "A prepared sweep requires its unchanged sweep-wide probe session.", nameof(probeSessionId));
         }
-        if (sweep.Phase != SellSweepPhase.ReadyForCandidate || sweep.CurrentAttemptId is not null)
+        if (!HasFreeSlot(sweep, maxConcurrentSweepOrders))
         {
             throw new InvalidOperationException("A sweep can prepare only its current unplaced candidate.");
         }
         var next = Clone(sweep);
         var candidate = next.Current
             ?? throw new InvalidOperationException("The sweep is not positioned on a candidate.");
-        if (candidate.Outcome != SellSweepCandidateOutcome.Pending ||
+        if (next.IsMetadataSlotted(candidate.Metadata) ||
+            candidate.Outcome != SellSweepCandidateOutcome.Pending ||
             !quote.Edge.From.Metadata.Equals(candidate.Metadata, StringComparison.Ordinal) ||
             quote.Edge.ExecutionIntent != SellSweepExecutionModes.ToExecutionIntent(next.ExecutionMode) ||
             quote.InputSpent <= 0 || quote.Output <= 0 || quote.InputSpent > candidate.HoldingAtScan)
@@ -376,22 +526,24 @@ public static class SellSweepCoordinator
     public static SellSweepState MarkPlaced(
         SellSweepState sweep,
         Guid attemptId,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        int maxConcurrentSweepOrders = 1)
     {
         ArgumentNullException.ThrowIfNull(sweep);
         if (attemptId == Guid.Empty)
         {
             throw new ArgumentException("A placed order requires an attempt id.", nameof(attemptId));
         }
-        if (sweep.Phase != SellSweepPhase.ReadyForCandidate)
+        if (!HasFreeSlot(sweep, maxConcurrentSweepOrders))
         {
             throw new InvalidOperationException(
-                "A sell sweep places an order only from ReadyForCandidate; one order is live at a time.");
+                "A sell sweep places an order only into a free slot; every slot is already resting.");
         }
         var next = Clone(sweep);
         var candidate = next.Current
             ?? throw new InvalidOperationException("The sweep is not positioned on a candidate.");
-        if (next.CurrentAttemptId is not null || candidate.Outcome != SellSweepCandidateOutcome.Pending ||
+        if (next.FindSlot(attemptId) is not null || next.IsMetadataSlotted(candidate.Metadata) ||
+            candidate.Outcome != SellSweepCandidateOutcome.Pending ||
             string.IsNullOrWhiteSpace(next.PreparedSignature) ||
             !string.Equals(next.PreparedSignature, candidate.PlannedSignature, StringComparison.Ordinal) ||
             candidate.PlannedInputSpent <= 0 || candidate.PlannedOutput <= 0 ||
@@ -399,15 +551,41 @@ public static class SellSweepCoordinator
         {
             throw new InvalidOperationException("A sell sweep order requires an exact current preparation.");
         }
+        next.Slots.Add(new SellSweepSlot
+        {
+            CandidateIndex = candidate.Index,
+            AttemptId = attemptId,
+            PreparedSignature = next.PreparedSignature,
+            OfferedMetadata = candidate.Metadata,
+            PlacedAtUtc = now,
+        });
+        // Placement consumes the candidate: the cursor moves on so the next tick prices the next
+        // holding rather than re-pricing one that is already resting.
+        next.CurrentIndex++;
+        next.PreparedSignature = string.Empty;
         next.Phase = SellSweepPhase.OrderLive;
-        next.CurrentAttemptId = attemptId;
         next.UpdatedAtUtc = now;
-        next.Detail = $"Order live for {candidate.Name}; no further placement until it settles.";
+        next.Detail = $"Order live for {candidate.Name}; {next.Slots.Count} of " +
+            $"{maxConcurrentSweepOrders} slots resting.";
         return next;
     }
 
+    /// <summary>
+    /// Closes out one candidate. A <see cref="SellSweepCandidateOutcome.Sold"/> outcome closes the
+    /// slot the attempt belongs to and leaves every other slot resting; a skip or failure retires
+    /// the candidate the cursor is on, which was never placed, and moves the cursor past it.
+    /// </summary>
     public static SellSweepState Advance(
         SellSweepState sweep,
+        SellSweepCandidateOutcome outcome,
+        long realizedProceedsChaos,
+        string detail,
+        DateTimeOffset now) =>
+        Advance(sweep, null, outcome, realizedProceedsChaos, detail, now);
+
+    public static SellSweepState Advance(
+        SellSweepState sweep,
+        Guid? attemptId,
         SellSweepCandidateOutcome outcome,
         long realizedProceedsChaos,
         string detail,
@@ -423,12 +601,29 @@ public static class SellSweepCoordinator
             throw new ArgumentOutOfRangeException(nameof(realizedProceedsChaos));
         }
         var next = Clone(sweep);
-        var candidate = next.Current
+
+        // A sold candidate is identified by the attempt that sold it, never by the cursor: with
+        // several orders resting the cursor has long since moved past the one that just settled.
+        SellSweepSlot? slot = null;
+        if (outcome == SellSweepCandidateOutcome.Sold)
+        {
+            slot = attemptId is { } id ? next.FindSlot(id) : next.Slots.SingleOrDefault();
+            if (slot is null)
+            {
+                throw new InvalidOperationException(
+                    "A sold sweep candidate must name the resting slot its attempt closed.");
+            }
+        }
+        else if (attemptId is not null)
+        {
+            throw new InvalidOperationException("Only a sold sweep candidate closes a slot.");
+        }
+
+        var candidate = (slot is null ? next.Current : next.CandidateFor(slot))
             ?? throw new InvalidOperationException("The sweep is not positioned on a candidate.");
         if (candidate.Outcome != SellSweepCandidateOutcome.Pending ||
-            outcome == SellSweepCandidateOutcome.Sold && next.Phase != SellSweepPhase.OrderLive ||
             outcome is SellSweepCandidateOutcome.Skipped or SellSweepCandidateOutcome.Failed &&
-                (next.Phase != SellSweepPhase.ReadyForCandidate || realizedProceedsChaos != 0))
+                realizedProceedsChaos != 0)
         {
             throw new InvalidOperationException("The requested sweep advancement does not match its current phase.");
         }
@@ -436,11 +631,24 @@ public static class SellSweepCoordinator
         candidate.RealizedProceedsChaos = realizedProceedsChaos;
         candidate.Detail = detail ?? string.Empty;
         next.RealizedProceedsChaos = checked(next.RealizedProceedsChaos + realizedProceedsChaos);
-        next.CurrentAttemptId = null;
+        // Any retirement invalidates the preparation, whichever candidate was retired. The cursor's
+        // own candidate dies with it; a slot closing means seconds of settlement have passed, and the
+        // driver's half of the preparation - the staged leg and the placement token - is cleared
+        // unconditionally when that happens. Keeping the durable half alone would leave the sweep
+        // authorizing a placement whose plan no longer exists.
         next.PreparedSignature = string.Empty;
-        next.CurrentIndex++;
+        if (slot is null)
+        {
+            // The cursor's candidate was never placed, so the cursor moves past it here. A sold one
+            // was already consumed by placement, which moved the cursor at the time.
+            next.CurrentIndex++;
+        }
+        else
+        {
+            next.Slots.Remove(slot);
+        }
         next.UpdatedAtUtc = now;
-        if (next.CurrentIndex >= next.Candidates.Count)
+        if (next.CurrentIndex >= next.Candidates.Count && next.Slots.Count == 0)
         {
             next.Phase = SellSweepPhase.Completed;
             next.Detail = $"Sweep complete: {next.Candidates.Count(entry => entry.Outcome == SellSweepCandidateOutcome.Sold)} " +
@@ -448,9 +656,13 @@ public static class SellSweepCoordinator
         }
         else
         {
-            next.Phase = SellSweepPhase.ReadyForCandidate;
-            next.Detail = $"{candidate.Name} {outcome}; next candidate {next.Current!.Name} " +
-                "requires a fresh re-plan before placement.";
+            next.Phase = next.Slots.Count > 0
+                ? SellSweepPhase.OrderLive
+                : SellSweepPhase.ReadyForCandidate;
+            next.Detail = next.Current is { } upcoming
+                ? $"{candidate.Name} {outcome}; next candidate {upcoming.Name} " +
+                    "requires a fresh re-plan before placement."
+                : $"{candidate.Name} {outcome}; {next.Slots.Count} order(s) still resting.";
         }
         return next;
     }
@@ -458,10 +670,11 @@ public static class SellSweepCoordinator
     public static SellSweepState ClearPreparationForRetry(
         SellSweepState sweep,
         string reason,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        int maxConcurrentSweepOrders = 1)
     {
         ArgumentNullException.ThrowIfNull(sweep);
-        if (sweep.Phase != SellSweepPhase.ReadyForCandidate || sweep.CurrentAttemptId is not null ||
+        if (!HasFreeSlot(sweep, maxConcurrentSweepOrders) ||
             sweep.Current is not { Outcome: SellSweepCandidateOutcome.Pending })
         {
             throw new InvalidOperationException("Only an unplaced pending sweep candidate can be re-probed.");
@@ -491,10 +704,12 @@ public static class SellSweepCoordinator
         ArgumentNullException.ThrowIfNull(sweep);
         ArgumentNullException.ThrowIfNull(tracked);
         realizedProceedsChaos = 0;
-        var candidate = sweep.Current;
-        if (sweep.Phase != SellSweepPhase.OrderLive || candidate is null ||
+        // The candidate is reached through the slot the attempt closed, never through the cursor:
+        // with several orders resting the cursor is already past the one that just stashed.
+        var slot = sweep.FindSlot(tracked.AttemptId);
+        var candidate = slot is null ? null : sweep.CandidateFor(slot);
+        if (!sweep.IsActive || candidate is null ||
             candidate.Outcome != SellSweepCandidateOutcome.Pending ||
-            sweep.CurrentAttemptId is null || sweep.CurrentAttemptId != tracked.AttemptId ||
             tracked.Status != TrackedOrderStatus.Stashed)
         {
             failure = "Realized proceeds require the matching stashed sweep attempt.";
@@ -542,10 +757,15 @@ public static class SellSweepCoordinator
         next.PreparedSignature = string.Empty;
         next.UpdatedAtUtc = now;
         next.Detail = reason ?? string.Empty;
-        var candidate = next.Current;
-        if (candidate is not null)
+        // Every candidate the sweep still owns fails, not just the one the cursor is on: a
+        // resting order's custody is exactly as unprovable as the active one's.
+        var owned = next.Slots
+            .Select(next.CandidateFor)
+            .Append(next.Current)
+            .Where(entry => entry is { Outcome: SellSweepCandidateOutcome.Pending });
+        foreach (var candidate in owned)
         {
-            candidate.Outcome = SellSweepCandidateOutcome.Failed;
+            candidate!.Outcome = SellSweepCandidateOutcome.Failed;
             candidate.Detail = reason ?? string.Empty;
         }
         return next;
@@ -563,13 +783,20 @@ public static class SellSweepCoordinator
             ExecutionMode = sweep.ExecutionMode,
             Phase = sweep.Phase,
             CurrentIndex = sweep.CurrentIndex,
-            CurrentAttemptId = sweep.CurrentAttemptId,
             PreparedSignature = sweep.PreparedSignature,
             MinimumSaleChaos = sweep.MinimumSaleChaos,
             RealizedProceedsChaos = sweep.RealizedProceedsChaos,
             StartedAtUtc = sweep.StartedAtUtc,
             UpdatedAtUtc = sweep.UpdatedAtUtc,
             Detail = sweep.Detail,
+            Slots = sweep.Slots.Select(slot => new SellSweepSlot
+            {
+                CandidateIndex = slot.CandidateIndex,
+                AttemptId = slot.AttemptId,
+                PreparedSignature = slot.PreparedSignature,
+                OfferedMetadata = slot.OfferedMetadata,
+                PlacedAtUtc = slot.PlacedAtUtc,
+            }).ToList(),
             Candidates = sweep.Candidates.Select(candidate => new SellSweepCandidate
             {
                 Index = candidate.Index,

@@ -1,4 +1,4 @@
-# FaustusControllerLite
+﻿# FaustusControllerLite
 
 ## Build
 
@@ -38,7 +38,11 @@ Both commands must finish with zero warnings. The test project is outside `Plugi
 - An armed placement whose click outlived the placement controller's observation window is reconciled from the order list alone: baseline plus one order matching the armed pair, amount, ratio, and click time binds pending or terminal state; anything else is durable ambiguity. Reconciliation is observation only and never clicks.
 - Pending-row cancellation aligns the durable SDK identity to one parallel visible row using status, total amounts, and an exact or correctly rounded decimal ratio; live partial-fill amounts do not replace the original placed economics.
 - Collection targets only canonical `CompletedUncollected` state. It matches one unique visible row by completed status, exact amounts and ratio, persists `CollectionArmed`, Ctrl-right-clicks once, proves only that tracked order disappeared, and requires a phase-bound exact ownership increase before crediting.
-- Every unrelated order's full SDK snapshot must remain unchanged through collection settlement. Any post-click interruption, ownership mismatch, row ambiguity, or persistence uncertainty remains unresolved and is never retried automatically.
+- Every unrelated order's full SDK snapshot must remain unchanged through collection settlement, except that an order the sweep itself rests - listed by id in the armed intent - is held only to its immutable identity and may take a fill while the settlement runs. Any post-click interruption, ownership mismatch, row ambiguity, or persistence uncertainty remains unresolved and is never retried automatically.
+- A sell sweep tracks each order it places as a slot keyed by attempt id; a candidate is reached through its slot, never through the queue cursor, which placement has already moved on. Placement is serial and one order per offered metadata; only resting is concurrent. Any slot ambiguous, or any slot with no order behind it, requires an operator.
+- Exactly one order is ever active - owned by an input controller, in `BankrollState.TrackedOrder`. Every other order the sweep has placed is resting: observation-only, no armed intent, and settled only after being promoted into the active slot one at a time. Settlement is serial whatever `MaxConcurrentSweepOrders` is set to; only resting is concurrent, and promotion and demotion are single durable writes that change nothing about the order itself.
+- An order row'''s visible status text is evidence that the row has stopped trading, and nothing more. It is never evidence of which terminal it reached: a partly filled order cancelled by the plugin reports `completed=True canceled=False` while its row reads "Order Cancelled". Which terminal, and for how much, is proved by the SDK amounts and the durable intent.
+- Whether an order rests or takes the active slot is decided from a live panel observation, never from its stored status: promotion leaves the status untouched, so a status-based rule demotes a just-promoted order straight back and the two moves ping-pong a canonical write per frame. Slot moves are rate-limited independently of that rule.
 - Enabling any Lite input permission disables the full `FaustusController`; inability to verify exclusion turns all Lite input permissions off.
 - Currency identity is exact metadata; names are display-only.
 - Spend is capped by both the isolated ledger and observed live ownership.
@@ -61,11 +65,12 @@ Both commands must finish with zero warnings. The test project is outside `Plugi
 - Fresh-state reset is arm-then-apply, stops continuous trading, reseeds from configured seeds, and clears resolved workflow/tracked state and transient failures. It is refused while any order or settlement is unresolved and never deletes rates, calibration, audit, or unresolved evidence.
 - The forced fresh-state reset is the manual override for unreadable or unresolvable canonical state. It is separately armed, still refuses while any input operation is live, and publishes the exact metadata and amounts it abandons before arming; a change to that summary between arm and apply cancels it. Applying quarantines canonical and legacy state files under timestamped names, never deletes them, and records a `ForcedFreshStateReset` audit event with the discard summary and quarantine paths. It moves nothing in game, so everything it names is the operator's to reconcile by hand.
 - Settlement collection is capacity-batched on both wanted-proceeds and offered-return slots. Each batch is durably armed, exact row/inventory/ownership evidence is verified, the batch is credited once, then stashed before another batch is collected.
+- Canonical state holds one active tracked order - the only order an input controller may own - plus a resting set of placed, observation-only orders with no armed intent. A resting order must be restable (pending, timed out, uncollected terminal, or ambiguous), a distinct attempt, and offer an asset no other order offers. Unresolved means the active order is unresolved or any order is ambiguous; ambiguity always rests rather than being unrecordable, and is still never retried. Reservations match the orders holding principal exactly, per metadata. A workflow never runs alongside a resting order.
 - Reload never restores transient input authorization. Pending/cancellation states are observation-only until explicitly reauthorized; interrupted collection/stash intents accept exact pre-state or exact post-state and never repeat an uncertain click.
 
 ## State
 
-- Bankroll/workflow canonical state: `config/FaustusControllerLite/FaustusControllerLite/bankroll-<league>.json`, bankroll schema 5 with tracked-order schema 5 and workflow schema 2.
+- Bankroll/workflow canonical state: `config/FaustusControllerLite/FaustusControllerLite/bankroll-<league>.json`, bankroll schema 7 with tracked-order schema 7 and workflow schema 4.
 - Audit: `config/FaustusControllerLite/FaustusControllerLite/execution-audit-<league>.jsonl`, schema 1 events.
 - Latest rates: `config/FaustusControllerLite/FaustusControllerLite/latest-rates.json`, schema 1, one record per league/canonical pair.
 - SDK report: `config/FaustusControllerLite/FaustusControllerLite/sdk-diagnostic.txt`.

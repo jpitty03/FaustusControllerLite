@@ -1,3 +1,5 @@
+﻿using FaustusControllerLite.Domain;
+
 namespace FaustusControllerLite;
 
 public enum SellRejectionReason
@@ -13,6 +15,7 @@ public enum SellRejectionReason
     NoWholeLot,
     ArithmeticOverflow,
     ProceedsBelowMinimum,
+    UnbackedCompetingHead,
 }
 
 public enum SellSweepExecutionMode
@@ -72,7 +75,9 @@ public sealed record SellCandidateRequest(
     string SessionId,
     string AreaId,
     long MinimumSaleChaos = 10,
-    SellSweepExecutionMode ExecutionMode = SellSweepExecutionMode.MostCurrency);
+    SellSweepExecutionMode ExecutionMode = SellSweepExecutionMode.MostCurrency,
+    long MinCompetingQueue = CompetingLiquidityGate.DefaultMinCompetingQueue,
+    long MaxCompetingSpread = CompetingLiquidityGate.DefaultMaxCompetingSpread);
 
 public sealed record SellMarketQuote(
     DirectedExchangeEdge Edge,
@@ -119,10 +124,31 @@ public static class FaustusSellPlanner
         SellRejectionReason.StaleQuote,
         SellRejectionReason.SessionMismatch,
         SellRejectionReason.AreaMismatch,
+        SellRejectionReason.UnbackedCompetingHead,
         SellRejectionReason.InvalidQuote,
         SellRejectionReason.MissingDivineBenchmark,
         SellRejectionReason.MissingEdge,
     };
+
+    /// <summary>
+    /// Every market's verdict, not just the one the priority table surfaced.
+    ///
+    /// A holding is skipped only when *both* proceeds markets refuse it, and they usually refuse for
+    /// different reasons. <see cref="ReasonPriority"/> then reports one of them, which is fine for a
+    /// single-line summary and actively misleading in a log: a Divine market rejected on lot size
+    /// outranks a Chaos market rejected on an unbacked head, so the operator reads a lot-size
+    /// complaint about a currency they were never going to be paid in, and never learns what
+    /// actually blocked the market that mattered.
+    /// </summary>
+    public static string DescribeRejections(SellCandidateResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        return result.Evaluations.Count == 0
+            ? result.Detail
+            : string.Join("; ", result.Evaluations.Select(evaluation => evaluation.Accepted
+                ? $"{evaluation.Proceeds.Metadata}: accepted"
+                : $"{evaluation.Proceeds.Metadata}: {evaluation.RejectionReason} ({evaluation.Detail})"));
+    }
 
     public static SellCandidateResult Evaluate(SellCandidateRequest request)
     {
@@ -136,7 +162,8 @@ public static class FaustusSellPlanner
                 SellRejectionReason.ZeroHolding, $"No {request.Target.Metadata} held.");
         }
 
-        var divineBenchmark = SelectEdge(request, request.Divine, request.Chaos, out _);
+        var modeIntent = SellSweepExecutionModes.ToExecutionIntent(request.ExecutionMode);
+        var divineBenchmark = SelectEdge(request, request.Divine, request.Chaos, modeIntent, out _);
         var evaluations = new[]
         {
             EvaluateMarket(request, request.Chaos, divineBenchmark),
@@ -168,13 +195,27 @@ public static class FaustusSellPlanner
         CurrencyIdentity proceeds,
         DirectedExchangeEdge? divineBenchmark)
     {
-        var intentName = SellSweepExecutionModes.ToExecutionIntent(request.ExecutionMode)
-            .ToString().ToLowerInvariant();
-        var edge = SelectEdge(request, request.Target, proceeds, out var edgeReason);
+        var intent = SellSweepExecutionModes.ToExecutionIntent(request.ExecutionMode);
+        var intentName = intent.ToString().ToLowerInvariant();
+        var edge = SelectEdge(request, request.Target, proceeds, intent, out var edgeReason);
         if (edge is null)
         {
             return new SellMarketEvaluation(proceeds, null, edgeReason,
                 $"No usable {intentName} {request.Target.Metadata}->{proceeds.Metadata} quote.");
+        }
+
+        // A competing order is priced at a head it then has to wait behind, so the head has to be a real
+        // market before the holding is sized against it. The sibling immediate edge is the anchor: it is
+        // the only rate in this direction with a counterparty already resting on it. Rejecting one market
+        // is enough - Evaluate scores Chaos and Divine independently and takes the better, so a trolled
+        // Divine book simply loses to a healthy Chaos one.
+        var immediateAnchor = SelectEdge(
+            request, request.Target, proceeds, QuoteExecutionIntent.Immediate, out _);
+        if (!CompetingLiquidityGate.IsBelievable(
+                edge, immediateAnchor, request.MinCompetingQueue, request.MaxCompetingSpread, out var gateReason))
+        {
+            return new SellMarketEvaluation(proceeds, null, SellRejectionReason.UnbackedCompetingHead,
+                $"{request.Target.Metadata}->{proceeds.Metadata} skipped: {gateReason}.");
         }
 
         try
@@ -231,12 +272,12 @@ public static class FaustusSellPlanner
         SellCandidateRequest request,
         CurrencyIdentity from,
         CurrencyIdentity to,
+        QuoteExecutionIntent intent,
         out SellRejectionReason reason)
     {
-        var expectedIntent = SellSweepExecutionModes.ToExecutionIntent(request.ExecutionMode);
         var directed = request.Edges
             .Where(edge => edge.From.Equals(from) && edge.To.Equals(to) &&
-                           edge.ExecutionIntent == expectedIntent)
+                           edge.ExecutionIntent == intent)
             .ToArray();
         if (directed.Length == 0)
         {
@@ -326,6 +367,17 @@ public static class FaustusSellPlanner
         if (request.MinimumSaleChaos < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(request), "Minimum sale cannot be negative.");
+        }
+
+        if (request.MinCompetingQueue < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(request), "Minimum competing queue cannot be negative.");
+        }
+
+        if (request.MaxCompetingSpread < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(request), "Maximum competing spread must be at least one.");
         }
 
         if (request.MaximumQuoteAge <= TimeSpan.Zero)
